@@ -1,0 +1,39 @@
+#ifndef TIMERULER_H_INCLUDED
+#define TIMERULER_H_INCLUDED
+
+#include <glib.h>
+#include <sys/types.h> /* off_t */
+
+G_BEGIN_DECLS
+
+/* ---- Time display modes ---- */
+#define TIMEMODE_REAL 0
+#define TIMEMODE_REALLONG 1
+#define TIMEMODE_SAMPLES 2
+#define TIMEMODE_24FPS 3
+#define TIMEMODE_25FPS 4
+#define TIMEMODE_NTSC 5
+#define TIMEMODE_30FPS 6
+
+/*
+ * Format a sample position as a timecode string for the given TIMEMODE_*.
+ * timebuf must be at least 64 bytes; pass NULL to use an internal static buffer.
+ * Returns timebuf (or the internal buffer).
+ */
+gchar *format_timecode(guint32 samplerate, off_t samples, off_t samplemax, gchar *timebuf,
+                       gint mode);
+
+/*
+ * Compute ruler tick positions for a sample range. The *n* arguments are
+ * in/out: pass the array capacity, receive the count written. Returns 1 if
+ * the midpoint level is populated, 0 otherwise.
+ */
+guint ruler_tick_positions(guint32 samplerate, off_t start_samp, off_t end_samp, off_t *points,
+                           int *npoints, off_t *midpoints, int *nmidpoints, off_t *minor_points,
+                           int *nminorpoints, int timemode);
+
+#define ARRAY_LENGTH(a) (sizeof(a) / sizeof((a)[0]))
+
+G_END_DECLS
+
+#endif /* TIMERULER_H_INCLUDED */

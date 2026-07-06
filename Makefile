@@ -12,8 +12,11 @@ CFLAGS   = -std=gnu99 $(COMMON) $(GLIB_CFLAGS)
 CXXFLAGS = -std=c++17 $(COMMON) $(GLIB_CFLAGS)
 LDFLAGS  = -L$(NONPACKAGED)/lib -ljack -lbe $(GLIB_LIBS)
 
-C_SOURCES   = src/engine/glib_check.c
-CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp
+C_SOURCES   = src/engine/glib_check.c src/engine/message.c src/engine/settings.c \
+              src/engine/track.c src/engine/project.c src/engine/jackdaw-engine.c \
+              src/engine/tempomap.c src/engine/timeruler.c
+CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
+              src/ui/TransportView.cpp
 
 OBJECTS = $(C_SOURCES:.c=.o) $(CXX_SOURCES:.cpp=.o)
 DEPS    = $(OBJECTS:.o=.d)

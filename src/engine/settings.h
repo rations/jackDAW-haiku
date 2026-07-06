@@ -3,6 +3,8 @@
 
 #include <glib.h>
 
+G_BEGIN_DECLS
+
 void settings_init(void);
 void settings_save(void);
 void settings_quit(void);
@@ -13,5 +15,7 @@ void settings_set_uint32(const gchar *key, guint32 val);
 /* Caller frees the returned string. */
 gchar *settings_get_string(const gchar *key, const gchar *def);
 void settings_set_string(const gchar *key, const gchar *val);
+
+G_END_DECLS
 
 #endif /* SETTINGS_H_INCLUDED */

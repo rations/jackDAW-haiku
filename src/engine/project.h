@@ -61,6 +61,9 @@ struct _JackDawProject {
     guint countin_before_record; /* metronome beats before recording (0=off) */
     guint countin_before_play;   /* metronome beats before playback (0=off) */
     JackDawRulerMode ruler_mode;
+    gint grid_unit; /* TempoMapGrid: snap/grid resolution (default beat).
+                     * Extends the Linux original's fixed beat snap to the
+                     * configurable bar/beat/division grid. */
 };
 
 struct _JackDawProjectClass {
@@ -146,6 +149,9 @@ guint jackdaw_project_get_countin_before_record(JackDawProject *p);
 void jackdaw_project_set_countin_before_play(JackDawProject *p, guint beats);
 guint jackdaw_project_get_countin_before_play(JackDawProject *p);
 void jackdaw_project_set_ruler_mode(JackDawProject *p, JackDawRulerMode m);
+/* Snap/grid resolution (a TempoMapGrid value, clamped). */
+void jackdaw_project_set_grid_unit(JackDawProject *p, gint unit);
+gint jackdaw_project_get_grid_unit(JackDawProject *p);
 void jackdaw_project_emit_timing_changed(JackDawProject *p);
 
 /* Grid geometry helpers (timeline frames at the given sample rate). */

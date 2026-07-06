@@ -11,6 +11,14 @@ enum {
     MSG_TRANSPORT_STOP = 'stop',
     MSG_TRANSPORT_RECORD = 'recd',
     MSG_TRANSPORT_RTZ = 'rtz ',
+    MSG_TRANSPORT_TOGGLE = 'plst', // space bar: play <-> stop
+
+    // Tempo / grid / display controls (handled by TransportView).
+    MSG_SET_BPM = 'sbpm',
+    MSG_SET_TIMESIG = 'tsig',
+    MSG_TOGGLE_METRONOME = 'metr',
+    MSG_TOGGLE_SNAP = 'snap',
+    MSG_TOGGLE_RULER_MODE = 'rulm',
 
     // Engine event hook -> window (posted from JACK notification threads via
     // BMessenger; handlers re-read engine state, payloads carry no pointers).

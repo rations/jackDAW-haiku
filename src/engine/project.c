@@ -3,6 +3,7 @@
 
 #include "project.h"
 #include "settings.h"
+#include "tempomap.h"
 #include "track.h"
 
 G_DEFINE_TYPE(JackDawProject, jackdaw_project, G_TYPE_OBJECT)
@@ -53,25 +54,21 @@ static void jackdaw_project_class_init(JackDawProjectClass *klass)
                      G_STRUCT_OFFSET(JackDawProjectClass, track_removed), NULL, NULL, NULL,
                      G_TYPE_NONE, 1, JACKDAW_TYPE_TRACK);
 
-    project_signals[SIGNAL_PORTS_CHANGED] =
-        g_signal_new("ports-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_FIRST,
-                     G_STRUCT_OFFSET(JackDawProjectClass, ports_changed), NULL, NULL, NULL,
-                     G_TYPE_NONE, 0);
+    project_signals[SIGNAL_PORTS_CHANGED] = g_signal_new(
+        "ports-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_FIRST,
+        G_STRUCT_OFFSET(JackDawProjectClass, ports_changed), NULL, NULL, NULL, G_TYPE_NONE, 0);
 
-    project_signals[SIGNAL_TIMING_CHANGED] =
-        g_signal_new("timing-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_FIRST,
-                     G_STRUCT_OFFSET(JackDawProjectClass, timing_changed), NULL, NULL, NULL,
-                     G_TYPE_NONE, 0);
+    project_signals[SIGNAL_TIMING_CHANGED] = g_signal_new(
+        "timing-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_FIRST,
+        G_STRUCT_OFFSET(JackDawProjectClass, timing_changed), NULL, NULL, NULL, G_TYPE_NONE, 0);
 
-    project_signals[SIGNAL_SELECTION_CHANGED] =
-        g_signal_new("selection-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_FIRST,
-                     G_STRUCT_OFFSET(JackDawProjectClass, selection_changed), NULL, NULL, NULL,
-                     G_TYPE_NONE, 0);
+    project_signals[SIGNAL_SELECTION_CHANGED] = g_signal_new(
+        "selection-changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_FIRST,
+        G_STRUCT_OFFSET(JackDawProjectClass, selection_changed), NULL, NULL, NULL, G_TYPE_NONE, 0);
 
-    project_signals[SIGNAL_TRACKS_REORDERED] =
-        g_signal_new("tracks-reordered", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_FIRST,
-                     G_STRUCT_OFFSET(JackDawProjectClass, tracks_reordered), NULL, NULL, NULL,
-                     G_TYPE_NONE, 0);
+    project_signals[SIGNAL_TRACKS_REORDERED] = g_signal_new(
+        "tracks-reordered", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_FIRST,
+        G_STRUCT_OFFSET(JackDawProjectClass, tracks_reordered), NULL, NULL, NULL, G_TYPE_NONE, 0);
 }
 
 static void jackdaw_project_init(JackDawProject *p)
@@ -99,6 +96,7 @@ static void jackdaw_project_init(JackDawProject *p)
     p->countin_before_record = 0;
     p->countin_before_play = 0;
     p->ruler_mode = JACKDAW_RULER_TIME;
+    p->grid_unit = TEMPOMAP_GRID_BEAT;
 }
 
 /* ---- Constructor ---- */
@@ -432,15 +430,27 @@ gdouble jackdaw_project_frames_per_bar(JackDawProject *p, guint32 sample_rate)
            (gdouble)(p->beats_per_bar ? p->beats_per_bar : 1);
 }
 
+void jackdaw_project_set_grid_unit(JackDawProject *p, gint unit)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    p->grid_unit = CLAMP(unit, 0, TEMPOMAP_GRID_LAST - 1);
+    jackdaw_project_emit_timing_changed(p);
+}
+
+gint jackdaw_project_get_grid_unit(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), TEMPOMAP_GRID_BEAT);
+    return p->grid_unit;
+}
+
+/* Routed through the tempomap so ruler, snap and metronome share one grid.
+ * The Linux original snapped to whole beats only; the grid unit generalizes it. */
 off_t jackdaw_project_snap_frame(JackDawProject *p, off_t frame, guint32 sample_rate)
 {
     g_return_val_if_fail(JACKDAW_IS_PROJECT(p), frame);
     if (!p->snap_enabled)
         return frame;
-    gdouble fpb = jackdaw_project_frames_per_beat(p, sample_rate);
-    if (fpb <= 0.0)
-        return frame;
-    gdouble n = (gdouble)frame / fpb;
-    off_t snapped = (off_t)(floor(n + 0.5) * fpb);
-    return snapped < 0 ? 0 : snapped;
+    TempoMap tm;
+    tempomap_from_project(&tm, p, sample_rate);
+    return tempomap_snap_frame(&tm, frame, (TempoMapGrid)p->grid_unit);
 }
