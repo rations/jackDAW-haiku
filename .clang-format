@@ -1,0 +1,16 @@
+# Matches the style of the Linux JackDAW sources this project ports from:
+# 4-space indentation, Linux braces (function brace on its own line, control braces
+# attached), no tabs. Applies to both the ported C engine and the new C++ UI.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+PointerAlignment: Right
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+SortIncludes: false
+IndentCaseLabels: true
+AccessModifierOffset: -4
