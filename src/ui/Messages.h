@@ -13,10 +13,15 @@ enum {
     MSG_TRANSPORT_RTZ = 'rtz ',
     MSG_TRANSPORT_TOGGLE = 'plst', // space bar: play <-> stop
 
+    // Timeline zoom (menu / keyboard).
+    MSG_ZOOM_IN = 'zmin',
+    MSG_ZOOM_OUT = 'zmot',
+
     // Tempo / grid / display controls (handled by TransportView).
     MSG_SET_BPM = 'sbpm',
     MSG_SET_TIMESIG = 'tsig',
     MSG_TOGGLE_METRONOME = 'metr',
+    MSG_TOGGLE_GRID = 'grid',
     MSG_TOGGLE_SNAP = 'snap',
     MSG_TOGGLE_RULER_MODE = 'rulm',
 

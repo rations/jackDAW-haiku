@@ -5,7 +5,7 @@
 #include "engine/project.h"
 
 class BMessageRunner;
-class BStringView;
+class TimelineView;
 class TransportView;
 
 class MainWindow : public BWindow
@@ -17,10 +17,6 @@ public:
     void MessageReceived(BMessage *message) override;
     bool QuitRequested() override;
 
-    // Call once after jackdaw_engine_init so the status line shows the real
-    // sample rate / buffer size (runs on the creating thread, pre-Show).
-    void UpdateEngineStatus();
-
 private:
     void TransportPlay();
     void TransportStop();
@@ -30,6 +26,6 @@ private:
     JackDawProject *m_project; // borrowed; main() owns the reference
 
     TransportView *m_transport;
-    BStringView *m_status_view;
+    TimelineView *m_timeline;
     BMessageRunner *m_tick_runner;
 };

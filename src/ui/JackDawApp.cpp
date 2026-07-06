@@ -18,7 +18,6 @@ void JackDawApp::ReadyToRun()
     m_main_window = new MainWindow(m_project);
     if (jackdaw_engine_init(m_project))
         g_warning("JACK engine failed to start — running without audio");
-    m_main_window->UpdateEngineStatus();
     m_main_window->Show();
 }
 

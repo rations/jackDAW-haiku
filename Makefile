@@ -16,7 +16,8 @@ C_SOURCES   = src/engine/glib_check.c src/engine/message.c src/engine/settings.c
               src/engine/track.c src/engine/project.c src/engine/jackdaw-engine.c \
               src/engine/tempomap.c src/engine/timeruler.c
 CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
-              src/ui/TransportView.cpp
+              src/ui/TransportView.cpp src/ui/TimelineView.cpp src/ui/RulerView.cpp \
+              src/ui/TrackAreaView.cpp
 
 OBJECTS = $(C_SOURCES:.c=.o) $(CXX_SOURCES:.cpp=.o)
 DEPS    = $(OBJECTS:.o=.d)

@@ -6,7 +6,6 @@
 #include <MessageFilter.h>
 #include <MessageRunner.h>
 #include <Messenger.h>
-#include <StringView.h>
 #include <TextView.h>
 
 #include <stdio.h>
@@ -14,6 +13,7 @@
 
 #include "engine/jackdaw-engine.h"
 #include "Messages.h"
+#include "TimelineView.h"
 #include "TransportView.h"
 
 // UI refresh cadence (playhead readout, later ruler/lane playhead redraws).
@@ -108,19 +108,19 @@ public:
 
 MainWindow::MainWindow(JackDawProject *project)
     : BWindow(BRect(100, 100, 1100, 700), "JackDAW", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
-      m_project(project), m_transport(NULL), m_status_view(NULL), m_tick_runner(NULL)
+      m_project(project), m_transport(NULL), m_timeline(NULL), m_tick_runner(NULL)
 {
     m_transport = new TransportView(project);
-    m_status_view = new BStringView("status_bar", "JACK: starting…");
+    m_timeline = new TimelineView(project);
 
-    BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
-        .Add(m_transport)
-        .AddGlue()
-        .AddGroup(B_HORIZONTAL, 0)
-        .SetInsets(B_USE_SMALL_INSETS, 2, B_USE_SMALL_INSETS, 2)
-        .Add(m_status_view)
-        .AddGlue()
-        .End();
+    // No JACK status bar: server health/xrun monitoring is the patchbay's job
+    // (JackGraph), matching the Linux JackDAW main window.
+    BLayoutBuilder::Group<>(this, B_VERTICAL, 0).Add(m_transport).Add(m_timeline);
+
+    // Zoom shortcuts (Command is Alt on the default Haiku keymap).
+    AddShortcut('=', B_COMMAND_KEY, new BMessage(MSG_ZOOM_IN));
+    AddShortcut('+', B_COMMAND_KEY, new BMessage(MSG_ZOOM_IN));
+    AddShortcut('-', B_COMMAND_KEY, new BMessage(MSG_ZOOM_OUT));
 
     AddCommonFilter(new TransportKeyFilter());
     AddCommonFilter(new FocusReleaseFilter());
@@ -140,19 +140,6 @@ MainWindow::MainWindow(JackDawProject *project)
 MainWindow::~MainWindow()
 {
     delete m_tick_runner;
-}
-
-void MainWindow::UpdateEngineStatus()
-{
-    char text[128];
-    if (jackdaw_engine_is_running()) {
-        snprintf(text, sizeof(text), "JACK: %u Hz, %u frames, %u xruns",
-                 jackdaw_engine_get_sample_rate(), jackdaw_engine_get_buffer_size(),
-                 jackdaw_engine_get_xrun_count());
-    } else {
-        snprintf(text, sizeof(text), "JACK: not connected");
-    }
-    m_status_view->SetText(text);
 }
 
 void MainWindow::TransportPlay()
@@ -186,7 +173,14 @@ void MainWindow::MessageReceived(BMessage *message)
     switch (message->what) {
         case MSG_UI_TICK:
             m_transport->UpdateReadout();
-            UpdateEngineStatus();
+            m_timeline->TickUpdate();
+            break;
+
+        case MSG_ZOOM_IN:
+            m_timeline->ZoomBy(0.5, m_timeline->LaneWidth() / 2);
+            break;
+        case MSG_ZOOM_OUT:
+            m_timeline->ZoomBy(2.0, m_timeline->LaneWidth() / 2);
             break;
 
         case MSG_TRANSPORT_PLAY:
@@ -207,10 +201,9 @@ void MainWindow::MessageReceived(BMessage *message)
 
         case MSG_ENGINE_PORTS_CHANGED:
         case MSG_ENGINE_CONNECTIONS_CHANGED:
-            // Port selectors refresh here once track strips exist.
-            break;
         case MSG_ENGINE_SHUTDOWN:
-            UpdateEngineStatus();
+            // Port selectors refresh here once track strips exist; a server
+            // shutdown alert can hang off MSG_ENGINE_SHUTDOWN later.
             break;
 
         default:

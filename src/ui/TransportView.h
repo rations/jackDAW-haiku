@@ -45,6 +45,7 @@ private:
     BTextControl *m_sig_num;
     BTextControl *m_sig_den;
     BCheckBox *m_metronome;
+    BCheckBox *m_grid;
     BCheckBox *m_snap;
     BCheckBox *m_bars_mode;
 };

@@ -38,6 +38,7 @@ TransportView::TransportView(JackDawProject *project)
     m_sig_den = new BTextControl("/", "4", new BMessage(MSG_SET_TIMESIG));
 
     m_metronome = new BCheckBox("Click", new BMessage(MSG_TOGGLE_METRONOME));
+    m_grid = new BCheckBox("Grid", new BMessage(MSG_TOGGLE_GRID));
     m_snap = new BCheckBox("Snap", new BMessage(MSG_TOGGLE_SNAP));
     m_bars_mode = new BCheckBox("Bars", new BMessage(MSG_TOGGLE_RULER_MODE));
 
@@ -56,6 +57,7 @@ TransportView::TransportView(JackDawProject *project)
         .Add(m_sig_den)
         .AddStrut(12.0f)
         .Add(m_metronome)
+        .Add(m_grid)
         .Add(m_snap)
         .Add(m_bars_mode);
 }
@@ -87,6 +89,7 @@ void TransportView::AttachedToWindow()
     m_sig_num->SetTarget(this);
     m_sig_den->SetTarget(this);
     m_metronome->SetTarget(this);
+    m_grid->SetTarget(this);
     m_snap->SetTarget(this);
     m_bars_mode->SetTarget(this);
 
@@ -104,6 +107,7 @@ void TransportView::SyncControls()
     snprintf(buf, sizeof(buf), "%u", m_project->beat_unit);
     m_sig_den->SetText(buf);
     m_metronome->SetValue(m_project->metronome_enabled ? B_CONTROL_ON : B_CONTROL_OFF);
+    m_grid->SetValue(m_project->grid_enabled ? B_CONTROL_ON : B_CONTROL_OFF);
     m_snap->SetValue(m_project->snap_enabled ? B_CONTROL_ON : B_CONTROL_OFF);
     m_bars_mode->SetValue(m_project->ruler_mode == JACKDAW_RULER_BARS ? B_CONTROL_ON
                                                                       : B_CONTROL_OFF);
@@ -176,6 +180,9 @@ void TransportView::MessageReceived(BMessage *message)
         }
         case MSG_TOGGLE_METRONOME:
             jackdaw_project_set_metronome(m_project, m_metronome->Value() == B_CONTROL_ON);
+            break;
+        case MSG_TOGGLE_GRID:
+            jackdaw_project_set_grid_enabled(m_project, m_grid->Value() == B_CONTROL_ON);
             break;
         case MSG_TOGGLE_SNAP:
             jackdaw_project_set_snap_enabled(m_project, m_snap->Value() == B_CONTROL_ON);
