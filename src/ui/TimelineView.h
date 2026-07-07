@@ -11,7 +11,7 @@ class TrackAreaView;
 // Timeline geometry (pixel metrics mirror the Linux JackDAW timeline).
 static const float kTimelineHeaderWidth = 235.0f; // track strip column
 static const float kTimelineRulerHeight = 28.0f;
-static const float kTimelineTrackHeight = 80.0f;
+static const float kTimelineTrackHeight = 100.0f; // room for the strip's name/buttons/knobs/input
 
 // TimelineView: the ruler + track area + horizontal scrollbar, and the owner
 // of the horizontal view model every child shares:

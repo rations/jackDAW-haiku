@@ -1,6 +1,9 @@
 #include "MainWindow.h"
 
+#include <Alert.h>
 #include <Application.h>
+#include <Entry.h>
+#include <FilePanel.h>
 #include <InterfaceDefs.h>
 #include <LayoutBuilder.h>
 #include <LayoutItem.h>
@@ -10,7 +13,9 @@
 #include <MessageFilter.h>
 #include <MessageRunner.h>
 #include <Messenger.h>
+#include <Path.h>
 #include <PopUpMenu.h>
+#include <String.h>
 #include <TextView.h>
 
 #include <stdio.h>
@@ -159,8 +164,8 @@ MainWindow::MainWindow(JackDawProject *project)
     : BWindow(BRect(100, 100, 1100, 700), "JackDAW", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
       m_project(project), m_transport(NULL), m_timeline(NULL), m_tick_runner(NULL),
       m_metro_volume_window(NULL), m_countin_window(NULL), m_mixer(NULL), m_mixer_item(NULL),
-      m_mixer_window(NULL), m_mixer_visible(false), m_track_added_h(0), m_track_removed_h(0),
-      m_tracks_reordered_h(0)
+      m_mixer_window(NULL), m_mixer_visible(false), m_load_panel(NULL), m_track_added_h(0),
+      m_track_removed_h(0), m_tracks_reordered_h(0)
 {
     BMenuBar *menu_bar = BuildMenuBar();
     m_transport = new TransportView(project);
@@ -207,6 +212,7 @@ MainWindow::~MainWindow()
     if (m_tracks_reordered_h)
         g_signal_handler_disconnect(m_project, m_tracks_reordered_h);
     delete m_tick_runner;
+    delete m_load_panel;
 }
 
 void MainWindow::ApplyMixerState()
@@ -295,7 +301,7 @@ BMenuBar *MainWindow::BuildMenuBar()
     BMenu *track = new BMenu("Track");
     AddItem(track, "Add Empty Track", MSG_TRACK_ADD, 'T', B_COMMAND_KEY);
     AddItem(track, "Add MIDI Track", MSG_TRACK_ADD_MIDI, 'T', B_COMMAND_KEY | B_SHIFT_KEY);
-    AddItem(track, "Load File as New Track…", MSG_TRACK_LOAD_FILE, 0, 0, false);
+    AddItem(track, "Load File as New Track…", MSG_TRACK_LOAD_FILE);
     track->AddSeparatorItem();
     AddItem(track, "Delete Active Track", MSG_TRACK_DELETE, 0, 0);
     bar->AddItem(track);
@@ -403,7 +409,7 @@ void MainWindow::LocateNextBoundary()
 
 void MainWindow::AddTrack(JackDawTrackKind kind)
 {
-    JackDawTrack *t = jackdaw_track_new(NULL);
+    JackDawTrack *t = jackdaw_track_new(NULL, NULL);
     jackdaw_track_set_kind(t, kind);
     // Engine first so track->slot is assigned before views build for it.
     if (jackdaw_engine_add_track(t)) {
@@ -422,6 +428,52 @@ void MainWindow::DeleteTrack(JackDawTrack *track)
     // Clear the RT slot before dropping the last GObject ref.
     jackdaw_engine_remove_track(track);
     jackdaw_project_remove_track(m_project, track);
+}
+
+void MainWindow::LoadFileAsTrack(const char *path)
+{
+    if (!path || !*path)
+        return;
+    GError *err = NULL;
+    AudioClip *clip = audio_clip_new(path, &err);
+    if (!clip) {
+        BString msg("Could not load audio file:\n");
+        msg << (err ? err->message : path);
+        if (err)
+            g_error_free(err);
+        (new BAlert("Load error", msg.String(), "OK", NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT))
+            ->Go();
+        return;
+    }
+
+    // Name the track after the file's leaf. Engine first (allocates the slot +
+    // playback ringbuffers) so views build against a fully-wired track.
+    BPath bp(path);
+    JackDawTrack *t = jackdaw_track_new(bp.Leaf(), NULL);
+    if (jackdaw_engine_add_track(t)) {
+        audio_clip_free(clip);
+        g_object_unref(t);
+        return;
+    }
+    jackdaw_track_place_clip(t, clip, 0); // consumes the clip reference
+    jackdaw_project_add_track(m_project, t);
+    jackdaw_project_select_single(m_project, t);
+    g_object_unref(t);
+}
+
+void MainWindow::SplitAtCursor()
+{
+    JackDawTrack *t = jackdaw_project_get_active_track(m_project);
+    if (!t)
+        return;
+    off_t cursor = jackdaw_engine_get_play_pos();
+    int sr = (int)jackdaw_engine_get_sample_rate();
+    // Only push undo + commit if the cut actually lands inside a region.
+    if (!clip_region_list_at(jackdaw_track_get_regions(t), cursor))
+        return;
+    jackdaw_project_push_region_undo(m_project, t);
+    clip_region_list_split_at(jackdaw_track_get_regions(t), cursor, sr);
+    jackdaw_track_commit_regions(t);
 }
 
 void MainWindow::ShowTrackContext(int slot, BPoint screen_where)
@@ -577,9 +629,27 @@ void MainWindow::MessageReceived(BMessage *message)
             break;
 
         case MSG_SPLIT:
-            // Region splitting arrives with the clip-editing phase; no-op until
-            // there are regions under the cursor to split.
+            SplitAtCursor();
             break;
+
+        case MSG_TRACK_LOAD_FILE: {
+            if (!m_load_panel)
+                m_load_panel = new BFilePanel(B_OPEN_PANEL, new BMessenger(this), NULL, B_FILE_NODE,
+                                              true /* allow multi-select */);
+            m_load_panel->Show();
+            break;
+        }
+        case B_REFS_RECEIVED: {
+            // Selections from the "Load File as New Track" open panel.
+            entry_ref ref;
+            for (int32 i = 0; message->FindRef("refs", i, &ref) == B_OK; i++) {
+                BEntry entry(&ref, true);
+                BPath path;
+                if (entry.GetPath(&path) == B_OK)
+                    LoadFileAsTrack(path.Path());
+            }
+            break;
+        }
 
         case MSG_EDIT_UNDO:
             jackdaw_project_undo(m_project);

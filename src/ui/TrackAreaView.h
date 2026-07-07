@@ -52,6 +52,8 @@ public:
 private:
     void RepositionStrips();
     int RowAtY(float y) const; // track index under a lane y, or -1
+    // Draw every track's clip-region waveforms + region boundaries into the lane.
+    void DrawWaveforms(BRect lane);
 
     TimelineView *m_timeline; // borrowed (parent)
     BMessenger m_main;        // MainWindow (for strip context/structural msgs)
@@ -60,6 +62,10 @@ private:
     float m_scroll_y;
     bool m_dragging;
     int m_drop_gap; // reorder insertion boundary, or -1 when not dragging
+
+    // Per-track "state-changed" handlers (region edits) → repaint the lane.
+    // Parallel to m_strips; reconnected on every RebuildStrips().
+    std::vector<gulong> m_track_state_handlers;
 
     gulong m_added_handler;
     gulong m_removed_handler;

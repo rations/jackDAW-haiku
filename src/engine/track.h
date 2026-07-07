@@ -2,12 +2,16 @@
 #define TRACK_H_INCLUDED
 
 #include <glib-object.h>
+#include <jack/ringbuffer.h>
+
+#include "audio_clip.h"
+#include "clipregion.h"
 
 G_BEGIN_DECLS
 
 /* Track kind: an audio track streams AudioClip regions; an instrument track
  * sequences MidiRegions into its first FX-chain plugin (the instrument).
- * Phase 1 carries the kind only; clip/MIDI/FX members return in phase 2. */
+ * Audio clip regions are present; MIDI/FX members return in later phases. */
 typedef enum { JACKDAW_TRACK_AUDIO = 0, JACKDAW_TRACK_INSTRUMENT } JackDawTrackKind;
 
 #define JACKDAW_TYPE_TRACK (jackdaw_track_get_type())
@@ -54,6 +58,26 @@ struct _JackDawTrack {
     /* Peak metering: written by RT callback, read by main thread */
     volatile gfloat peak_L;
     volatile gfloat peak_R;
+
+    /* Timeline clip regions (main-thread list, ordered by tl_pos).
+     * The feeder thread never touches this directly — it reads the immutable
+     * rt_snapshot under region_lock. */
+    GPtrArray *regions;              /* GPtrArray of ClipRegion* */
+    GMutex region_lock;              /* guards rt_snapshot (main ↔ feeder) */
+    ClipRegionSnapshot *rt_snapshot; /* current snapshot for the feeder */
+
+    /* Timeline position used as the default placement for set_clip and as the
+     * live-recording anchor (recording finalisation is a later phase). */
+    off_t clip_start;
+
+    /* Playback ringbuffers: fed by the feeder thread, drained by RT callback.
+     * Allocated by jackdaw_engine_add_track() once the JACK rate is known. */
+    jack_ringbuffer_t *play_buf_L;
+    jack_ringbuffer_t *play_buf_R;
+
+    /* Feeder's playback position in timeline frames (feeder-owned; the RT
+     * callback does not read it). */
+    volatile off_t played_frames;
 };
 
 struct _JackDawTrackClass {
@@ -65,13 +89,42 @@ struct _JackDawTrackClass {
 
 GType jackdaw_track_get_type(void);
 
-/* Constructor. Phase 2 restores the AudioClip take-ownership parameter the
- * Linux original has here. */
-JackDawTrack *jackdaw_track_new(const gchar *name);
+/* Constructor — the track takes ownership of clip (may be NULL); a non-NULL
+ * clip is placed as a single region at timeline position 0. */
+JackDawTrack *jackdaw_track_new(const gchar *name, AudioClip *clip);
 
 /* Accessors (main-thread safe) */
 const gchar *jackdaw_track_get_name(JackDawTrack *t);
 void jackdaw_track_set_name(JackDawTrack *t, const gchar *name);
+
+/* ---- Clip regions (main thread only) ----
+ * Returns the first region's source clip, or NULL — borrowed, do not free.
+ * Back-compat helper; new code iterates jackdaw_track_get_regions(). */
+AudioClip *jackdaw_track_get_clip(JackDawTrack *t);
+/* Replace all regions with a single region holding new_clip placed at clip_start.
+ * Consumes one reference to new_clip (take-ownership semantics). */
+void jackdaw_track_set_clip(JackDawTrack *t, AudioClip *new_clip);
+/* Place a clip as a new region at timeline position tl_pos, spanning the whole
+ * file. Consumes one reference to clip. Rebuilds the feeder snapshot. */
+void jackdaw_track_place_clip(JackDawTrack *t, AudioClip *clip, off_t tl_pos);
+
+/* Borrowed region list — edit in place, then call jackdaw_track_commit_regions(). */
+GPtrArray *jackdaw_track_get_regions(JackDawTrack *t);
+
+/* Rebuild + publish the immutable feeder snapshot from the current region list
+ * and emit state-changed so wave views redraw. Call after any region edit. */
+void jackdaw_track_commit_regions(JackDawTrack *t);
+
+/* Replace the region list wholesale with a copy of `list` (may be NULL/empty)
+ * and republish the feeder snapshot. Used by undo restore. */
+void jackdaw_track_apply_regions(JackDawTrack *t, GPtrArray *list);
+
+/* Last timeline frame covered by any region (0 if empty). */
+off_t jackdaw_track_total_frames(JackDawTrack *t);
+
+/* Feeder-thread access: take/drop a reference to the current snapshot.
+ * ref locks region_lock briefly; the returned snapshot is stable until unref. */
+ClipRegionSnapshot *jackdaw_track_ref_snapshot(JackDawTrack *t);
 
 /* ---- Track kind (main thread) ---- */
 JackDawTrackKind jackdaw_track_get_kind(JackDawTrack *t);

@@ -4,6 +4,7 @@
 
 #include "engine/project.h"
 
+class BFilePanel;
 class BLayoutItem;
 class BMenuBar;
 class BMessageRunner;
@@ -43,6 +44,10 @@ private:
     void AddTrack(JackDawTrackKind kind);
     void DeleteTrack(JackDawTrack *track);
     void ShowTrackContext(int slot, BPoint screen_where);
+    // Import an audio file onto a fresh audio track (region placed at timeline 0).
+    void LoadFileAsTrack(const char *path);
+    // Split the region under the cursor on the active track at the play head.
+    void SplitAtCursor();
 
     // Right-click context popups (built fresh so their marks are current).
     void ShowRecordMenu(BPoint screen_where);
@@ -71,6 +76,8 @@ private:
     BLayoutItem *m_mixer_item;   // its layout slot (for collapse)
     MixerWindow *m_mixer_window; // detached window (NULL until first detach)
     bool m_mixer_visible;        // user toggled the mixer on
+
+    BFilePanel *m_load_panel; // "Load File as New Track" open panel (lazy)
 
     gulong m_track_added_h;
     gulong m_track_removed_h;

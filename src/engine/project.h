@@ -3,6 +3,7 @@
 
 #include <glib-object.h>
 #include "track.h"
+#include "undo.h"
 
 G_BEGIN_DECLS
 
@@ -34,6 +35,7 @@ struct _JackDawProject {
     JackDawTrack *active_track; /* primary/active track (borrowed, weak): the
                                  * single target for undo/paste/keyboard ops.
                                  * Always a member of sel_tracks, or NULL. */
+    JackDawUndoManager *undo;   /* global undo/redo history (owned) */
     gchar *project_file;        /* NULL if unsaved */
 
     gfloat master_volume;
@@ -114,10 +116,15 @@ JackDawTrack *jackdaw_project_get_active_track(JackDawProject *p);
 void jackdaw_project_set_active_track(JackDawProject *p, JackDawTrack *t);
 
 /* ---- Global undo/redo ----
- * TODO(flagged): no-op stubs — the undo manager is a later-phase port. The
- * entry points exist so callers keep the Linux tree's shape. */
+ * One chronological history for the whole project; a single Ctrl+Z undoes the
+ * last edit regardless of which track produced it. */
+JackDawUndoManager *jackdaw_project_get_undo(JackDawProject *p);
 void jackdaw_project_undo(JackDawProject *p);
 void jackdaw_project_redo(JackDawProject *p);
+
+/* Snapshot a track's region list BEFORE a region edit and push an undo action.
+ * Restore re-applies the captured regions and republishes the feeder snapshot. */
+void jackdaw_project_push_region_undo(JackDawProject *p, JackDawTrack *t);
 
 /* Master volume */
 void jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol);

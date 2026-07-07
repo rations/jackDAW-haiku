@@ -34,6 +34,10 @@ static void jackdaw_project_finalize(GObject *obj)
         g_ptr_array_unref(p->sel_tracks);
         p->sel_tracks = NULL;
     }
+    if (p->undo) {
+        undo_manager_free(p->undo);
+        p->undo = NULL;
+    }
     g_free(p->project_file);
 
     G_OBJECT_CLASS(jackdaw_project_parent_class)->finalize(obj);
@@ -76,6 +80,7 @@ static void jackdaw_project_init(JackDawProject *p)
     p->tracks = g_ptr_array_new_with_free_func(g_object_unref);
     p->sel_tracks = g_ptr_array_new(); /* borrowed pointers, no free func */
     p->active_track = NULL;
+    p->undo = undo_manager_new(64);
     p->project_file = NULL;
     p->master_volume = 1.0f;
     p->master_muted = FALSE;
@@ -257,16 +262,60 @@ void jackdaw_project_set_active_track(JackDawProject *p, JackDawTrack *t)
     g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
 }
 
-/* ---- Global undo/redo (stubs, see header) ---- */
+/* ---- Global undo/redo ---- */
+
+JackDawUndoManager *jackdaw_project_get_undo(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), NULL);
+    return p->undo;
+}
 
 void jackdaw_project_undo(JackDawProject *p)
 {
     g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    undo_manager_undo(p->undo);
 }
 
 void jackdaw_project_redo(JackDawProject *p)
 {
     g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    undo_manager_redo(p->undo);
+}
+
+/* Region-edit memento: ctx is the target track (holds a ref); saved_state is a
+ * deep copy of its region list. Restore swaps the list back and republishes the
+ * feeder snapshot (which emits state-changed so wave views redraw). */
+static gpointer region_undo_capture(gpointer ctx)
+{
+    return clip_region_list_copy(jackdaw_track_get_regions(JACKDAW_TRACK(ctx)));
+}
+
+static void region_undo_restore(gpointer ctx, gpointer state)
+{
+    jackdaw_track_apply_regions(JACKDAW_TRACK(ctx), (GPtrArray *)state);
+}
+
+static void region_undo_free_state(gpointer state)
+{
+    if (state)
+        g_ptr_array_unref((GPtrArray *)state);
+}
+
+void jackdaw_project_push_region_undo(JackDawProject *p, JackDawTrack *t)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    JackDawUndoAction a = {
+        .ctx = g_object_ref(t),
+        .saved_state = clip_region_list_copy(jackdaw_track_get_regions(t)),
+        .capture_fn = region_undo_capture,
+        .restore_fn = region_undo_restore,
+        .free_fn = region_undo_free_state,
+        .after_fn = NULL,
+        .ctx_free_fn = g_object_unref,
+        .desc = g_strdup("Region edit"),
+    };
+    undo_manager_push(p->undo, &a);
 }
 
 /* ---- Master volume ---- */

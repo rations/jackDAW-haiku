@@ -1,5 +1,6 @@
 #include <string.h>
 #include "track.h"
+#include "jackdaw-engine.h"
 #include "message.h"
 
 G_DEFINE_TYPE(JackDawTrack, jackdaw_track, G_TYPE_OBJECT)
@@ -18,6 +19,17 @@ static void jackdaw_track_finalize(GObject *obj)
     g_free(t->audio_src_port);
     g_free(t->audio_src_port_r);
     g_free(t->midi_src_port);
+
+    if (t->regions)
+        g_ptr_array_unref(t->regions);
+    if (t->rt_snapshot)
+        clip_region_snapshot_unref(t->rt_snapshot);
+    g_mutex_clear(&t->region_lock);
+
+    if (t->play_buf_L)
+        jack_ringbuffer_free(t->play_buf_L);
+    if (t->play_buf_R)
+        jack_ringbuffer_free(t->play_buf_R);
 
     G_OBJECT_CLASS(jackdaw_track_parent_class)->finalize(obj);
 }
@@ -54,17 +66,125 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->pan = 0.0f;
     t->peak_L = 0.0f;
     t->peak_R = 0.0f;
+
+    t->regions = clip_region_list_new();
+    g_mutex_init(&t->region_lock);
+    t->rt_snapshot = clip_region_snapshot_new(t->regions);
+    t->clip_start = 0;
+    t->play_buf_L = NULL;
+    t->play_buf_R = NULL;
+    t->played_frames = 0;
 }
 
 /* ---- Constructor ---- */
 
-JackDawTrack *jackdaw_track_new(const gchar *name)
+JackDawTrack *jackdaw_track_new(const gchar *name, AudioClip *clip)
 {
     JackDawTrack *t = g_object_new(JACKDAW_TYPE_TRACK, NULL);
 
     t->name = g_strdup(name ? name : "Track");
 
+    /* If an initial clip is supplied, place it as a single region at tl=0.
+     * jackdaw_track_set_clip consumes one reference, matching the take-ownership
+     * contract of this constructor. Audio ringbuffers are allocated later by
+     * jackdaw_engine_add_track() once the JACK sample rate is known. */
+    if (clip)
+        jackdaw_track_set_clip(t, clip);
+
     return t;
+}
+
+/* ---- Clip regions ---- */
+
+/* Region duration on the timeline (timeline frames) for a whole file. */
+static off_t clip_timeline_length(AudioClip *clip)
+{
+    if (!clip)
+        return 0;
+    int jack_sr = (int)jackdaw_engine_get_sample_rate();
+    int clip_sr = clip->info.samplerate;
+    if (clip_sr <= 0 || jack_sr <= 0 || clip_sr == jack_sr)
+        return clip->info.frames;
+    return (off_t)((double)clip->info.frames * (double)jack_sr / (double)clip_sr + 0.5);
+}
+
+AudioClip *jackdaw_track_get_clip(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), NULL);
+    if (!t->regions || t->regions->len == 0)
+        return NULL;
+    ClipRegion *r = g_ptr_array_index(t->regions, 0);
+    return r->clip;
+}
+
+void jackdaw_track_place_clip(JackDawTrack *t, AudioClip *clip, off_t tl_pos)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (!clip)
+        return;
+    ClipRegion *r = clip_region_new(clip, 0, clip_timeline_length(clip), tl_pos);
+    g_ptr_array_add(t->regions, r);
+    clip_region_list_sort(t->regions);
+    audio_clip_free(clip); /* consume caller's reference */
+    jackdaw_track_commit_regions(t);
+}
+
+void jackdaw_track_set_clip(JackDawTrack *t, AudioClip *new_clip)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (t->regions->len > 0)
+        g_ptr_array_remove_range(t->regions, 0, t->regions->len);
+    if (new_clip)
+        jackdaw_track_place_clip(t, new_clip, t->clip_start);
+    else
+        jackdaw_track_commit_regions(t);
+}
+
+GPtrArray *jackdaw_track_get_regions(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), NULL);
+    return t->regions;
+}
+
+void jackdaw_track_commit_regions(JackDawTrack *t)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    clip_region_list_sort(t->regions);
+    ClipRegionSnapshot *snap = clip_region_snapshot_new(t->regions);
+    g_mutex_lock(&t->region_lock);
+    ClipRegionSnapshot *old = t->rt_snapshot;
+    t->rt_snapshot = snap;
+    g_mutex_unlock(&t->region_lock);
+    if (old)
+        clip_region_snapshot_unref(old);
+    g_signal_emit(t, track_signals[SIGNAL_STATE_CHANGED], 0);
+}
+
+void jackdaw_track_apply_regions(JackDawTrack *t, GPtrArray *list)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (t->regions->len > 0)
+        g_ptr_array_remove_range(t->regions, 0, t->regions->len);
+    if (list) {
+        for (guint i = 0; i < list->len; i++)
+            g_ptr_array_add(t->regions, clip_region_copy(g_ptr_array_index(list, i)));
+    }
+    jackdaw_track_commit_regions(t);
+}
+
+off_t jackdaw_track_total_frames(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), 0);
+    return clip_region_list_total_frames(t->regions);
+}
+
+ClipRegionSnapshot *jackdaw_track_ref_snapshot(JackDawTrack *t)
+{
+    ClipRegionSnapshot *s;
+    g_mutex_lock(&t->region_lock);
+    s = clip_region_snapshot_ref(t->rt_snapshot);
+    g_mutex_unlock(&t->region_lock);
+    return s;
 }
 
 /* ---- Accessors ---- */
