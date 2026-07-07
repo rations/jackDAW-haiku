@@ -44,11 +44,17 @@ typedef struct {
     volatile gint transport_flags; /* ENGINE_PLAYING | ENGINE_RECORDING */
     volatile off_t play_pos;       /* sample counter, incremented by process cb */
 
-    /* Loop region (frames) — fields reserved for the phase-2 port of looping
-     * and punch recording; nothing reads them yet. */
+    /* Loop region (frames). Looping is active only while loop_enabled is set and
+     * loop_end > loop_start; the playhead wraps loop_end -> loop_start once it
+     * has entered the region. Written on the window thread, read by RT. */
     volatile gint loop_enabled;
     volatile off_t loop_start;
     volatile off_t loop_end;
+
+    /* Record mode (RECORD_MODE_NORMAL / RECORD_MODE_PUNCH). Punch capture over
+     * the loop-tab region is wired in the recording phase; stored here now so
+     * the RT capture path can read it. Window thread writes, RT reads. */
+    volatile gint record_mode;
 
     /* Count-in pre-roll. While countin_active the transport is in a metronome-
      * only lead-in: the project is frozen (play_pos does not advance) and nothing
@@ -193,6 +199,21 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
     if (flags & ENGINE_PLAYING)
         engine.play_pos += nframes;
+
+    /* Loop wrap (master clock — drives the metronome and the UI playhead, and
+     * later MIDI scheduling and the feeder). Only engages when this block
+     * started inside the region: block-start in [loop_start, loop_end). A
+     * playhead placed after the region therefore plays straight through without
+     * looping. The remainder past loop_end is carried over so the loop period
+     * equals the region length. Checked at block granularity, so the loop point
+     * quantizes to the JACK period (acceptable for now). */
+    if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.loop_enabled)) {
+        off_t l_start = engine.loop_start;
+        off_t l_end = engine.loop_end;
+        off_t bstart = engine.play_pos - (off_t)nframes;
+        if (l_end > l_start && bstart >= l_start && bstart < l_end && engine.play_pos >= l_end)
+            engine.play_pos = l_start + (engine.play_pos - l_end);
+    }
 
     /* Phase 2 ports the per-track mixing passes (solo scan, worker fan-out,
      * live monitoring, capture) here. With no track audio yet the master sum
@@ -365,10 +386,14 @@ gboolean jackdaw_engine_init(JackDawProject *project)
      * together with the capture and MIDI ports. */
     engine.audio_out_count = 2;
 
-    engine.client = jack_client_open("jackdaw", JackNullOption, &status);
+    /* JackNoStartServer: connect only to the server the user already started
+     * (e.g. from jack-graph's settings), never spawn or reconfigure one of our
+     * own. If no server is running this fails cleanly and the user is told to
+     * start jackd first — JackDAW is a plain client, not a server manager. */
+    engine.client = jack_client_open("jackdaw", JackNoStartServer, &status);
     if (!engine.client) {
-        jackdaw_error("Could not connect to JACK server.\n"
-                      "Is jackd running?");
+        jackdaw_error("Could not connect to the JACK server.\n"
+                      "Start JACK first (e.g. from jack-graph), then launch JackDAW.");
         return TRUE;
     }
 
@@ -436,6 +461,16 @@ gboolean jackdaw_engine_init(JackDawProject *project)
                 const char *src = jack_port_name(engine.audio_out[pi]);
                 int r = jack_connect(engine.client, src, phys_audio_in[pi]);
                 (void)r; /* EEXIST is fine */
+            }
+            /* Also monitor the dedicated metronome click through the same
+             * physical outputs (mono -> both), so it is audible by default
+             * while staying out of the DAW's main mix (never summed into the
+             * master, meters or recordings). The user can rewire it to a
+             * separate headphone bus in the patchbay. EEXIST is fine. */
+            if (engine.metro_out) {
+                const char *msrc = jack_port_name(engine.metro_out);
+                for (guint mi = 0; mi < 2 && phys_audio_in[mi]; mi++)
+                    (void)jack_connect(engine.client, msrc, phys_audio_in[mi]);
             }
             jack_free(phys_audio_in);
         }
@@ -633,6 +668,60 @@ void jackdaw_engine_locate(off_t sample)
     jackdaw_engine_stop_recording();
     engine.play_pos = sample;
     /* Phase 2 re-seeks every feeder slot to the new position here. */
+}
+
+/* -----------------------------------------------------------------------
+ * Loop region / record mode
+ * ----------------------------------------------------------------------- */
+
+void jackdaw_engine_set_loop_range(off_t start, off_t end)
+{
+    if (end < start) {
+        off_t tmp = start;
+        start = end;
+        end = tmp;
+    }
+    if (start < 0)
+        start = 0;
+    if (end < 0)
+        end = 0;
+    /* Publish start first, then end, so the RT path never sees end < start. */
+    engine.loop_start = start;
+    engine.loop_end = end;
+}
+
+void jackdaw_engine_get_loop_range(off_t *start, off_t *end)
+{
+    if (start)
+        *start = engine.loop_start;
+    if (end)
+        *end = engine.loop_end;
+}
+
+void jackdaw_engine_set_loop_enabled(gboolean on)
+{
+    g_atomic_int_set(&engine.loop_enabled, on ? 1 : 0);
+}
+
+gboolean jackdaw_engine_get_loop_enabled(void)
+{
+    return g_atomic_int_get(&engine.loop_enabled) != 0;
+}
+
+gboolean jackdaw_engine_has_loop_region(void)
+{
+    return engine.loop_end > engine.loop_start;
+}
+
+void jackdaw_engine_set_record_mode(int mode)
+{
+    g_atomic_int_set(&engine.record_mode,
+                     mode == RECORD_MODE_PUNCH ? RECORD_MODE_PUNCH : RECORD_MODE_NORMAL);
+}
+
+int jackdaw_engine_get_record_mode(void)
+{
+    return g_atomic_int_get(&engine.record_mode);
 }
 
 /* -----------------------------------------------------------------------

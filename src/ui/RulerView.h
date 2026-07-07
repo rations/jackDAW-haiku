@@ -22,7 +22,12 @@ public:
 private:
     void DrawTimeTicks(BRect bounds);
     void DrawBarTicks(BRect bounds);
+    void DrawLoop(BRect bounds);
+    // Hit-test x against the loop tabs: 1 = start tab, 2 = end tab, 0 = none.
+    int LoopHit(float x) const;
+    void LoopDragTo(float x);
 
     TimelineView *m_timeline; // borrowed (parent)
-    bool m_dragging;
+    bool m_dragging;          // scrub drag in progress
+    int m_loop_drag_edge;     // 0 none, 1 start tab, 2 end tab
 };

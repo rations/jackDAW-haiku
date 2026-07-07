@@ -70,6 +70,26 @@ void jackdaw_engine_stop_recording(void);
 gboolean jackdaw_engine_begin_countin(guint beats, gboolean record);
 void jackdaw_engine_locate(off_t sample);
 
+/* --- Loop region ---
+ * A [start, end) frame span the playhead wraps back over while looping is
+ * enabled. The wrap fires only once the playhead has entered the region
+ * (block-start in [start, end)); a playhead placed after the region plays
+ * straight through. set_loop_range normalises start <= end. All accesses are
+ * atomic (written on the window thread, read by the RT callback). */
+void jackdaw_engine_set_loop_range(off_t start, off_t end);
+void jackdaw_engine_get_loop_range(off_t *start, off_t *end);
+void jackdaw_engine_set_loop_enabled(gboolean on);
+gboolean jackdaw_engine_get_loop_enabled(void);
+gboolean jackdaw_engine_has_loop_region(void); /* TRUE when loop_end > loop_start */
+
+/* --- Record mode ---
+ * RECORD_MODE_PUNCH auto-records armed audio tracks over the loop-tab region
+ * [loop_start, loop_end) (wired in the recording phase); RECORD_MODE_NORMAL
+ * records from the cursor. Stored here so the RT capture path can read it. */
+enum { RECORD_MODE_NORMAL = 0, RECORD_MODE_PUNCH = 1 };
+void jackdaw_engine_set_record_mode(int mode);
+int jackdaw_engine_get_record_mode(void);
+
 /* TRUE while a count-in pre-roll is sounding (transport not yet engaged). */
 gboolean jackdaw_engine_is_counting_in(void);
 

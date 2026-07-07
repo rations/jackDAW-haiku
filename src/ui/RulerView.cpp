@@ -4,6 +4,7 @@
 #include <InterfaceDefs.h>
 #include <Window.h>
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -19,7 +20,8 @@ static const float kMidTickLen = 8.0f;
 static const float kMinorTickLen = 4.0f;
 
 RulerView::RulerView(TimelineView *timeline)
-    : BView("ruler", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE), m_timeline(timeline), m_dragging(false)
+    : BView("ruler", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE), m_timeline(timeline),
+      m_dragging(false), m_loop_drag_edge(0)
 {
     SetExplicitMinSize(BSize(B_SIZE_UNSET, kTimelineRulerHeight));
     SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, kTimelineRulerHeight));
@@ -44,6 +46,8 @@ void RulerView::Draw(BRect updateRect)
         DrawBarTicks(bounds);
     else
         DrawTimeTicks(bounds);
+
+    DrawLoop(bounds);
 
     // Playhead marker: a line with a small triangle hanging from the top.
     float x = m_timeline->FrameToX(jackdaw_engine_get_play_pos());
@@ -161,10 +165,93 @@ void RulerView::DrawBarTicks(BRect bounds)
     }
 }
 
+// Amber loop-region band + two draggable end tabs, drawn over the ticks in
+// either ruler mode. The tabs are always meaningful: with no region set both
+// edges sit at frame 0, so a drag from there creates one. The band is brighter
+// while looping is enabled.
+void RulerView::DrawLoop(BRect bounds)
+{
+    if (m_timeline->Spp() <= 0.0)
+        return;
+
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    bool has = jackdaw_engine_has_loop_region();
+    bool on = jackdaw_engine_get_loop_enabled();
+
+    float x0 = m_timeline->FrameToX(ls);
+    float x1 = m_timeline->FrameToX(le);
+
+    if (has && x1 >= bounds.left && x0 <= bounds.right) {
+        float bx0 = x0 < bounds.left ? bounds.left : x0;
+        float bx1 = x1 > bounds.right ? bounds.right : x1;
+        rgb_color band = {243, 166, 26, (uint8)(on ? 90 : 45)};
+        SetDrawingMode(B_OP_ALPHA);
+        SetHighColor(band);
+        FillRect(BRect(bx0, bounds.top, bx1, bounds.bottom));
+        SetDrawingMode(B_OP_COPY);
+    }
+
+    rgb_color tab = {243, 166, 26, 255};
+    SetHighColor(tab);
+    if (x0 >= bounds.left - 5 && x0 <= bounds.right + 5)
+        FillRect(BRect(x0, bounds.top, x0 + 4, bounds.bottom)); // start tab: right of x0
+    if (x1 >= bounds.left - 5 && x1 <= bounds.right + 5)
+        FillRect(BRect(x1 - 4, bounds.top, x1, bounds.bottom)); // end tab: left of x1
+}
+
+int RulerView::LoopHit(float x) const
+{
+    if (m_timeline->Spp() <= 0.0)
+        return 0;
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    float x0 = m_timeline->FrameToX(ls);
+    float x1 = m_timeline->FrameToX(le);
+    if (!jackdaw_engine_has_loop_region())
+        return (fabsf(x - x0) <= 6.0f) ? 2 : 0; // no region: grab end tab, drag right
+    if (fabsf(x - x0) <= 6.0f)
+        return 1;
+    if (fabsf(x - x1) <= 6.0f)
+        return 2;
+    return 0;
+}
+
+void RulerView::LoopDragTo(float x)
+{
+    off_t frame = m_timeline->XToFrame(x);
+    if (frame < 0)
+        frame = 0;
+    frame =
+        jackdaw_project_snap_frame(m_timeline->Project(), frame, jackdaw_engine_get_sample_rate());
+
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    if (m_loop_drag_edge == 1) { // start tab
+        if (frame > le)
+            frame = le;
+        jackdaw_engine_set_loop_range(frame, le);
+    } else { // end tab
+        if (frame < ls)
+            frame = ls;
+        jackdaw_engine_set_loop_range(ls, frame);
+    }
+    m_timeline->InvalidateAll();
+}
+
 void RulerView::MouseDown(BPoint where)
 {
-    m_dragging = true;
     SetMouseEventMask(B_POINTER_EVENTS, B_LOCK_WINDOW_FOCUS);
+
+    // A loop tab takes priority over scrubbing.
+    int edge = LoopHit(where.x);
+    if (edge) {
+        m_loop_drag_edge = edge;
+        LoopDragTo(where.x);
+        return;
+    }
+
+    m_dragging = true;
     m_timeline->LocateTo(m_timeline->XToFrame(where.x));
 }
 
@@ -172,13 +259,16 @@ void RulerView::MouseUp(BPoint where)
 {
     (void)where;
     m_dragging = false;
+    m_loop_drag_edge = 0;
 }
 
 void RulerView::MouseMoved(BPoint where, uint32 code, const BMessage *dragMessage)
 {
     (void)code;
     (void)dragMessage;
-    if (m_dragging)
+    if (m_loop_drag_edge)
+        LoopDragTo(where.x);
+    else if (m_dragging)
         m_timeline->LocateTo(m_timeline->XToFrame(where.x));
 }
 

@@ -92,7 +92,10 @@ static void jackdaw_project_init(JackDawProject *p)
     p->metronome_enabled = FALSE;
     p->metronome_volume_db = 0.0; /* unity; loaded per-project from save file */
     p->metronome_gain = 1.0f;
-    p->metronome_route = METRONOME_ROUTE_MAIN;
+    /* Default: click on the dedicated "metronome" port only, kept out of the
+     * main mix (so it is never in recordings or the master meter). The engine
+     * auto-connects that port to the physical playback so it is still heard. */
+    p->metronome_route = METRONOME_ROUTE_CLICK_PORT;
     p->countin_before_record = 0;
     p->countin_before_play = 0;
     p->ruler_mode = JACKDAW_RULER_TIME;

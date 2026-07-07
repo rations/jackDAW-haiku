@@ -4,9 +4,11 @@
 #include <CheckBox.h>
 #include <Font.h>
 #include <LayoutBuilder.h>
+#include <Looper.h>
+#include <Message.h>
+#include <SeparatorView.h>
 #include <StringView.h>
-#include <TextControl.h>
-#include <TextView.h>
+#include <Window.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,16 +17,96 @@
 #include "engine/tempomap.h"
 #include "engine/timeruler.h"
 #include "Messages.h"
+#include "StepperControl.h"
+
+// Timecode formats cycled by clicking the position readout (time-ruler mode).
+static const int32 kTimeModes[] = {TIMEMODE_REALLONG, TIMEMODE_REAL,  TIMEMODE_SAMPLES,
+                                   TIMEMODE_24FPS,    TIMEMODE_25FPS, TIMEMODE_NTSC,
+                                   TIMEMODE_30FPS};
+static const int kNumTimeModes = (int)(sizeof(kTimeModes) / sizeof(kTimeModes[0]));
+
+// A BButton that, on a right-click, posts a context-menu trigger (with the
+// screen point) to its window instead of invoking/toggling. Used for the
+// Record, Metro and Mixer buttons.
+class ContextButton : public BButton
+{
+public:
+    ContextButton(const char *name, const char *label, BMessage *invoke, uint32 context_what)
+        : BButton(name, label, invoke), m_context_what(context_what)
+    {
+    }
+
+    void MouseDown(BPoint where) override
+    {
+        int32 buttons = 0;
+        if (Looper()) {
+            BMessage *cur = Looper()->CurrentMessage();
+            if (cur)
+                cur->FindInt32("buttons", &buttons);
+        }
+        if (buttons & B_SECONDARY_MOUSE_BUTTON) {
+            ConvertToScreen(&where);
+            BMessage msg(m_context_what);
+            msg.AddPoint("screen_where", where);
+            if (Window())
+                Window()->PostMessage(&msg);
+            return; // don't invoke/toggle on right-click
+        }
+        BButton::MouseDown(where);
+    }
+
+private:
+    uint32 m_context_what;
+};
+
+// A BStringView that posts a message to a target handler when clicked — the
+// position readout, which cycles the timecode format.
+class ClickableStringView : public BStringView
+{
+public:
+    ClickableStringView(const char *name, const char *text, uint32 click_what)
+        : BStringView(name, text), m_click_what(click_what), m_target(NULL)
+    {
+    }
+
+    void SetClickTarget(BHandler *target)
+    {
+        m_target = target;
+    }
+
+    void MouseDown(BPoint where) override
+    {
+        (void)where;
+        if (m_target && Looper())
+            Looper()->PostMessage(m_click_what, m_target);
+    }
+
+private:
+    uint32 m_click_what;
+    BHandler *m_target;
+};
 
 TransportView::TransportView(JackDawProject *project)
-    : BView("transport", B_WILL_DRAW), m_project(project)
+    : BView("transport", B_WILL_DRAW), m_project(project), m_timemode(TIMEMODE_REALLONG)
 {
     m_rtz_button = new BButton("|◀", new BMessage(MSG_TRANSPORT_RTZ));
+    m_step_back = new BButton("|<<", new BMessage(MSG_TRANSPORT_STEP_BACK));
+    m_step_fwd = new BButton(">>|", new BMessage(MSG_TRANSPORT_STEP_FWD));
+    m_next_button = new BButton("▶|", new BMessage(MSG_TRANSPORT_NEXT_BOUNDARY));
     m_play_button = new BButton("▶", new BMessage(MSG_TRANSPORT_PLAY));
+    m_loop_button = new BButton("⟳", new BMessage(MSG_TRANSPORT_LOOP));
+    m_pause_button = new BButton("||", new BMessage(MSG_TRANSPORT_PAUSE));
     m_stop_button = new BButton("■", new BMessage(MSG_TRANSPORT_STOP));
-    m_record_button = new BButton("●", new BMessage(MSG_TRANSPORT_RECORD));
+    m_record_button =
+        new ContextButton("record", "●", new BMessage(MSG_TRANSPORT_RECORD), MSG_RECORD_MENU);
 
-    m_readout = new BStringView("readout", "00:00.000");
+    m_play_button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+    m_loop_button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+    m_record_button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+
+    ClickableStringView *readout =
+        new ClickableStringView("readout", "00:00.000", MSG_CYCLE_TIMEMODE);
+    m_readout = readout;
     m_state = new BStringView("state", "");
     BFont font(be_bold_font);
     font.SetSize(font.Size() * 1.6f);
@@ -33,33 +115,55 @@ TransportView::TransportView(JackDawProject *project)
     m_readout->SetAlignment(B_ALIGN_LEFT);
     m_state->SetAlignment(B_ALIGN_LEFT);
 
-    m_bpm = new BTextControl("BPM", "120", new BMessage(MSG_SET_BPM));
-    m_sig_num = new BTextControl("", "4", new BMessage(MSG_SET_TIMESIG));
-    m_sig_den = new BTextControl("/", "4", new BMessage(MSG_SET_TIMESIG));
-
-    m_metronome = new BCheckBox("Click", new BMessage(MSG_TOGGLE_METRONOME));
+    m_split_button = new BButton("Split", new BMessage(MSG_SPLIT));
     m_grid = new BCheckBox("Grid", new BMessage(MSG_TOGGLE_GRID));
     m_snap = new BCheckBox("Snap", new BMessage(MSG_TOGGLE_SNAP));
+    m_metro_button =
+        new ContextButton("metro", "Metro", new BMessage(MSG_TOGGLE_METRONOME), MSG_METRO_MENU);
+    m_metro_button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_bars_mode = new BCheckBox("Bars", new BMessage(MSG_TOGGLE_RULER_MODE));
 
-    BLayoutBuilder::Group<>(this, B_HORIZONTAL, B_USE_SMALL_SPACING)
-        .SetInsets(B_USE_SMALL_INSETS)
+    m_bpm = new StepperControl("bpm", "BPM", new BMessage(MSG_SET_BPM), 20, 999, 1, 0);
+    m_sig_num = new StepperControl("signum", "Sig", new BMessage(MSG_SET_TIMESIG), 1, 32, 1, 0);
+    m_sig_den = new StepperControl("sigden", "/", new BMessage(MSG_SET_TIMESIG), 1, 32, 1, 0);
+
+    m_mixer_button =
+        new ContextButton("mixer", "Mixer", new BMessage(MSG_MIXER_TOGGLE), MSG_MIXER_MENU);
+    m_mixer_button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+
+    BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
+        .AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING)
+        .SetInsets(B_USE_SMALL_INSETS, B_USE_SMALL_INSETS, B_USE_SMALL_INSETS, 0)
         .Add(m_rtz_button)
+        .Add(m_step_back)
+        .Add(m_step_fwd)
+        .Add(m_next_button)
+        .Add(new BSeparatorView(B_VERTICAL))
         .Add(m_play_button)
+        .Add(m_loop_button)
+        .Add(m_pause_button)
         .Add(m_stop_button)
         .Add(m_record_button)
         .AddStrut(12.0f)
         .Add(m_readout)
         .Add(m_state)
         .AddGlue()
+        .End()
+        .AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING)
+        .SetInsets(B_USE_SMALL_INSETS, 0, B_USE_SMALL_INSETS, B_USE_SMALL_INSETS)
+        .Add(m_split_button)
+        .Add(m_metro_button)
+        .Add(new BSeparatorView(B_VERTICAL))
+        .Add(m_grid)
+        .Add(m_snap)
+        .Add(m_bars_mode)
+        .AddStrut(12.0f)
         .Add(m_bpm)
         .Add(m_sig_num)
         .Add(m_sig_den)
-        .AddStrut(12.0f)
-        .Add(m_metronome)
-        .Add(m_grid)
-        .Add(m_snap)
-        .Add(m_bars_mode);
+        .AddGlue()
+        .Add(m_mixer_button)
+        .End();
 }
 
 void TransportView::AttachedToWindow()
@@ -82,16 +186,17 @@ void TransportView::AttachedToWindow()
     m_state->SetExplicitMinSize(BSize(state_w, B_SIZE_UNSET));
     m_state->SetExplicitMaxSize(BSize(state_w, B_SIZE_UNSET));
 
-    // Tempo/toggle controls apply straight to the project on this window's
-    // looper thread; the transport buttons keep their default target (the
-    // window), which owns all engine transport calls.
-    m_bpm->SetTarget(this);
-    m_sig_num->SetTarget(this);
-    m_sig_den->SetTarget(this);
-    m_metronome->SetTarget(this);
+    // Project-scoped controls apply on this looper; the readout cycles its own
+    // timecode format. The transport/loop/mixer buttons keep their default
+    // target (the window), which owns the engine calls.
+    static_cast<ClickableStringView *>(m_readout)->SetClickTarget(this);
+    m_metro_button->SetTarget(this);
     m_grid->SetTarget(this);
     m_snap->SetTarget(this);
     m_bars_mode->SetTarget(this);
+    m_bpm->SetTarget(this);
+    m_sig_num->SetTarget(this);
+    m_sig_den->SetTarget(this);
 
     SyncControls();
     UpdateReadout();
@@ -99,16 +204,12 @@ void TransportView::AttachedToWindow()
 
 void TransportView::SyncControls()
 {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%g", jackdaw_project_get_bpm(m_project));
-    m_bpm->SetText(buf);
-    snprintf(buf, sizeof(buf), "%u", m_project->beats_per_bar);
-    m_sig_num->SetText(buf);
-    snprintf(buf, sizeof(buf), "%u", m_project->beat_unit);
-    m_sig_den->SetText(buf);
-    m_metronome->SetValue(m_project->metronome_enabled ? B_CONTROL_ON : B_CONTROL_OFF);
+    m_bpm->SetValue(jackdaw_project_get_bpm(m_project));
+    m_sig_num->SetValue(m_project->beats_per_bar);
+    m_sig_den->SetValue(m_project->beat_unit);
     m_grid->SetValue(m_project->grid_enabled ? B_CONTROL_ON : B_CONTROL_OFF);
     m_snap->SetValue(m_project->snap_enabled ? B_CONTROL_ON : B_CONTROL_OFF);
+    m_metro_button->SetValue(m_project->metronome_enabled ? B_CONTROL_ON : B_CONTROL_OFF);
     m_bars_mode->SetValue(m_project->ruler_mode == JACKDAW_RULER_BARS ? B_CONTROL_ON
                                                                       : B_CONTROL_OFF);
 }
@@ -127,20 +228,30 @@ void TransportView::UpdateReadout()
         snprintf(text, sizeof(text), "%u.%u.%03u", bbt.bar, bbt.beat, bbt.tick);
     } else {
         char tc[64];
-        format_timecode(sr, pos, 0, tc, TIMEMODE_REALLONG);
+        format_timecode(sr, pos, 0, tc, m_timemode);
         snprintf(text, sizeof(text), "%s", tc);
     }
 
     m_readout->SetText(text);
 
-    if (jackdaw_engine_is_counting_in())
+    bool playing = jackdaw_engine_is_playing();
+    bool recording = jackdaw_engine_is_recording();
+    bool counting = jackdaw_engine_is_counting_in();
+
+    if (counting)
         m_state->SetText("…");
-    else if (jackdaw_engine_is_recording())
+    else if (recording)
         m_state->SetText("●");
-    else if (jackdaw_engine_is_playing())
+    else if (playing)
         m_state->SetText("▶");
     else
         m_state->SetText("");
+
+    // Reflect engine state on the toggle buttons (state can change via keyboard,
+    // menu, count-in hand-off or loop, not only the buttons themselves).
+    m_play_button->SetValue((playing || counting) ? B_CONTROL_ON : B_CONTROL_OFF);
+    m_record_button->SetValue(recording ? B_CONTROL_ON : B_CONTROL_OFF);
+    m_loop_button->SetValue(jackdaw_engine_get_loop_enabled() ? B_CONTROL_ON : B_CONTROL_OFF);
 }
 
 void TransportView::MouseDown(BPoint where)
@@ -153,33 +264,23 @@ void TransportView::MessageReceived(BMessage *message)
 {
     switch (message->what) {
         case MSG_SET_BPM: {
-            double bpm = atof(m_bpm->Text());
+            double bpm = m_bpm->Value();
             if (bpm > 0.0)
                 jackdaw_project_set_bpm(m_project, bpm);
-            SyncControls(); /* show the clamped value */
-            /* Release keyboard focus so Space works as transport toggle again
-             * (the key filter leaves text fields alone while one is focused).
-             * Also clear the selection: the control's Enter handling runs
-             * SelectAll() after posting this message, which otherwise leaves
-             * the number highlighted as if still focused. */
-            m_bpm->MakeFocus(false);
-            m_bpm->TextView()->Select(0, 0);
+            m_bpm->SetValue(jackdaw_project_get_bpm(m_project)); /* show clamp */
             break;
         }
         case MSG_SET_TIMESIG: {
-            int num = atoi(m_sig_num->Text());
-            int den = atoi(m_sig_den->Text());
+            int num = (int)m_sig_num->Value();
+            int den = (int)m_sig_den->Value();
             if (num > 0 && den > 0)
                 jackdaw_project_set_time_signature(m_project, (guint)num, (guint)den);
-            SyncControls();
-            m_sig_num->MakeFocus(false);
-            m_sig_den->MakeFocus(false);
-            m_sig_num->TextView()->Select(0, 0);
-            m_sig_den->TextView()->Select(0, 0);
+            m_sig_num->SetValue(m_project->beats_per_bar);
+            m_sig_den->SetValue(m_project->beat_unit);
             break;
         }
         case MSG_TOGGLE_METRONOME:
-            jackdaw_project_set_metronome(m_project, m_metronome->Value() == B_CONTROL_ON);
+            jackdaw_project_set_metronome(m_project, m_metro_button->Value() == B_CONTROL_ON);
             break;
         case MSG_TOGGLE_GRID:
             jackdaw_project_set_grid_enabled(m_project, m_grid->Value() == B_CONTROL_ON);
@@ -193,6 +294,15 @@ void TransportView::MessageReceived(BMessage *message)
                                                           : JACKDAW_RULER_TIME);
             UpdateReadout();
             break;
+        case MSG_CYCLE_TIMEMODE: {
+            int idx = 0;
+            for (int i = 0; i < kNumTimeModes; i++)
+                if (kTimeModes[i] == m_timemode)
+                    idx = i;
+            m_timemode = kTimeModes[(idx + 1) % kNumTimeModes];
+            UpdateReadout();
+            break;
+        }
         default:
             BView::MessageReceived(message);
             break;

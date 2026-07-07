@@ -7,15 +7,18 @@
 class BButton;
 class BCheckBox;
 class BStringView;
-class BTextControl;
+class ContextButton;
+class StepperControl;
 
-// Transport bar: play/stop/record/RTZ buttons, position readout (timecode or
-// bars.beats.ticks per the project ruler mode), BPM + time signature entry,
-// metronome and snap toggles, ruler-mode toggle.
+// Transport bar (two rows, fixed metrics so it never re-flows on state change):
 //
-// Buttons post MSG_TRANSPORT_* to the window (the sole engine caller); the
-// tempo/toggle controls target this view, which applies them to the project
-// directly — all of it on the owning window's looper thread.
+//   row 1  |◀ |<< >>| ▶|   ▶ ⟳ || ■ ●    <position>  <state>
+//   row 2  Split  Grid Snap Metro Bars   BPM[-/+]  Sig[-/+]/[-/+]     Mixer
+//
+// Momentary transport buttons post MSG_TRANSPORT_* to the window (the sole
+// engine caller). Tempo/grid/metronome controls apply to the project directly
+// on this view (same looper). Right-clicking Record / Metro / Mixer posts a
+// MSG_*_MENU with a screen point so the window can run the context popup.
 class TransportView : public BView
 {
 public:
@@ -23,8 +26,8 @@ public:
 
     void AttachedToWindow() override;
     void MessageReceived(BMessage *message) override;
-    // Clicking the bar's background takes focus away from any text control,
-    // restoring the transport keys.
+    // Clicking the bar background drops text-field focus; clicking the position
+    // readout cycles the timecode format.
     void MouseDown(BPoint where) override;
 
     // Called by the window's UI tick and after timing changes.
@@ -36,16 +39,26 @@ private:
     JackDawProject *m_project; // borrowed
 
     BButton *m_rtz_button;
+    BButton *m_step_back;
+    BButton *m_step_fwd;
+    BButton *m_next_button;
     BButton *m_play_button;
+    BButton *m_loop_button;
+    BButton *m_pause_button;
     BButton *m_stop_button;
-    BButton *m_record_button;
+    ContextButton *m_record_button;
     BStringView *m_readout;
     BStringView *m_state; // ▶ / ● / count-in marker, fixed width
-    BTextControl *m_bpm;
-    BTextControl *m_sig_num;
-    BTextControl *m_sig_den;
-    BCheckBox *m_metronome;
+
+    BButton *m_split_button;
     BCheckBox *m_grid;
     BCheckBox *m_snap;
     BCheckBox *m_bars_mode;
+    ContextButton *m_metro_button;
+    StepperControl *m_bpm;
+    StepperControl *m_sig_num;
+    StepperControl *m_sig_den;
+    ContextButton *m_mixer_button;
+
+    int m_timemode; // TIMEMODE_* used when the ruler is in time mode
 };
