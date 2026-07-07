@@ -17,6 +17,8 @@
 #include "engine/jackdaw-engine.h"
 #include "KnobView.h"
 #include "Messages.h"
+#include "TimelineView.h"  // kTimelineTrackHeight (row geometry for the reorder drag)
+#include "TrackAreaView.h" // parent view: drop-indicator feedback
 #include "VuView.h"
 
 // GObject signal trampolines: a track's state/routing changed elsewhere (e.g.
@@ -52,7 +54,8 @@ TrackStripView::TrackStripView(JackDawProject *project, JackDawTrack *track, con
     : BView("track_strip", B_WILL_DRAW | B_FRAME_EVENTS), m_project(project), m_track(track),
       m_main(main), m_name(NULL), m_arm(NULL), m_mute(NULL), m_solo(NULL), m_stereo(NULL),
       m_fx(NULL), m_vol(NULL), m_pan(NULL), m_input_field(NULL), m_input_menu(NULL), m_vu(NULL),
-      m_state_handler(0), m_routing_handler(0)
+      m_state_handler(0), m_routing_handler(0), m_maybe_drag(false), m_did_drag(false),
+      m_drag_start_y(0.0f), m_drag_from(-1)
 {
     m_name =
         new BTextControl("name", NULL, jackdaw_track_get_name(track), new BMessage(MSG_S_NAME));
@@ -245,7 +248,6 @@ void TrackStripView::ApplyStereo(bool stereo)
 
 void TrackStripView::MouseDown(BPoint where)
 {
-    (void)where;
     int32 buttons = 0;
     int32 modifiers = 0;
     BMessage *msg = Window() ? Window()->CurrentMessage() : NULL;
@@ -264,10 +266,77 @@ void TrackStripView::MouseDown(BPoint where)
     }
 
     // Left click selects the track (Shift/Cmd extends the selection).
-    if (modifiers & (B_SHIFT_KEY | B_COMMAND_KEY))
+    if (modifiers & (B_SHIFT_KEY | B_COMMAND_KEY)) {
         jackdaw_project_toggle_selected(m_project, m_track);
-    else
-        jackdaw_project_select_single(m_project, m_track);
+        return; // multi-select gesture, not a reorder drag
+    }
+    jackdaw_project_select_single(m_project, m_track);
+
+    // Prime a drag-to-reorder: a plain press on the strip background (child
+    // controls consume their own clicks) can become a row drag once the pointer
+    // moves past a small threshold.
+    m_maybe_drag = true;
+    m_did_drag = false;
+    m_drag_start_y = where.y;
+    m_drag_from = jackdaw_project_track_index(m_project, m_track);
+    SetMouseEventMask(B_POINTER_EVENTS, B_LOCK_WINDOW_FOCUS);
+}
+
+// Insertion boundary in [0, track count] for the current pointer position. The
+// vertical scroll offset cancels out because the strip sits at (from*rowH -
+// scroll), so only the press-time index and the local y are needed.
+int TrackStripView::DropGapFor(float local_y) const
+{
+    int n = (int)jackdaw_project_track_count(m_project);
+    float rowH = kTimelineTrackHeight;
+    int gap = (int)floorf(((float)m_drag_from * rowH + local_y) / rowH + 0.5f);
+    if (gap < 0)
+        gap = 0;
+    if (gap > n)
+        gap = n;
+    return gap;
+}
+
+void TrackStripView::MouseMoved(BPoint where, uint32 code, const BMessage *drag)
+{
+    (void)code;
+    (void)drag;
+    if (!m_maybe_drag)
+        return;
+    if (!m_did_drag && fabsf(where.y - m_drag_start_y) < 6.0f)
+        return; // below the movement threshold: still a click, not a drag
+    m_did_drag = true;
+    if (TrackAreaView *area = dynamic_cast<TrackAreaView *>(Parent()))
+        area->SetDropGap(DropGapFor(where.y));
+}
+
+void TrackStripView::MouseUp(BPoint where)
+{
+    if (!m_maybe_drag)
+        return;
+    bool did = m_did_drag;
+    m_maybe_drag = false;
+    m_did_drag = false;
+    if (TrackAreaView *area = dynamic_cast<TrackAreaView *>(Parent()))
+        area->SetDropGap(-1);
+    if (!did || m_drag_from < 0)
+        return;
+
+    int n = (int)jackdaw_project_track_count(m_project);
+    int gap = DropGapFor(where.y);
+    // Removing the source first shifts everything after it up by one, so a gap
+    // below the source maps to gap-1 in the post-removal array.
+    int to = (gap > m_drag_from) ? gap - 1 : gap;
+    if (to < 0)
+        to = 0;
+    if (to > n - 1)
+        to = n - 1;
+    if (to == m_drag_from)
+        return;
+    BMessage m(MSG_TRACK_MOVE);
+    m.AddInt32("from", m_drag_from);
+    m.AddInt32("to", to);
+    m_main.SendMessage(&m);
 }
 
 void TrackStripView::Draw(BRect updateRect)

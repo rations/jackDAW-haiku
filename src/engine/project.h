@@ -37,6 +37,7 @@ struct _JackDawProject {
     gchar *project_file;        /* NULL if unsaved */
 
     gfloat master_volume;
+    gboolean master_muted; /* master bus mute; read by the RT master-fader pass */
 
     /* JACK port counts (0 = auto-detect from physical JACK ports at startup).
      * Non-zero values are user overrides saved in the settings file.
@@ -121,6 +122,8 @@ void jackdaw_project_redo(JackDawProject *p);
 /* Master volume */
 void jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol);
 gfloat jackdaw_project_get_master_volume(JackDawProject *p);
+void jackdaw_project_set_master_muted(JackDawProject *p, gboolean muted);
+gboolean jackdaw_project_get_master_muted(JackDawProject *p);
 
 /* Project file */
 void jackdaw_project_set_file(JackDawProject *p, const gchar *path);

@@ -621,8 +621,10 @@ void MainWindow::MessageReceived(BMessage *message)
             int32 from = -1, to = -1;
             message->FindInt32("from", &from);
             message->FindInt32("to", &to);
-            if (from >= 0 && to >= 0)
+            if (from >= 0 && to >= 0 && from != to) {
                 jackdaw_project_move_track(m_project, (guint)from, (guint)to);
+                jackdaw_project_emit_tracks_reordered(m_project); // resync the row order
+            }
             break;
         }
 
@@ -711,7 +713,9 @@ void MainWindow::MessageReceived(BMessage *message)
             bool on = false;
             message->FindInt32("slot", &slot);
             message->FindBool("on", &on);
-            if (JackDawTrack *t = TrackForSlot(slot))
+            if (slot < 0)
+                jackdaw_project_set_master_muted(m_project, on);
+            else if (JackDawTrack *t = TrackForSlot(slot))
                 jackdaw_track_set_muted(t, on);
             break;
         }

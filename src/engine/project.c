@@ -78,6 +78,7 @@ static void jackdaw_project_init(JackDawProject *p)
     p->active_track = NULL;
     p->project_file = NULL;
     p->master_volume = 1.0f;
+    p->master_muted = FALSE;
     /* 0 = auto-detect from physical JACK ports at engine init */
     p->audio_in_count = settings_get_uint32("jackAudioInCount", 0);
     p->audio_out_count = settings_get_uint32("jackAudioOutCount", 0);
@@ -280,6 +281,18 @@ gfloat jackdaw_project_get_master_volume(JackDawProject *p)
 {
     g_return_val_if_fail(JACKDAW_IS_PROJECT(p), 1.0f);
     return p->master_volume;
+}
+
+void jackdaw_project_set_master_muted(JackDawProject *p, gboolean muted)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    p->master_muted = muted ? TRUE : FALSE;
+}
+
+gboolean jackdaw_project_get_master_muted(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), FALSE);
+    return p->master_muted;
 }
 
 /* ---- Project file ---- */

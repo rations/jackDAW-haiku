@@ -44,6 +44,11 @@ public:
     // Push fresh peak values into each strip's VU (called on the UI tick).
     void UpdateMeters();
 
+    // Drop-insertion indicator for the track drag-reorder gesture. gap is the
+    // boundary index in [0, track count] where the dragged row would land, or -1
+    // to clear the indicator. Called by a TrackStripView mid-drag.
+    void SetDropGap(int gap);
+
 private:
     void RepositionStrips();
     int RowAtY(float y) const; // track index under a lane y, or -1
@@ -54,6 +59,7 @@ private:
 
     float m_scroll_y;
     bool m_dragging;
+    int m_drop_gap; // reorder insertion boundary, or -1 when not dragging
 
     gulong m_added_handler;
     gulong m_removed_handler;

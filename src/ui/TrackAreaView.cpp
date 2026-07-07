@@ -35,7 +35,7 @@ static void area_selection_changed(gpointer /*proj*/, gpointer user)
 
 TrackAreaView::TrackAreaView(TimelineView *timeline)
     : BView("track_area", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE | B_FRAME_EVENTS),
-      m_timeline(timeline), m_scroll_y(0.0f), m_dragging(false), m_added_handler(0),
+      m_timeline(timeline), m_scroll_y(0.0f), m_dragging(false), m_drop_gap(-1), m_added_handler(0),
       m_removed_handler(0), m_reordered_handler(0), m_selection_handler(0)
 {
 }
@@ -135,6 +135,14 @@ void TrackAreaView::UpdateMeters()
     }
 }
 
+void TrackAreaView::SetDropGap(int gap)
+{
+    if (gap == m_drop_gap)
+        return;
+    m_drop_gap = gap;
+    Invalidate();
+}
+
 int TrackAreaView::RowAtY(float y) const
 {
     int row = (int)((y + m_scroll_y) / kTimelineTrackHeight);
@@ -209,6 +217,13 @@ void TrackAreaView::Draw(BRect updateRect)
     if (x >= lane.left && x <= lane.right) {
         SetHighColor(kPlayhead);
         StrokeLine(BPoint(x, lane.top), BPoint(x, lane.bottom));
+    }
+
+    // Drop-insertion indicator during a track drag-reorder.
+    if (m_drop_gap >= 0) {
+        float gy = (float)m_drop_gap * kTimelineTrackHeight - m_scroll_y;
+        SetHighColor(60, 150, 230);
+        FillRect(BRect(0.0f, gy - 1.0f, kTimelineHeaderWidth - 2.0f, gy + 1.0f));
     }
 }
 

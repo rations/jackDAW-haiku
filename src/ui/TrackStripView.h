@@ -28,6 +28,8 @@ public:
     void DetachedFromWindow() override;
     void Draw(BRect updateRect) override;
     void MouseDown(BPoint where) override;
+    void MouseUp(BPoint where) override;
+    void MouseMoved(BPoint where, uint32 code, const BMessage *drag) override;
     void MessageReceived(BMessage *message) override;
 
     JackDawTrack *Track() const
@@ -40,6 +42,7 @@ public:
 private:
     void BuildInputMenu();
     void ApplyStereo(bool stereo);
+    int DropGapFor(float local_y) const; // reorder insertion boundary for a pointer y
 
     JackDawProject *m_project; // borrowed
     JackDawTrack *m_track;     // borrowed (project owns the ref)
@@ -59,4 +62,12 @@ private:
 
     gulong m_state_handler;   // track "state-changed" -> SyncFromTrack
     gulong m_routing_handler; // track "routing-changed" -> SyncFromTrack
+
+    // Drag-to-reorder gesture state (a Haiku-port addition; the Linux UI has no
+    // track-reorder drag). A left-press primes a drag; once the pointer moves
+    // past a threshold the row can be dropped at a new position.
+    bool m_maybe_drag;
+    bool m_did_drag;
+    float m_drag_start_y; // strip-local y at press
+    int m_drag_from;      // track's array index at press
 };

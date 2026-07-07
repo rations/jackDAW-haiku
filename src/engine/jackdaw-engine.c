@@ -305,6 +305,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     }
 
     gfloat master_vol = engine.project ? engine.project->master_volume : 1.0f;
+    if (engine.project && engine.project->master_muted)
+        master_vol = 0.0f;
     float peak_L = 0.0f, peak_R = 0.0f;
     for (k = 0; k < nframes; k++) {
         engine.master_L[k] *= master_vol;

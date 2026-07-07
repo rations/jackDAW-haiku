@@ -52,18 +52,22 @@ MixerStripView::MixerStripView(JackDawProject *project, JackDawTrack *track, con
 
     col.AddGroup(B_HORIZONTAL, 2.0f).AddGlue().Add(m_fader).Add(m_vu).AddGlue().End();
 
+    // Mute is present on every strip including the master bus; Solo is a real-
+    // track concept only (soloing the master would be a no-op against the solo
+    // bus), matching the Linux mixer strip.
+    BSize btn(26.0f, 22.0f); // fix min+max so the buttons never widen the strip
+    m_mute = new BButton("M", "M", new BMessage(MSG_M_MUTE));
+    m_mute->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+    m_mute->SetExplicitMinSize(btn);
+    m_mute->SetExplicitMaxSize(btn);
     if (track) {
-        m_mute = new BButton("M", "M", new BMessage(MSG_M_MUTE));
         m_solo = new BButton("S", "S", new BMessage(MSG_M_SOLO));
-        m_mute->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
         m_solo->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
-        // Fix both min and max so the buttons never widen the strip's minimum.
-        BSize btn(26.0f, 22.0f);
-        m_mute->SetExplicitMinSize(btn);
-        m_mute->SetExplicitMaxSize(btn);
         m_solo->SetExplicitMinSize(btn);
         m_solo->SetExplicitMaxSize(btn);
         col.AddGroup(B_HORIZONTAL, 3.0f).AddGlue().Add(m_mute).Add(m_solo).AddGlue().End();
+    } else {
+        col.AddGroup(B_HORIZONTAL, 3.0f).AddGlue().Add(m_mute).AddGlue().End();
     }
 
     col.End();
@@ -109,6 +113,9 @@ void MixerStripView::Sync()
         m_fader->SetGain(jackdaw_track_get_fader(m_track));
     } else {
         m_fader->SetGain(jackdaw_project_get_master_volume(m_project));
+        if (m_mute)
+            m_mute->SetValue(jackdaw_project_get_master_muted(m_project) ? B_CONTROL_ON
+                                                                         : B_CONTROL_OFF);
     }
 }
 
