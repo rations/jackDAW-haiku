@@ -32,10 +32,17 @@ struct _JackDawTrack {
     guint slot;            /* index in engine track slot array */
     JackDawTrackKind kind; /* audio (default) or instrument */
 
-    /* Input routing — indices into engine port arrays; -1 = none.
-     * Phase 1 registers no capture ports, so these stay -1. */
+    /* Input routing — indices into engine port arrays; -1 = none. */
     gint audio_in_idx;
     gint midi_in_idx;
+
+    /* External JACK ports connected to this track's capture ports (main-thread
+     * only; NULL = no jackdaw-made connection). audio_src_port is the left/mono
+     * source; audio_src_port_r is the right source (NULL when mono). */
+    gchar *audio_src_port;
+    gchar *audio_src_port_r;
+    gchar *midi_src_port;  /* external MIDI source (instrument tracks); NULL = none */
+    gboolean stereo_input; /* TRUE = the track captures a stereo pair */
 
     /* RT-safe state: written atomically by main thread */
     volatile gint32 state_flags;
@@ -97,6 +104,9 @@ gfloat jackdaw_track_get_pan(JackDawTrack *t);
 /* Input routing */
 void jackdaw_track_set_audio_in(JackDawTrack *t, gint idx);
 void jackdaw_track_set_midi_in(JackDawTrack *t, gint idx);
+
+/* Stereo-input flag (main thread). Mono is the default. */
+gboolean jackdaw_track_is_stereo(JackDawTrack *t);
 
 /* Peak meter read (call from main thread) */
 void jackdaw_track_get_peaks(JackDawTrack *t, gfloat *out_L, gfloat *out_R);

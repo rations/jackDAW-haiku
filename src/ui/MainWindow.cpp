@@ -3,6 +3,7 @@
 #include <Application.h>
 #include <InterfaceDefs.h>
 #include <LayoutBuilder.h>
+#include <LayoutItem.h>
 #include <Menu.h>
 #include <MenuBar.h>
 #include <MenuItem.h>
@@ -19,8 +20,22 @@
 #include "engine/settings.h"
 #include "Messages.h"
 #include "MetronomeWindows.h"
+#include "MixerView.h"
+#include "MixerWindow.h"
 #include "TimelineView.h"
 #include "TransportView.h"
+
+// GObject "track-added/removed/reordered" -> refresh both mixers. Emitted only
+// on this (the MainWindow) looper, so touching the docked mixer is safe; the
+// detached window is refreshed via a posted message on its own looper.
+static void mainwin_tracks_changed_2(gpointer, gpointer, gpointer user)
+{
+    static_cast<MainWindow *>(user)->RebuildMixers();
+}
+static void mainwin_tracks_reordered(gpointer, gpointer user)
+{
+    static_cast<MainWindow *>(user)->RebuildMixers();
+}
 
 // UI refresh cadence (playhead readout, ruler/lane playhead redraws).
 static const bigtime_t kTickIntervalUsec = 33000; // ~30 Hz
@@ -143,15 +158,30 @@ static BMenuItem *AddItem(BMenu *menu, const char *label, uint32 what, char shor
 MainWindow::MainWindow(JackDawProject *project)
     : BWindow(BRect(100, 100, 1100, 700), "JackDAW", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
       m_project(project), m_transport(NULL), m_timeline(NULL), m_tick_runner(NULL),
-      m_metro_volume_window(NULL), m_countin_window(NULL)
+      m_metro_volume_window(NULL), m_countin_window(NULL), m_mixer(NULL), m_mixer_item(NULL),
+      m_mixer_window(NULL), m_mixer_visible(false), m_track_added_h(0), m_track_removed_h(0),
+      m_tracks_reordered_h(0)
 {
     BMenuBar *menu_bar = BuildMenuBar();
     m_transport = new TransportView(project);
     m_timeline = new TimelineView(project);
+    m_mixer = new MixerView(project, BMessenger(this));
+    m_mixer->SetExplicitMinSize(BSize(B_SIZE_UNSET, 250.0f));
+    m_mixer->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, 320.0f));
 
     // No JACK status bar: server health/xrun monitoring is the patchbay's job
     // (JackGraph), matching the Linux JackDAW main window.
     BLayoutBuilder::Group<>(this, B_VERTICAL, 0).Add(menu_bar).Add(m_transport).Add(m_timeline);
+    m_mixer_item = GetLayout()->AddView(m_mixer); // docked pane below the timeline
+    m_mixer_item->SetVisible(false);              // hidden until toggled on
+
+    // Track-list changes rebuild the mixer channel strips.
+    m_track_added_h =
+        g_signal_connect(project, "track-added", G_CALLBACK(mainwin_tracks_changed_2), this);
+    m_track_removed_h =
+        g_signal_connect(project, "track-removed", G_CALLBACK(mainwin_tracks_changed_2), this);
+    m_tracks_reordered_h =
+        g_signal_connect(project, "tracks-reordered", G_CALLBACK(mainwin_tracks_reordered), this);
 
     AddCommonFilter(new TransportKeyFilter());
     AddCommonFilter(new FocusReleaseFilter());
@@ -170,7 +200,70 @@ MainWindow::MainWindow(JackDawProject *project)
 
 MainWindow::~MainWindow()
 {
+    if (m_track_added_h)
+        g_signal_handler_disconnect(m_project, m_track_added_h);
+    if (m_track_removed_h)
+        g_signal_handler_disconnect(m_project, m_track_removed_h);
+    if (m_tracks_reordered_h)
+        g_signal_handler_disconnect(m_project, m_tracks_reordered_h);
     delete m_tick_runner;
+}
+
+void MainWindow::ApplyMixerState()
+{
+    bool in_window = settings_get_uint32("mixer_in_window", 0) != 0;
+    bool want_dock = m_mixer_visible && !in_window;
+    bool want_win = m_mixer_visible && in_window;
+
+    if (m_mixer_item)
+        m_mixer_item->SetVisible(want_dock);
+
+    if (want_win) {
+        if (m_mixer_window == NULL)
+            m_mixer_window = new MixerWindow(m_project, BMessenger(this));
+        if (m_mixer_window->LockLooper()) {
+            m_mixer_window->Rebuild();
+            if (m_mixer_window->IsHidden())
+                m_mixer_window->Show();
+            m_mixer_window->Activate();
+            m_mixer_window->UnlockLooper();
+        }
+    } else if (m_mixer_window && m_mixer_window->LockLooper()) {
+        if (!m_mixer_window->IsHidden())
+            m_mixer_window->Hide();
+        m_mixer_window->UnlockLooper();
+    }
+}
+
+void MainWindow::RebuildMixers()
+{
+    if (m_mixer)
+        m_mixer->Rebuild();
+    if (m_mixer_window)
+        BMessenger(m_mixer_window).SendMessage(MSG_MIXER_REBUILD);
+}
+
+void MainWindow::SyncMixers()
+{
+    bool in_window = settings_get_uint32("mixer_in_window", 0) != 0;
+    if (m_mixer && m_mixer_visible && !in_window) {
+        m_mixer->Sync();
+        m_mixer->UpdateMeters();
+    }
+    // The detached window refreshes itself on its own runner tick.
+}
+
+JackDawTrack *MainWindow::TrackForSlot(int slot)
+{
+    if (slot < 0)
+        return NULL; // master
+    guint n = jackdaw_project_track_count(m_project);
+    for (guint i = 0; i < n; i++) {
+        JackDawTrack *t = jackdaw_project_get_track(m_project, i);
+        if ((int)t->slot == slot)
+            return t;
+    }
+    return NULL;
 }
 
 BMenuBar *MainWindow::BuildMenuBar()
@@ -198,13 +291,13 @@ BMenuBar *MainWindow::BuildMenuBar()
     AddItem(edit, "Redo", MSG_EDIT_REDO, 'Y', B_COMMAND_KEY);
     bar->AddItem(edit);
 
-    // Track — add/remove/load arrive with the track/clip phases.
+    // Track — add/delete are live now; Load File arrives with the clip phase.
     BMenu *track = new BMenu("Track");
-    AddItem(track, "Add Empty Track", MSG_TRACK_ADD, 0, 0, false);
-    AddItem(track, "Add MIDI Track", MSG_TRACK_ADD_MIDI, 0, 0, false);
+    AddItem(track, "Add Empty Track", MSG_TRACK_ADD, 'T', B_COMMAND_KEY);
+    AddItem(track, "Add MIDI Track", MSG_TRACK_ADD_MIDI, 'T', B_COMMAND_KEY | B_SHIFT_KEY);
     AddItem(track, "Load File as New Track…", MSG_TRACK_LOAD_FILE, 0, 0, false);
     track->AddSeparatorItem();
-    AddItem(track, "Delete Active Track", MSG_TRACK_DELETE, 0, 0, false);
+    AddItem(track, "Delete Active Track", MSG_TRACK_DELETE, 0, 0);
     bar->AddItem(track);
 
     // Transport — all functional now.
@@ -308,6 +401,51 @@ void MainWindow::LocateNextBoundary()
         m_timeline->LocateTo(next);
 }
 
+void MainWindow::AddTrack(JackDawTrackKind kind)
+{
+    JackDawTrack *t = jackdaw_track_new(NULL);
+    jackdaw_track_set_kind(t, kind);
+    // Engine first so track->slot is assigned before views build for it.
+    if (jackdaw_engine_add_track(t)) {
+        g_object_unref(t);
+        return;
+    }
+    jackdaw_project_add_track(m_project, t); // takes its own ref
+    jackdaw_project_select_single(m_project, t);
+    g_object_unref(t);
+}
+
+void MainWindow::DeleteTrack(JackDawTrack *track)
+{
+    if (!track)
+        return;
+    // Clear the RT slot before dropping the last GObject ref.
+    jackdaw_engine_remove_track(track);
+    jackdaw_project_remove_track(m_project, track);
+}
+
+void MainWindow::ShowTrackContext(int slot, BPoint screen_where)
+{
+    JackDawTrack *t = NULL;
+    guint n = jackdaw_project_track_count(m_project);
+    for (guint i = 0; i < n; i++) {
+        JackDawTrack *cand = jackdaw_project_get_track(m_project, i);
+        if ((int)cand->slot == slot) {
+            t = cand;
+            break;
+        }
+    }
+    if (!t)
+        return;
+
+    BPopUpMenu menu("track_context", false, false);
+    BMenuItem *del = new BMenuItem("Delete Track", NULL);
+    menu.AddItem(del);
+    BMenuItem *chosen = menu.Go(screen_where, false, false);
+    if (chosen == del)
+        DeleteTrack(t);
+}
+
 void MainWindow::ShowRecordMenu(BPoint screen_where)
 {
     BPopUpMenu menu("record_mode", false, false);
@@ -396,6 +534,7 @@ void MainWindow::MessageReceived(BMessage *message)
         case MSG_UI_TICK:
             m_transport->UpdateReadout();
             m_timeline->TickUpdate();
+            SyncMixers();
             break;
 
         case MSG_ZOOM_IN:
@@ -449,6 +588,44 @@ void MainWindow::MessageReceived(BMessage *message)
             jackdaw_project_redo(m_project);
             break;
 
+        case MSG_TRACK_ADD:
+            AddTrack(JACKDAW_TRACK_AUDIO);
+            break;
+        case MSG_TRACK_ADD_MIDI:
+            AddTrack(JACKDAW_TRACK_INSTRUMENT);
+            break;
+        case MSG_TRACK_DELETE:
+            DeleteTrack(jackdaw_project_get_active_track(m_project));
+            break;
+        case MSG_TRACK_DELETE_SLOT:
+        case MSG_TRACK_CONTEXT: {
+            int32 slot = -1;
+            message->FindInt32("slot", &slot);
+            if (message->what == MSG_TRACK_DELETE_SLOT) {
+                guint n = jackdaw_project_track_count(m_project);
+                for (guint i = 0; i < n; i++) {
+                    JackDawTrack *t = jackdaw_project_get_track(m_project, i);
+                    if ((int)t->slot == slot) {
+                        DeleteTrack(t);
+                        break;
+                    }
+                }
+            } else {
+                BPoint where;
+                if (message->FindPoint("screen_where", &where) == B_OK)
+                    ShowTrackContext(slot, where);
+            }
+            break;
+        }
+        case MSG_TRACK_MOVE: {
+            int32 from = -1, to = -1;
+            message->FindInt32("from", &from);
+            message->FindInt32("to", &to);
+            if (from >= 0 && to >= 0)
+                jackdaw_project_move_track(m_project, (guint)from, (guint)to);
+            break;
+        }
+
         // Right-click context popups (screen point carried in the message).
         case MSG_RECORD_MENU:
         case MSG_METRO_MENU:
@@ -493,13 +670,58 @@ void MainWindow::MessageReceived(BMessage *message)
         }
 
         case MSG_MIXER_TOGGLE:
-            // Dock show/hide arrives with the mixer view (track/mixer phase).
+            m_mixer_visible = !m_mixer_visible;
+            ApplyMixerState();
             break;
         case MSG_MIXER_OPEN_WINDOW: {
-            // Persist the preference now; the mixer view honours it once it
-            // exists. Toggle the stored flag.
+            // Toggle docked <-> detached. Enabling the window also shows the
+            // mixer if it was off; closing the window (which re-posts this)
+            // flips back to docked.
             bool on = settings_get_uint32("mixer_in_window", 0) != 0;
             settings_set_uint32("mixer_in_window", on ? 0 : 1);
+            if (!on)
+                m_mixer_visible = true;
+            ApplyMixerState();
+            break;
+        }
+
+        // Mixer strip edits (docked or detached) applied here (single mutator).
+        case MSG_MIX_SET_FADER: {
+            int32 slot = -1;
+            float gain = 1.0f;
+            message->FindInt32("slot", &slot);
+            message->FindFloat("gain", &gain);
+            if (slot < 0)
+                jackdaw_project_set_master_volume(m_project, gain);
+            else if (JackDawTrack *t = TrackForSlot(slot))
+                jackdaw_track_set_fader(t, gain);
+            break;
+        }
+        case MSG_MIX_SET_PAN: {
+            int32 slot = -1;
+            float pan = 0.0f;
+            message->FindInt32("slot", &slot);
+            message->FindFloat("pan", &pan);
+            if (JackDawTrack *t = TrackForSlot(slot))
+                jackdaw_track_set_pan(t, pan);
+            break;
+        }
+        case MSG_MIX_TOGGLE_MUTE: {
+            int32 slot = -1;
+            bool on = false;
+            message->FindInt32("slot", &slot);
+            message->FindBool("on", &on);
+            if (JackDawTrack *t = TrackForSlot(slot))
+                jackdaw_track_set_muted(t, on);
+            break;
+        }
+        case MSG_MIX_TOGGLE_SOLO: {
+            int32 slot = -1;
+            bool on = false;
+            message->FindInt32("slot", &slot);
+            message->FindBool("on", &on);
+            if (JackDawTrack *t = TrackForSlot(slot))
+                jackdaw_track_set_soloed(t, on);
             break;
         }
 
@@ -521,6 +743,12 @@ bool MainWindow::QuitRequested()
     // Stop engine events reaching a window that is about to die. The engine
     // itself is torn down by main() after the app loop exits.
     jackdaw_engine_set_event_hook(NULL, NULL);
+    // Force the detached mixer window closed first (its QuitRequested normally
+    // re-docks rather than quits, which would otherwise block app shutdown).
+    if (m_mixer_window && m_mixer_window->Lock()) {
+        m_mixer_window->Quit(); // deletes the window
+        m_mixer_window = NULL;
+    }
     be_app->PostMessage(B_QUIT_REQUESTED);
     return true;
 }

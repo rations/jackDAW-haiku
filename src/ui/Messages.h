@@ -58,6 +58,8 @@ enum {
     // Mixer toggle (dock) + right-click "Open in Window".
     MSG_MIXER_TOGGLE = 'mixt',
     MSG_MIXER_OPEN_WINDOW = 'mixw',
+    MSG_MIXER_REBUILD = 'mixr', // -> detached MixerWindow: rebuild its strips
+    MSG_MIXER_TICK = 'mixk',    // detached MixerWindow's own refresh tick
 
     // Menu bar — File.
     MSG_FILE_OPEN = 'fopn',
@@ -76,7 +78,18 @@ enum {
     MSG_TRACK_ADD = 'tadd',
     MSG_TRACK_ADD_MIDI = 'tadm',
     MSG_TRACK_LOAD_FILE = 'tldf',
-    MSG_TRACK_DELETE = 'tdel',
+    MSG_TRACK_DELETE = 'tdel',      // delete active track
+    MSG_TRACK_DELETE_SLOT = 'tdes', // delete track at int32 "slot"
+    MSG_TRACK_CONTEXT = 'tctx',     // strip right-click: int32 "slot" + BPoint "screen_where"
+    MSG_TRACK_MOVE = 'tmov',        // reorder: int32 "from", int32 "to"
+
+    // Mixer strip -> MainWindow (single-mutator: a detached mixer window routes
+    // its edits here rather than calling the engine from its own looper). Each
+    // carries int32 "slot"; setters also carry their value. slot == -1 = master.
+    MSG_MIX_SET_FADER = 'mxfd',   // float "gain"
+    MSG_MIX_SET_PAN = 'mxpn',     // float "pan"
+    MSG_MIX_TOGGLE_MUTE = 'mxmu', // bool  "on"
+    MSG_MIX_TOGGLE_SOLO = 'mxso', // bool  "on"
 
     // Menu bar — Options.
     MSG_OPT_IO = 'oint',

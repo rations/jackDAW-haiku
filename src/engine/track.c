@@ -15,6 +15,9 @@ static void jackdaw_track_finalize(GObject *obj)
     JackDawTrack *t = JACKDAW_TRACK(obj);
 
     g_free(t->name);
+    g_free(t->audio_src_port);
+    g_free(t->audio_src_port_r);
+    g_free(t->midi_src_port);
 
     G_OBJECT_CLASS(jackdaw_track_parent_class)->finalize(obj);
 }
@@ -40,6 +43,10 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->kind = JACKDAW_TRACK_AUDIO;
     t->audio_in_idx = -1;
     t->midi_in_idx = -1;
+    t->audio_src_port = NULL;
+    t->audio_src_port_r = NULL;
+    t->midi_src_port = NULL;
+    t->stereo_input = FALSE;
     t->state_flags = 0;
     t->volume = 1.0f;
     t->trim = 1.0f;
@@ -220,6 +227,12 @@ void jackdaw_track_set_midi_in(JackDawTrack *t, gint idx)
     g_return_if_fail(JACKDAW_IS_TRACK(t));
     t->midi_in_idx = idx;
     g_signal_emit(t, track_signals[SIGNAL_ROUTING_CHANGED], 0);
+}
+
+gboolean jackdaw_track_is_stereo(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), FALSE);
+    return t->stereo_input;
 }
 
 /* ---- Peak metering ---- */

@@ -64,15 +64,23 @@ public:
     // Full redraw of ruler + lanes (timing/grid/zoom changes).
     void InvalidateAll();
 
+    // Vertical (track) scrolling.
+    void UpdateVScrollBar();       // re-derive range from track content height
+    void ScrollTracksBy(float dy); // wheel scroll the track column
+
+    void FrameResized(float w, float h) override;
+
 private:
     void UpdateScrollBar();
     friend class TimelineScrollBar;
+    friend class TimelineVScrollBar;
 
     JackDawProject *m_project; // borrowed
 
     RulerView *m_ruler;
     TrackAreaView *m_track_area;
     BScrollBar *m_hscroll;
+    BScrollBar *m_vscroll;
 
     off_t m_view_start;
     double m_spp;

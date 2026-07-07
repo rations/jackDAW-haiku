@@ -59,6 +59,26 @@ gboolean jackdaw_engine_is_playing(void);
 gboolean jackdaw_engine_add_track(JackDawTrack *track);
 void jackdaw_engine_remove_track(JackDawTrack *track);
 
+/* --- Input routing (main thread only) ---
+ * Connect an external JACK output port to a track's capture port and remember
+ * the connection so it can be torn down again. port_name == NULL clears the
+ * source. Return FALSE on success, TRUE on failure. set_track_stereo registers
+ * or drops the track's right capture port (must precede wiring the right
+ * source). */
+gboolean jackdaw_engine_set_audio_source_l(JackDawTrack *t, const gchar *port_name);
+gboolean jackdaw_engine_set_audio_source_r(JackDawTrack *t, const gchar *port_name);
+gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo);
+/* Connect an external MIDI output to an instrument track's MIDI capture port
+ * (routing only in this phase; thru/record land with the MIDI phase). */
+gboolean jackdaw_engine_set_midi_source(JackDawTrack *t, const gchar *port_name);
+
+/* NULL-terminated lists of connectable sources (physical hardware ports). Audio
+ * capture and MIDI capture are JackPortIsOutput|Physical of their type. Free
+ * with jackdaw_engine_free_ports. NULL when the engine is inactive. */
+const char **jackdaw_engine_list_capture_ports(void);
+const char **jackdaw_engine_list_midi_ports(void);
+void jackdaw_engine_free_ports(const char **ports);
+
 /* --- Transport --- */
 void jackdaw_engine_start_playback(void);
 void jackdaw_engine_stop_playback(void);

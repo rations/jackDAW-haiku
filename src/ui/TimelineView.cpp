@@ -1,5 +1,6 @@
 #include "TimelineView.h"
 
+#include <InterfaceDefs.h>
 #include <LayoutBuilder.h>
 #include <ScrollBar.h>
 #include <SpaceLayoutItem.h>
@@ -33,6 +34,26 @@ private:
     TimelineView *m_timeline;
 };
 
+// Vertical scrollbar for the track column: value is a pixel offset into the
+// stacked track rows.
+class TimelineVScrollBar : public BScrollBar
+{
+public:
+    explicit TimelineVScrollBar(TimelineView *timeline)
+        : BScrollBar("timeline_vscroll", NULL, 0, 0, B_VERTICAL), m_timeline(timeline)
+    {
+    }
+
+    void ValueChanged(float newValue) override
+    {
+        BScrollBar::ValueChanged(newValue);
+        m_timeline->m_track_area->SetScrollY(newValue);
+    }
+
+private:
+    TimelineView *m_timeline;
+};
+
 // GObject "timing-changed" -> full timeline redraw. Emitted only from this
 // window's looper thread (all mutating project calls happen there), so the
 // direct Invalidate is thread-safe.
@@ -43,22 +64,32 @@ static void timeline_timing_changed(JackDawProject *project, gpointer user)
 }
 
 TimelineView::TimelineView(JackDawProject *project)
-    : BView("timeline", B_WILL_DRAW), m_project(project), m_ruler(NULL), m_track_area(NULL),
-      m_hscroll(NULL), m_view_start(0), m_spp(kDefaultSpp), m_last_playhead(-1), m_timing_handler(0)
+    : BView("timeline", B_WILL_DRAW | B_FRAME_EVENTS), m_project(project), m_ruler(NULL),
+      m_track_area(NULL), m_hscroll(NULL), m_vscroll(NULL), m_view_start(0), m_spp(kDefaultSpp),
+      m_last_playhead(-1), m_timing_handler(0)
 {
     m_ruler = new RulerView(this);
     m_track_area = new TrackAreaView(this);
     m_hscroll = new TimelineScrollBar(this);
+    m_vscroll = new TimelineVScrollBar(this);
 
+    // Frozen-pane layout: fixed strip column (left) + ruler (top), the track
+    // area scrolling both ways. The corner struts keep the columns aligned with
+    // the vertical scrollbar gutter.
     BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
         .AddGroup(B_HORIZONTAL, 0)
         .Add(BSpaceLayoutItem::CreateHorizontalStrut(kTimelineHeaderWidth))
         .Add(m_ruler)
+        .Add(BSpaceLayoutItem::CreateHorizontalStrut(B_V_SCROLL_BAR_WIDTH))
         .End()
+        .AddGroup(B_HORIZONTAL, 0)
         .Add(m_track_area)
+        .Add(m_vscroll)
+        .End()
         .AddGroup(B_HORIZONTAL, 0)
         .Add(BSpaceLayoutItem::CreateHorizontalStrut(kTimelineHeaderWidth))
         .Add(m_hscroll)
+        .Add(BSpaceLayoutItem::CreateHorizontalStrut(B_V_SCROLL_BAR_WIDTH))
         .End();
 }
 
@@ -133,6 +164,8 @@ void TimelineView::LocateTo(off_t frame)
 
 void TimelineView::TickUpdate()
 {
+    m_track_area->UpdateMeters();
+
     off_t pos = jackdaw_engine_get_play_pos();
     if (pos == m_last_playhead)
         return;
@@ -186,4 +219,35 @@ void TimelineView::UpdateScrollBar()
     m_hscroll->SetValue((float)((double)m_view_start / m_spp));
     m_hscroll->SetProportion((float)((double)LaneWidth() / (content / m_spp)));
     m_hscroll->SetSteps(LaneWidth() * 0.1f, LaneWidth() * 0.9f);
+}
+
+void TimelineView::UpdateVScrollBar()
+{
+    if (!m_vscroll || !m_track_area)
+        return;
+    float content = m_track_area->ContentHeight();
+    float visible = m_track_area->Bounds().Height();
+    if (visible < 1.0f)
+        visible = 1.0f;
+    float maxv = content - visible;
+    if (maxv < 0.0f)
+        maxv = 0.0f;
+    m_vscroll->SetRange(0, maxv);
+    m_vscroll->SetProportion(content > 0.0f ? visible / content : 1.0f);
+    m_vscroll->SetSteps(kTimelineTrackHeight, visible);
+    if (m_vscroll->Value() > maxv)
+        m_vscroll->SetValue(maxv);
+}
+
+void TimelineView::ScrollTracksBy(float dy)
+{
+    if (m_vscroll)
+        m_vscroll->SetValue(m_vscroll->Value() + dy); // clamped to range; drives SetScrollY
+}
+
+void TimelineView::FrameResized(float w, float h)
+{
+    BView::FrameResized(w, h);
+    UpdateScrollBar();
+    UpdateVScrollBar();
 }

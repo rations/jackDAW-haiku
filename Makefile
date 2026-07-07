@@ -18,7 +18,9 @@ C_SOURCES   = src/engine/glib_check.c src/engine/message.c src/engine/settings.c
 CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/TransportView.cpp src/ui/TimelineView.cpp src/ui/RulerView.cpp \
               src/ui/TrackAreaView.cpp src/ui/StepperControl.cpp \
-              src/ui/MetronomeWindows.cpp
+              src/ui/MetronomeWindows.cpp src/ui/KnobView.cpp src/ui/FaderView.cpp \
+              src/ui/VuView.cpp src/ui/TrackStripView.cpp src/ui/MixerStripView.cpp \
+              src/ui/MixerView.cpp src/ui/MixerWindow.cpp
 
 OBJECTS = $(C_SOURCES:.c=.o) $(CXX_SOURCES:.cpp=.o)
 DEPS    = $(OBJECTS:.o=.d)
