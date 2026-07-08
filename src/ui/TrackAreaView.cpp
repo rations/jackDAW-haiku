@@ -1,11 +1,18 @@
 #include "TrackAreaView.h"
 
 #include <InterfaceDefs.h>
+#include <MenuItem.h>
+#include <PopUpMenu.h>
 #include <Window.h>
+
+#include <math.h>
+
+#include <algorithm>
 
 #include "engine/jackdaw-engine.h"
 #include "engine/tempomap.h"
 #include "Messages.h"
+#include "RegionGainWindow.h"
 #include "TimelineView.h"
 #include "TrackStripView.h"
 
@@ -21,6 +28,12 @@ static const rgb_color kRowSelTint = {58, 66, 82, 255};
 static const rgb_color kWaveColor = {38, 128, 51, 255};
 static const rgb_color kWaveMid = {77, 179, 90, 255};
 static const rgb_color kRegionEdge = {230, 220, 120, 255};
+// Selected-section fill tint + rubber-band range wash (over the lane bg).
+static const rgb_color kSelRegionTint = {70, 90, 130, 90};
+static const rgb_color kRangeTint = {90, 110, 150, 70};
+
+// Pointer travel (px) before an armed press on a selected section becomes a move.
+static const float kMoveThreshold = 3.0f;
 
 // GObject trampolines. All emitted on the MainWindow looper (the sole mutator),
 // so these run on this view's thread and may touch views directly.
@@ -44,13 +57,20 @@ static void area_track_state_changed(gpointer /*track*/, gpointer user)
 
 TrackAreaView::TrackAreaView(TimelineView *timeline)
     : BView("track_area", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE | B_FRAME_EVENTS),
-      m_timeline(timeline), m_scroll_y(0.0f), m_dragging(false), m_drop_gap(-1), m_added_handler(0),
-      m_removed_handler(0), m_reordered_handler(0), m_selection_handler(0)
+      m_timeline(timeline), m_scroll_y(0.0f), m_drop_gap(-1), m_sel_track(NULL), m_selecting(false),
+      m_range_active(false), m_range_start(0), m_range_end(0), m_move_armed(false), m_moving(false),
+      m_move_committed(false), m_move_press_x(0.0f), m_move_press_y(0.0f), m_move_src(NULL),
+      m_menu_track(NULL), m_menu_frame(0), m_added_handler(0), m_removed_handler(0),
+      m_reordered_handler(0), m_selection_handler(0)
 {
+    m_clipboard = clip_region_list_new();
 }
 
 TrackAreaView::~TrackAreaView()
 {
+    ClearMovePre();
+    if (m_clipboard)
+        g_ptr_array_unref(m_clipboard);
 }
 
 void TrackAreaView::AttachedToWindow()
@@ -175,6 +195,429 @@ int TrackAreaView::RowAtY(float y) const
     return row;
 }
 
+/* -----------------------------------------------------------------------
+ * Region-edit helpers + operations. Ported from the Linux JackDAW timeline;
+ * all run on this looper, the single project mutator, so they touch the model
+ * directly. Any list-mutating op clears the section selection because the edit
+ * frees/rebuilds ClipRegion pointers (split, delete, gain all re-slice).
+ * ----------------------------------------------------------------------- */
+
+JackDawTrack *TrackAreaView::TrackAtRow(int row) const
+{
+    if (row < 0)
+        return NULL;
+    JackDawProject *p = m_timeline->Project();
+    if ((guint)row >= jackdaw_project_track_count(p))
+        return NULL;
+    return jackdaw_project_get_track(p, row);
+}
+
+off_t TrackAreaView::LaneXToFrame(float x) const
+{
+    off_t f = m_timeline->XToFrame(x - kTimelineHeaderWidth);
+    return f < 0 ? 0 : f;
+}
+
+bool TrackAreaView::SectionSelContains(ClipRegion *r) const
+{
+    for (ClipRegion *s : m_sel_regions)
+        if (s == r)
+            return true;
+    return false;
+}
+
+void TrackAreaView::ClearMovePre()
+{
+    for (auto &kv : m_move_pre)
+        if (kv.second)
+            g_ptr_array_unref(kv.second);
+    m_move_pre.clear();
+}
+
+void TrackAreaView::ClearSectionSelection()
+{
+    m_sel_track = NULL;
+    m_sel_regions.clear();
+    m_range_active = false;
+    m_selecting = false;
+    m_move_armed = false;
+    m_moving = false;
+    m_move_committed = false;
+    m_move_src = NULL;
+    m_move_orig.clear();
+    ClearMovePre();
+    Invalidate();
+}
+
+// Select the single audio section covering `frame` on `track` (highlights its
+// whole span); clears the selection when the frame lands in a gap.
+void TrackAreaView::SelectRegionAt(JackDawTrack *t, off_t frame)
+{
+    m_sel_track = NULL;
+    m_sel_regions.clear();
+    m_range_active = false;
+    if (t && !jackdaw_track_is_instrument(t)) {
+        ClipRegion *r = clip_region_list_at(jackdaw_track_get_regions(t), frame);
+        if (r) {
+            m_sel_track = t;
+            m_sel_regions.push_back(r);
+        }
+    }
+    Invalidate();
+}
+
+void TrackAreaView::CommitTrack(JackDawTrack *t)
+{
+    clip_region_list_sort(jackdaw_track_get_regions(t));
+    jackdaw_track_commit_regions(t);
+}
+
+bool TrackAreaView::CanPaste() const
+{
+    return m_clipboard && m_clipboard->len > 0;
+}
+
+// Snap a section-move delta (timeline frames): consider both the beat grid (the
+// block's leading edge) and the edges of non-selected sections on the move
+// track, applying the smallest correction within ~10 px.
+off_t TrackAreaView::SnapMoveDelta(off_t raw_delta) const
+{
+    JackDawProject *p = m_timeline->Project();
+    if (!p || !p->snap_enabled)
+        return raw_delta;
+    if (!m_sel_track || m_sel_regions.empty() || m_move_orig.empty())
+        return raw_delta;
+
+    double spp = m_timeline->Spp();
+    off_t thresh = (off_t)(spp * 10.0);
+    if (thresh < 1)
+        thresh = 1;
+    int sr = (int)jackdaw_engine_get_sample_rate();
+    guint n = (guint)m_sel_regions.size();
+
+    bool have = false;
+    off_t best_corr = 0;
+    off_t best_abs = thresh + 1;
+
+    off_t lead = G_MAXINT64;
+    for (guint i = 0; i < n; i++) {
+        off_t e = m_move_orig[i] + raw_delta;
+        if (e < lead)
+            lead = e;
+    }
+    {
+        off_t corr = jackdaw_project_snap_frame(p, lead, sr) - lead;
+        off_t a = corr < 0 ? -corr : corr;
+        if (a <= thresh && a < best_abs) {
+            best_abs = a;
+            best_corr = corr;
+            have = true;
+        }
+    }
+
+    GPtrArray *regs = jackdaw_track_get_regions(m_sel_track);
+    for (guint i = 0; i < n; i++) {
+        ClipRegion *m = m_sel_regions[i];
+        off_t m_len = m->length;
+        off_t mine[2] = {m_move_orig[i] + raw_delta, m_move_orig[i] + raw_delta + m_len};
+        for (guint j = 0; j < regs->len; j++) {
+            ClipRegion *o = (ClipRegion *)g_ptr_array_index(regs, j);
+            if (SectionSelContains(o))
+                continue;
+            off_t edges[2] = {o->tl_pos, clip_region_end(o)};
+            for (int em = 0; em < 2; em++)
+                for (int eo = 0; eo < 2; eo++) {
+                    off_t corr = edges[eo] - mine[em];
+                    off_t a = corr < 0 ? -corr : corr;
+                    if (a <= thresh && a < best_abs) {
+                        best_abs = a;
+                        best_corr = corr;
+                        have = true;
+                    }
+                }
+        }
+    }
+    return have ? raw_delta + best_corr : raw_delta;
+}
+
+/* ---- Combined multi-track move undo -----------------------------------
+ * A move can relocate a block across tracks, so one undo must restore every
+ * track the drag touched. Pristine per-track copies are captured into
+ * m_move_pre at drag start; this builds one action from them. The callbacks
+ * have C linkage-compatible signatures so they can be stored as function
+ * pointers in the C undo manager. */
+namespace
+{
+struct MoveUndoCtx {
+    guint n;
+    JackDawTrack **tracks; /* strong refs */
+};
+gpointer move_undo_capture(gpointer ctx)
+{
+    MoveUndoCtx *c = (MoveUndoCtx *)ctx;
+    GPtrArray *lists = g_ptr_array_new();
+    for (guint i = 0; i < c->n; i++)
+        g_ptr_array_add(lists, clip_region_list_copy(jackdaw_track_get_regions(c->tracks[i])));
+    return lists;
+}
+void move_undo_restore(gpointer ctx, gpointer state)
+{
+    MoveUndoCtx *c = (MoveUndoCtx *)ctx;
+    GPtrArray *lists = (GPtrArray *)state;
+    for (guint i = 0; i < c->n && i < lists->len; i++)
+        jackdaw_track_apply_regions(c->tracks[i], (GPtrArray *)g_ptr_array_index(lists, i));
+}
+void move_undo_free_state(gpointer state)
+{
+    GPtrArray *lists = (GPtrArray *)state;
+    if (!lists)
+        return;
+    for (guint i = 0; i < lists->len; i++)
+        g_ptr_array_unref((GPtrArray *)g_ptr_array_index(lists, i));
+    g_ptr_array_free(lists, TRUE);
+}
+void move_undo_ctx_free(gpointer ctx)
+{
+    MoveUndoCtx *c = (MoveUndoCtx *)ctx;
+    for (guint i = 0; i < c->n; i++)
+        if (c->tracks[i])
+            g_object_unref(c->tracks[i]);
+    g_free(c->tracks);
+    g_free(c);
+}
+} // namespace
+
+void TrackAreaView::PushMoveUndo()
+{
+    JackDawProject *p = m_timeline->Project();
+    if (!p || m_move_pre.empty())
+        return;
+    guint n = (guint)m_move_pre.size();
+    MoveUndoCtx *c = g_new0(MoveUndoCtx, 1);
+    c->n = n;
+    c->tracks = g_new0(JackDawTrack *, n);
+    GPtrArray *saved = g_ptr_array_new();
+    guint i = 0;
+    for (auto &kv : m_move_pre) {
+        JackDawTrack *tr = kv.first; // non-const local: avoids a qualified-cast warning
+        c->tracks[i] = (JackDawTrack *)g_object_ref(tr);
+        g_ptr_array_add(saved, g_ptr_array_ref(kv.second)); /* pristine pre-move copy */
+        i++;
+    }
+    JackDawUndoAction a = {};
+    a.ctx = c;
+    a.saved_state = saved;
+    a.capture_fn = move_undo_capture;
+    a.restore_fn = move_undo_restore;
+    a.free_fn = move_undo_free_state;
+    a.after_fn = NULL;
+    a.ctx_free_fn = move_undo_ctx_free;
+    a.desc = g_strdup("Move section");
+    undo_manager_push(jackdaw_project_get_undo(p), &a);
+}
+
+/* ---- Public edit operations ---- */
+
+void TrackAreaView::SplitAtCursor()
+{
+    JackDawProject *p = m_timeline->Project();
+    JackDawTrack *t = jackdaw_project_get_active_track(p);
+    if (!t || jackdaw_track_is_instrument(t))
+        return;
+    off_t cur = jackdaw_engine_get_play_pos();
+    if (!clip_region_list_at(jackdaw_track_get_regions(t), cur))
+        return; // only split if the cut lands inside a region
+    jackdaw_project_push_region_undo(p, t);
+    clip_region_list_split_at(jackdaw_track_get_regions(t), cur,
+                              (int)jackdaw_engine_get_sample_rate());
+    CommitTrack(t);
+    SelectRegionAt(t, cur); // focus the new right-hand region for the next edit
+}
+
+void TrackAreaView::DeleteSelection()
+{
+    JackDawProject *p = m_timeline->Project();
+    int sr = (int)jackdaw_engine_get_sample_rate();
+
+    if (m_sel_track && !m_sel_regions.empty()) {
+        JackDawTrack *t = m_sel_track;
+        guint n = (guint)m_sel_regions.size();
+        std::vector<off_t> aa(n), bb(n);
+        for (guint i = 0; i < n; i++) {
+            aa[i] = m_sel_regions[i]->tl_pos;
+            bb[i] = clip_region_end(m_sel_regions[i]);
+        }
+        jackdaw_project_push_region_undo(p, t);
+        GPtrArray *regs = jackdaw_track_get_regions(t);
+        for (guint i = 0; i < n; i++) // spans cached; pointers get freed below
+            clip_region_list_delete_range(regs, aa[i], bb[i], sr);
+        ClearSectionSelection();
+        CommitTrack(t);
+        return;
+    }
+
+    JackDawTrack *t = jackdaw_project_get_active_track(p);
+    if (!t || jackdaw_track_is_instrument(t) || !m_range_active)
+        return;
+    off_t a = m_range_start, b = m_range_end;
+    if (b < a) {
+        off_t tmp = a;
+        a = b;
+        b = tmp;
+    }
+    jackdaw_project_push_region_undo(p, t);
+    clip_region_list_delete_range(jackdaw_track_get_regions(t), a, b, sr);
+    ClearSectionSelection();
+    CommitTrack(t);
+}
+
+// Replace the clipboard with copies of `regs`, normalized so the earliest
+// region starts at frame 0. `regs` is borrowed.
+static void clipboard_set(GPtrArray *clipboard, GPtrArray *regs)
+{
+    g_ptr_array_set_size(clipboard, 0);
+    if (regs->len == 0)
+        return;
+    off_t origin = ((ClipRegion *)g_ptr_array_index(regs, 0))->tl_pos;
+    for (guint i = 1; i < regs->len; i++) {
+        off_t pp = ((ClipRegion *)g_ptr_array_index(regs, i))->tl_pos;
+        if (pp < origin)
+            origin = pp;
+    }
+    for (guint i = 0; i < regs->len; i++) {
+        ClipRegion *c = clip_region_copy((ClipRegion *)g_ptr_array_index(regs, i));
+        c->tl_pos -= origin;
+        g_ptr_array_add(clipboard, c);
+    }
+}
+
+void TrackAreaView::CopySelection()
+{
+    JackDawProject *p = m_timeline->Project();
+    int sr = (int)jackdaw_engine_get_sample_rate();
+
+    if (m_sel_track && !m_sel_regions.empty()) {
+        if (jackdaw_track_is_instrument(m_sel_track))
+            return;
+        GPtrArray *tmp = g_ptr_array_new(); // borrowed pointers, no free func
+        for (ClipRegion *r : m_sel_regions)
+            g_ptr_array_add(tmp, r);
+        clipboard_set(m_clipboard, tmp);
+        g_ptr_array_free(tmp, TRUE);
+        return;
+    }
+
+    JackDawTrack *t = jackdaw_project_get_active_track(p);
+    if (!t || jackdaw_track_is_instrument(t) || !m_range_active)
+        return;
+    off_t a = m_range_start, b = m_range_end;
+    if (b < a) {
+        off_t tmp = a;
+        a = b;
+        b = tmp;
+    }
+    if (b <= a)
+        return;
+    // Deep-copy the track then trim outside [a,b] with the same sample-rate-aware
+    // delete used by Delete Selected Area.
+    GPtrArray *tmp = clip_region_list_copy(jackdaw_track_get_regions(t));
+    off_t big = clip_region_list_total_frames(tmp) + 1;
+    if (a > 0)
+        clip_region_list_delete_range(tmp, 0, a, sr);
+    if (b < big)
+        clip_region_list_delete_range(tmp, b, big, sr);
+    clipboard_set(m_clipboard, tmp);
+    g_ptr_array_unref(tmp);
+}
+
+void TrackAreaView::PasteAtCursor()
+{
+    JackDawProject *p = m_timeline->Project();
+    JackDawTrack *t = jackdaw_project_get_active_track(p);
+    if (!t || jackdaw_track_is_instrument(t))
+        return;
+    if (!m_clipboard || m_clipboard->len == 0)
+        return;
+    off_t at = jackdaw_engine_get_play_pos();
+    if (at < 0)
+        at = 0;
+    off_t span = 0; // normalized clipboard width
+    for (guint i = 0; i < m_clipboard->len; i++) {
+        off_t e = clip_region_end((ClipRegion *)g_ptr_array_index(m_clipboard, i));
+        if (e > span)
+            span = e;
+    }
+    int sr = (int)jackdaw_engine_get_sample_rate();
+    GPtrArray *regs = jackdaw_track_get_regions(t);
+    jackdaw_project_push_region_undo(p, t);
+    clip_region_list_delete_range(regs, at, at + span, sr); // overwrite the span
+    for (guint i = 0; i < m_clipboard->len; i++) {
+        ClipRegion *c = clip_region_copy((ClipRegion *)g_ptr_array_index(m_clipboard, i));
+        c->tl_pos += at;
+        g_ptr_array_add(regs, c);
+    }
+    ClearSectionSelection();
+    CommitTrack(t);
+}
+
+void TrackAreaView::GroupSelection()
+{
+    JackDawProject *p = m_timeline->Project();
+    if (!m_sel_track || m_sel_regions.size() < 2)
+        return;
+    if (jackdaw_track_is_instrument(m_sel_track))
+        return;
+    JackDawTrack *t = m_sel_track;
+    guint n = (guint)m_sel_regions.size();
+    off_t *tlpos = g_new(off_t, n);
+    for (guint i = 0; i < n; i++)
+        tlpos[i] = m_sel_regions[i]->tl_pos;
+    jackdaw_project_push_region_undo(p, t);
+    clip_region_list_group(jackdaw_track_get_regions(t), tlpos, n,
+                           (int)jackdaw_engine_get_sample_rate());
+    g_free(tlpos);
+    ClearSectionSelection(); // merge frees the absorbed regions
+    CommitTrack(t);
+}
+
+void TrackAreaView::SetSelectionGain(float db)
+{
+    JackDawProject *p = m_timeline->Project();
+    gfloat g = (gfloat)pow(10.0, (double)db / 20.0);
+    int sr = (int)jackdaw_engine_get_sample_rate();
+
+    if (m_sel_track && !m_sel_regions.empty()) {
+        JackDawTrack *t = m_sel_track;
+        guint n = (guint)m_sel_regions.size();
+        std::vector<off_t> aa(n), bb(n);
+        for (guint i = 0; i < n; i++) {
+            aa[i] = m_sel_regions[i]->tl_pos;
+            bb[i] = clip_region_end(m_sel_regions[i]);
+        }
+        GPtrArray *regs = jackdaw_track_get_regions(t);
+        jackdaw_project_push_region_undo(p, t);
+        for (guint i = 0; i < n; i++)
+            clip_region_list_set_gain_range(regs, aa[i], bb[i], g, sr);
+        ClearSectionSelection(); // set_gain re-slices at edges
+        CommitTrack(t);
+        return;
+    }
+
+    JackDawTrack *t = jackdaw_project_get_active_track(p);
+    if (!t || jackdaw_track_is_instrument(t) || !m_range_active)
+        return;
+    off_t a = m_range_start, b = m_range_end;
+    if (b < a) {
+        off_t tmp = a;
+        a = b;
+        b = tmp;
+    }
+    jackdaw_project_push_region_undo(p, t);
+    clip_region_list_set_gain_range(jackdaw_track_get_regions(t), a, b, g, sr);
+    ClearSectionSelection();
+    CommitTrack(t);
+}
+
 /* Draw every track's clip-region waveforms into the lane (right of the strip
  * column). Peaks come from the AudioClip block-peak table via
  * audio_clip_get_peaks(), sampled per pixel column — the same model the Linux
@@ -216,6 +659,23 @@ void TrackAreaView::DrawWaveforms(BRect lane)
             off_t vis1 = r_tl1 < view1 ? r_tl1 : view1;
             if (vis1 <= vis0)
                 continue;
+
+            // Selected-section highlight: a translucent wash over the region span.
+            if (m_sel_track == t && SectionSelContains(r)) {
+                float rx0 = lane.left + m_timeline->FrameToX(r_tl0);
+                float rx1 = lane.left + m_timeline->FrameToX(r_tl1);
+                if (rx0 < lane.left)
+                    rx0 = lane.left;
+                if (rx1 > lane.right)
+                    rx1 = lane.right;
+                if (rx1 > rx0) {
+                    SetDrawingMode(B_OP_ALPHA);
+                    SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+                    SetHighColor(kSelRegionTint);
+                    FillRect(BRect(rx0, row_top, rx1, row_bot));
+                    SetDrawingMode(B_OP_COPY);
+                }
+            }
 
             int px0 = (int)(((double)vis0 - start) / spp);
             int px1 = (int)(((double)vis1 - start) / spp) + 1;
@@ -355,6 +815,29 @@ void TrackAreaView::Draw(BRect updateRect)
         }
     }
 
+    // Rubber-band range selection: a translucent time band across all lanes.
+    if (m_range_active) {
+        off_t a = m_range_start, b = m_range_end;
+        if (b < a) {
+            off_t tmp = a;
+            a = b;
+            b = tmp;
+        }
+        float rx0 = lane.left + m_timeline->FrameToX(a);
+        float rx1 = lane.left + m_timeline->FrameToX(b);
+        if (rx0 < lane.left)
+            rx0 = lane.left;
+        if (rx1 > lane.right)
+            rx1 = lane.right;
+        if (rx1 > rx0) {
+            SetDrawingMode(B_OP_ALPHA);
+            SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+            SetHighColor(kRangeTint);
+            FillRect(BRect(rx0, lane.top, rx1, lane.bottom));
+            SetDrawingMode(B_OP_COPY);
+        }
+    }
+
     // Clip-region waveforms (drawn over the grid, under the playhead).
     DrawWaveforms(lane);
 
@@ -377,34 +860,211 @@ void TrackAreaView::Draw(BRect updateRect)
 
 void TrackAreaView::MouseDown(BPoint where)
 {
+    JackDawProject *p = m_timeline->Project();
     if (where.x < kTimelineHeaderWidth) {
         // Empty strip column below the last track: clear the selection.
         if (RowAtY(where.y) < 0)
-            jackdaw_project_clear_selection(m_timeline->Project());
+            jackdaw_project_clear_selection(p);
         return;
     }
-    // Lane click: select the row's track (if any) and locate the transport.
-    int row = RowAtY(where.y);
-    if (row >= 0)
-        jackdaw_project_select_single(m_timeline->Project(),
-                                      jackdaw_project_get_track(m_timeline->Project(), row));
-    m_dragging = true;
-    SetMouseEventMask(B_POINTER_EVENTS, B_LOCK_WINDOW_FOCUS);
-    m_timeline->LocateTo(m_timeline->XToFrame(where.x - kTimelineHeaderWidth));
-}
 
-void TrackAreaView::MouseUp(BPoint where)
-{
-    (void)where;
-    m_dragging = false;
+    int32 buttons = 0, mods = 0;
+    BMessage *msg = Window() ? Window()->CurrentMessage() : NULL;
+    if (msg) {
+        msg->FindInt32("buttons", &buttons);
+        msg->FindInt32("modifiers", &mods);
+    }
+    bool ctrl = (mods & (B_COMMAND_KEY | B_CONTROL_KEY)) != 0;
+    bool secondary = (buttons & B_SECONDARY_MOUSE_BUTTON) != 0;
+
+    int row = RowAtY(where.y);
+    JackDawTrack *t = TrackAtRow(row);
+    off_t frame = LaneXToFrame(where.x);
+    ClipRegion *r = (t && !jackdaw_track_is_instrument(t))
+                        ? clip_region_list_at(jackdaw_track_get_regions(t), frame)
+                        : NULL;
+
+    // Unify strip + timeline selection: a plain click selects just this track;
+    // Ctrl+click keeps any multi-track selection and only makes this active.
+    if (t) {
+        if (!secondary && ctrl)
+            jackdaw_project_set_active_track(p, t);
+        else
+            jackdaw_project_select_single(p, t);
+    }
+
+    // Right-click: context menu acting on the section under the pointer. Keep an
+    // existing multi-selection if the click landed inside one of its members.
+    if (secondary) {
+        m_menu_track = t;
+        m_menu_frame = frame;
+        if (!(r && m_sel_track == t && SectionSelContains(r)))
+            SelectRegionAt(t, frame);
+        ShowContextMenu(t, frame, ConvertToScreen(where));
+        return;
+    }
+
+    // Ctrl+left toggles a section in the (single-track) multi-selection.
+    if (ctrl) {
+        if (r) {
+            if (m_sel_track != t) {
+                m_sel_regions.clear();
+                m_range_active = false;
+                m_sel_track = t;
+            }
+            if (SectionSelContains(r))
+                m_sel_regions.erase(std::remove(m_sel_regions.begin(), m_sel_regions.end(), r),
+                                    m_sel_regions.end());
+            else
+                m_sel_regions.push_back(r);
+            if (m_sel_regions.empty())
+                m_sel_track = NULL;
+        }
+        Invalidate();
+        return;
+    }
+
+    // Plain press on an already-selected section → arm a potential move-drag.
+    // If the pointer doesn't travel, MouseUp falls through to a plain seek.
+    if (r && m_sel_track == t && SectionSelContains(r)) {
+        m_move_armed = true;
+        m_moving = false;
+        m_move_committed = false;
+        m_move_press_x = where.x;
+        m_move_press_y = where.y;
+        m_move_src = t;
+        m_move_orig.clear();
+        for (ClipRegion *s : m_sel_regions)
+            m_move_orig.push_back(s->tl_pos);
+        SetMouseEventMask(B_POINTER_EVENTS, B_LOCK_WINDOW_FOCUS);
+        return;
+    }
+
+    // Otherwise: locate the playhead and start a potential rubber-band range.
+    ClearSectionSelection();
+    m_timeline->LocateTo(frame);
+    m_selecting = true;
+    m_range_active = false;
+    m_range_start = frame;
+    m_range_end = frame;
+    SetMouseEventMask(B_POINTER_EVENTS, B_LOCK_WINDOW_FOCUS);
+    Invalidate();
 }
 
 void TrackAreaView::MouseMoved(BPoint where, uint32 code, const BMessage *dragMessage)
 {
     (void)code;
     (void)dragMessage;
-    if (m_dragging)
-        m_timeline->LocateTo(m_timeline->XToFrame(where.x - kTimelineHeaderWidth));
+
+    // An armed press becomes a real move once the pointer travels past a small
+    // threshold in either axis (horizontal = slide, vertical = relocate track).
+    if (m_move_armed && !m_moving) {
+        if (fabs(where.x - m_move_press_x) > kMoveThreshold ||
+            fabs(where.y - m_move_press_y) > kMoveThreshold)
+            m_moving = true;
+        else
+            return;
+    }
+
+    if (m_moving && !m_sel_regions.empty() && !m_move_orig.empty() && m_sel_track) {
+        // Vertical: relocate the block to the audio track under the pointer. The
+        // section pointers are stolen between the two lists so the selection (and
+        // m_move_orig, which drives the horizontal offset below) stay valid.
+        JackDawTrack *tgt = TrackAtRow(RowAtY(where.y));
+        if (tgt && tgt != m_sel_track && !jackdaw_track_is_instrument(tgt) &&
+            !jackdaw_track_is_instrument(m_sel_track)) {
+            if (m_move_pre.find(m_sel_track) == m_move_pre.end())
+                m_move_pre[m_sel_track] =
+                    clip_region_list_copy(jackdaw_track_get_regions(m_sel_track));
+            if (m_move_pre.find(tgt) == m_move_pre.end())
+                m_move_pre[tgt] = clip_region_list_copy(jackdaw_track_get_regions(tgt));
+            m_move_committed = true;
+
+            GPtrArray *from = jackdaw_track_get_regions(m_sel_track);
+            GPtrArray *to = jackdaw_track_get_regions(tgt);
+            for (ClipRegion *s : m_sel_regions) {
+                guint idx;
+                if (g_ptr_array_find(from, s, &idx)) {
+                    g_ptr_array_steal_index_fast(from, idx);
+                    g_ptr_array_add(to, s);
+                }
+            }
+            m_sel_track = tgt;
+        }
+
+        double spp = m_timeline->Spp();
+        off_t raw = (off_t)((where.x - m_move_press_x) * spp);
+        off_t delta = SnapMoveDelta(raw);
+        guint n = (guint)m_sel_regions.size();
+
+        off_t min_orig = G_MAXINT64;
+        for (guint i = 0; i < n; i++)
+            if (m_move_orig[i] < min_orig)
+                min_orig = m_move_orig[i];
+        if (min_orig + delta < 0)
+            delta = -min_orig; // no section starts before 0
+
+        if (delta != 0 && !m_move_committed) {
+            if (m_move_pre.find(m_sel_track) == m_move_pre.end())
+                m_move_pre[m_sel_track] =
+                    clip_region_list_copy(jackdaw_track_get_regions(m_sel_track));
+            m_move_committed = true;
+        }
+        for (guint i = 0; i < n; i++)
+            m_sel_regions[i]->tl_pos = m_move_orig[i] + delta;
+        Invalidate();
+        return;
+    }
+
+    if (!m_selecting)
+        return;
+    off_t frame = LaneXToFrame(where.x);
+    m_range_end = frame;
+    off_t span = frame - m_range_start;
+    if (span < 0)
+        span = -span;
+    double spp = m_timeline->Spp();
+    if ((double)span > spp * 3.0) // a few pixels' worth => a real range
+        m_range_active = true;
+    Invalidate();
+}
+
+void TrackAreaView::MouseUp(BPoint where)
+{
+    // Finalize a move: re-sort + republish every touched track, one combined undo.
+    if (m_moving) {
+        m_moving = false;
+        m_move_armed = false;
+        if (!m_move_pre.empty()) {
+            for (auto &kv : m_move_pre)
+                CommitTrack(kv.first);
+            PushMoveUndo();
+            ClearMovePre();
+        } else if (m_sel_track) {
+            CommitTrack(m_sel_track);
+        }
+        m_move_src = NULL;
+        m_move_orig.clear();
+        Invalidate();
+        return;
+    }
+
+    // Armed but never dragged → a plain click on a selected section: seek there
+    // and keep the selection.
+    if (m_move_armed) {
+        m_move_armed = false;
+        m_move_orig.clear();
+        m_timeline->LocateTo(LaneXToFrame(where.x));
+        return;
+    }
+
+    // A rubber-band drag that never grew is a plain click: select the section
+    // under the pointer (a real drag already set m_range_active).
+    if (m_selecting) {
+        m_selecting = false;
+        if (!m_range_active)
+            SelectRegionAt(TrackAtRow(RowAtY(where.y)), m_range_start);
+    }
 }
 
 void TrackAreaView::FrameResized(float w, float h)
@@ -414,8 +1074,107 @@ void TrackAreaView::FrameResized(float w, float h)
     SetScrollY(m_scroll_y); // re-clamp against the new visible height
 }
 
+// Lane right-click popup, built fresh so item sensitivity is current. Runs
+// synchronously (menu.Go blocks this looper), so choices dispatch inline; the
+// gain choice spawns a modal dialog that posts MSG_REGION_SET_GAIN back here.
+void TrackAreaView::ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_where)
+{
+    (void)frame;
+    JackDawProject *p = m_timeline->Project();
+    bool sel_audio = m_sel_track && !jackdaw_track_is_instrument(m_sel_track);
+    bool op_audio = sel_audio || (!m_sel_track && t && !jackdaw_track_is_instrument(t));
+    bool have_sel = !m_sel_regions.empty() || m_range_active;
+    bool can_group = m_sel_regions.size() >= 2 && sel_audio;
+    bool can_paste = CanPaste() && t && !jackdaw_track_is_instrument(t);
+    bool audio_here = t && !jackdaw_track_is_instrument(t);
+
+    BPopUpMenu menu("region_context", false, false);
+    BMenuItem *mi_split = new BMenuItem("Split at Playhead", NULL);
+    mi_split->SetEnabled(audio_here);
+    menu.AddItem(mi_split);
+    BMenuItem *mi_del = new BMenuItem("Delete Selected Area", NULL);
+    mi_del->SetEnabled(have_sel && op_audio);
+    menu.AddItem(mi_del);
+    BMenuItem *mi_copy = new BMenuItem("Copy", NULL);
+    mi_copy->SetEnabled(have_sel && op_audio);
+    menu.AddItem(mi_copy);
+    BMenuItem *mi_paste = new BMenuItem("Paste at Playhead", NULL);
+    mi_paste->SetEnabled(can_paste);
+    menu.AddItem(mi_paste);
+    BMenuItem *mi_gain = new BMenuItem("Set Selection Gain…", NULL);
+    mi_gain->SetEnabled(have_sel && op_audio);
+    menu.AddItem(mi_gain);
+    BMenuItem *mi_group = new BMenuItem("Group Sections", NULL);
+    mi_group->SetEnabled(can_group);
+    menu.AddItem(mi_group);
+    BMenuItem *mi_delreg = new BMenuItem("Delete Region", NULL);
+    mi_delreg->SetEnabled(audio_here);
+    menu.AddItem(mi_delreg);
+    BMenuItem *mi_clrloop = new BMenuItem("Clear Loop Region", NULL);
+    mi_clrloop->SetEnabled(jackdaw_engine_has_loop_region());
+    menu.AddItem(mi_clrloop);
+
+    BMenuItem *mi_deltrack = NULL;
+    if (t) {
+        menu.AddSeparatorItem();
+        mi_deltrack = new BMenuItem("Delete Track", NULL);
+        menu.AddItem(mi_deltrack);
+    }
+
+    BMenuItem *chosen = menu.Go(screen_where, false, true);
+    if (!chosen)
+        return;
+    if (chosen == mi_split)
+        SplitAtCursor();
+    else if (chosen == mi_del)
+        DeleteSelection();
+    else if (chosen == mi_copy)
+        CopySelection();
+    else if (chosen == mi_paste)
+        PasteAtCursor();
+    else if (chosen == mi_gain) {
+        // Seed the dialog with the current gain of the first target region.
+        ClipRegion *cur = NULL;
+        if (!m_sel_regions.empty()) {
+            cur = m_sel_regions[0];
+        } else if (op_audio) {
+            JackDawTrack *gt = m_sel_track ? m_sel_track : t;
+            off_t a = m_range_start < m_range_end ? m_range_start : m_range_end;
+            if (gt)
+                cur = clip_region_list_at(jackdaw_track_get_regions(gt), a);
+        }
+        double cur_db =
+            (cur && cur->gain > 0.0f) ? CLAMP(20.0 * log10((double)cur->gain), -25.0, 25.0) : 0.0;
+        RegionGainWindow *dlg = new RegionGainWindow(BMessenger(this), cur_db);
+        dlg->Show();
+    } else if (chosen == mi_group) {
+        GroupSelection();
+    } else if (chosen == mi_delreg) {
+        if (m_menu_track && !jackdaw_track_is_instrument(m_menu_track)) {
+            jackdaw_project_push_region_undo(p, m_menu_track);
+            clip_region_list_remove_at(jackdaw_track_get_regions(m_menu_track), m_menu_frame);
+            ClearSectionSelection();
+            CommitTrack(m_menu_track);
+        }
+    } else if (chosen == mi_clrloop) {
+        jackdaw_engine_set_loop_range(0, 0);
+        jackdaw_engine_set_loop_enabled(FALSE);
+        m_timeline->InvalidateAll();
+    } else if (chosen == mi_deltrack && t) {
+        BMessage del(MSG_TRACK_DELETE_SLOT);
+        del.AddInt32("slot", (int32)t->slot);
+        m_main.SendMessage(&del);
+    }
+}
+
 void TrackAreaView::MessageReceived(BMessage *message)
 {
+    if (message->what == MSG_REGION_SET_GAIN) {
+        float db = 0.0f;
+        if (message->FindFloat("db", &db) == B_OK)
+            SetSelectionGain(db);
+        return;
+    }
     if (message->what == B_MOUSE_WHEEL_CHANGED) {
         float dy = 0.0f;
         if (message->FindFloat("be:wheel_delta_y", &dy) == B_OK && dy != 0.0f) {

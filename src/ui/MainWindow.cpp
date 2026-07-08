@@ -28,6 +28,7 @@
 #include "MixerView.h"
 #include "MixerWindow.h"
 #include "TimelineView.h"
+#include "TrackAreaView.h"
 #include "TransportView.h"
 
 // GObject "track-added/removed/reordered" -> refresh both mixers. Emitted only
@@ -120,6 +121,10 @@ public:
             case 's':
             case 'S':
                 window->PostMessage(MSG_SPLIT);
+                return B_SKIP_MESSAGE;
+            case B_DELETE:
+            case B_BACKSPACE:
+                window->PostMessage(MSG_REGION_DELETE);
                 return B_SKIP_MESSAGE;
             default:
                 return B_DISPATCH_MESSAGE;
@@ -291,10 +296,18 @@ BMenuBar *MainWindow::BuildMenuBar()
     AddItem(file, "Quit", B_QUIT_REQUESTED, 'Q', B_COMMAND_KEY);
     bar->AddItem(file);
 
-    // Edit — the undo manager is a later-phase port (currently a no-op stub).
+    // Edit — undo/redo + region clipboard/editing (act on the active track's
+    // section selection, else the rubber-band range).
     BMenu *edit = new BMenu("Edit");
     AddItem(edit, "Undo", MSG_EDIT_UNDO, 'Z', B_COMMAND_KEY);
     AddItem(edit, "Redo", MSG_EDIT_REDO, 'Y', B_COMMAND_KEY);
+    edit->AddSeparatorItem();
+    AddItem(edit, "Copy", MSG_REGION_COPY, 'C', B_COMMAND_KEY);
+    AddItem(edit, "Paste", MSG_REGION_PASTE, 'V', B_COMMAND_KEY);
+    AddItem(edit, "Delete", MSG_REGION_DELETE);
+    AddItem(edit, "Group Sections", MSG_REGION_GROUP, 'G', B_COMMAND_KEY);
+    edit->AddSeparatorItem();
+    AddItem(edit, "Split at Playhead", MSG_SPLIT);
     bar->AddItem(edit);
 
     // Track — add/delete are live now; Load File arrives with the clip phase.
@@ -461,21 +474,6 @@ void MainWindow::LoadFileAsTrack(const char *path)
     g_object_unref(t);
 }
 
-void MainWindow::SplitAtCursor()
-{
-    JackDawTrack *t = jackdaw_project_get_active_track(m_project);
-    if (!t)
-        return;
-    off_t cursor = jackdaw_engine_get_play_pos();
-    int sr = (int)jackdaw_engine_get_sample_rate();
-    // Only push undo + commit if the cut actually lands inside a region.
-    if (!clip_region_list_at(jackdaw_track_get_regions(t), cursor))
-        return;
-    jackdaw_project_push_region_undo(m_project, t);
-    clip_region_list_split_at(jackdaw_track_get_regions(t), cursor, sr);
-    jackdaw_track_commit_regions(t);
-}
-
 void MainWindow::ShowTrackContext(int slot, BPoint screen_where)
 {
     JackDawTrack *t = NULL;
@@ -629,7 +627,19 @@ void MainWindow::MessageReceived(BMessage *message)
             break;
 
         case MSG_SPLIT:
-            SplitAtCursor();
+            m_timeline->TrackArea()->SplitAtCursor();
+            break;
+        case MSG_REGION_COPY:
+            m_timeline->TrackArea()->CopySelection();
+            break;
+        case MSG_REGION_PASTE:
+            m_timeline->TrackArea()->PasteAtCursor();
+            break;
+        case MSG_REGION_DELETE:
+            m_timeline->TrackArea()->DeleteSelection();
+            break;
+        case MSG_REGION_GROUP:
+            m_timeline->TrackArea()->GroupSelection();
             break;
 
         case MSG_TRACK_LOAD_FILE: {
@@ -652,9 +662,13 @@ void MainWindow::MessageReceived(BMessage *message)
         }
 
         case MSG_EDIT_UNDO:
+            // The section-selection pointers reference the pre-undo region list;
+            // drop them so the restored regions aren't touched through stale ptrs.
+            m_timeline->TrackArea()->ClearSectionSelection();
             jackdaw_project_undo(m_project);
             break;
         case MSG_EDIT_REDO:
+            m_timeline->TrackArea()->ClearSectionSelection();
             jackdaw_project_redo(m_project);
             break;
 

@@ -46,8 +46,6 @@ private:
     void ShowTrackContext(int slot, BPoint screen_where);
     // Import an audio file onto a fresh audio track (region placed at timeline 0).
     void LoadFileAsTrack(const char *path);
-    // Split the region under the cursor on the active track at the play head.
-    void SplitAtCursor();
 
     // Right-click context popups (built fresh so their marks are current).
     void ShowRecordMenu(BPoint screen_where);

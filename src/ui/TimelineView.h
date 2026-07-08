@@ -57,6 +57,12 @@ public:
     // Locate the transport to `frame`, snapped when snap is enabled.
     void LocateTo(off_t frame);
 
+    // The track area (owner of lane interaction: region selection + editing).
+    TrackAreaView *TrackArea() const
+    {
+        return m_track_area;
+    }
+
     // Called by the window's UI tick: playhead strip invalidation +
     // follow-scroll while playing.
     void TickUpdate();

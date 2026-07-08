@@ -33,7 +33,12 @@ enum {
     MSG_ZOOM_OUT = 'zmot',
 
     // Region editing.
-    MSG_SPLIT = 'splt', // split focused track at the cursor
+    MSG_SPLIT = 'splt',           // split focused track at the cursor
+    MSG_REGION_COPY = 'rcpy',     // copy the section selection / range to the clipboard
+    MSG_REGION_PASTE = 'rpst',    // paste the clipboard at the playhead
+    MSG_REGION_DELETE = 'rdel',   // delete the selected sections / range
+    MSG_REGION_GROUP = 'rgrp',    // merge adjacent same-clip selected sections
+    MSG_REGION_SET_GAIN = 'rgan', // apply float "db" (from the gain dialog) to the selection
 
     // Tempo / grid / display controls (handled by TransportView).
     MSG_SET_BPM = 'sbpm',

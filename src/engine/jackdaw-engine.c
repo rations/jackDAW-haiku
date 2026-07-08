@@ -120,20 +120,10 @@ static gint64 g_diag_period_us = 0;
 static GThread *g_diag_thread = NULL;
 static volatile gint g_diag_quit = 0;
 
-/* TEMP measurement: total frames the process callback has consumed. Divided by
- * wall-clock in the diag thread, this is the device's TRUE clock rate — compare
- * against jack_get_sample_rate() to detect a device/jackd rate mismatch. */
-static volatile gint64 g_diag_total_frames = 0;
-static volatile gint64 g_diag_cb_count = 0;
-static volatile gint g_diag_last_nframes = 0;
-
 static gpointer diag_thread_func(gpointer arg)
 {
     (void)arg;
     int last_xruns = 0;
-    gint64 last_frames = 0;
-    gint64 last_cbs = 0;
-    gint64 last_us = g_get_monotonic_time();
     while (!g_atomic_int_get(&g_diag_quit)) {
         g_usleep(1000000); /* 1 s */
         int x = g_atomic_int_get(&engine_xruns);
@@ -141,19 +131,8 @@ static gpointer diag_thread_func(gpointer arg)
         last_xruns = x;
         gint64 cb_max = g_diag_cb_max_us;
         g_diag_cb_max_us = 0;
-        gint64 now_us = g_get_monotonic_time();
-        gint64 now_frames = g_diag_total_frames;
-        gint64 now_cbs = g_diag_cb_count;
-        double secs = (double)(now_us - last_us) / 1e6;
-        double fps = secs > 0.0 ? (double)(now_frames - last_frames) / secs : 0.0;
-        double cps = secs > 0.0 ? (double)(now_cbs - last_cbs) / secs : 0.0;
-        last_us = now_us;
-        last_frames = now_frames;
-        last_cbs = now_cbs;
-        g_message("[diag] xruns +%d  cb/s=%.0f nframes=%d bufsize=%u  "
-                  "TRUE_RATE=%.0f fps (jack reports %u, cb_max=%ldus)",
-                  dx, cps, g_diag_last_nframes, (unsigned)jack_get_buffer_size(engine.client), fps,
-                  (unsigned)jackdaw_engine_get_sample_rate(), (long)cb_max);
+        g_message("[diag] xruns +%d (total %d)  cb_last=%ldus cb_max=%ldus period=%ldus", dx, x,
+                  (long)g_diag_cb_last_us, (long)cb_max, (long)g_diag_period_us);
     }
     return NULL;
 }
@@ -596,9 +575,6 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     gint64 diag_t0 = 0;
     if (g_diag_on)
         diag_t0 = g_get_monotonic_time();
-    g_diag_total_frames += nframes; /* TEMP: measure true device rate */
-    g_diag_cb_count++;
-    g_diag_last_nframes = (gint)nframes;
 
     /* Flush denormals to zero on this RT thread (belt; thread-init cb is the
      * suspenders). */
