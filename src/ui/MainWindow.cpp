@@ -93,6 +93,39 @@ public:
         if (dynamic_cast<BTextView *>(window->CurrentFocus()) != NULL)
             return B_DISPATCH_MESSAGE; /* typing in a text field */
 
+        // Ctrl+<letter> edit shortcuts. Haiku only resolves menu/window
+        // shortcuts while the Command key (Alt on the default keymap) is held,
+        // so Ctrl combos must be caught here. raw_char is the base letter with
+        // no modifiers applied (byte would be the control code under Ctrl).
+        int32 mods = 0, raw = 0;
+        message->FindInt32("modifiers", &mods);
+        message->FindInt32("raw_char", &raw);
+        if (mods & B_CONTROL_KEY) {
+            uint32 what = 0;
+            switch (raw) {
+                case 'z':
+                    what = (mods & B_SHIFT_KEY) ? MSG_EDIT_REDO : MSG_EDIT_UNDO;
+                    break;
+                case 'y':
+                    what = MSG_EDIT_REDO;
+                    break;
+                case 'c':
+                    what = MSG_REGION_COPY;
+                    break;
+                case 'v':
+                    what = MSG_REGION_PASTE;
+                    break;
+                case 'g':
+                    what = MSG_REGION_GROUP;
+                    break;
+            }
+            if (what) {
+                window->PostMessage(what);
+                return B_SKIP_MESSAGE;
+            }
+            return B_DISPATCH_MESSAGE;
+        }
+
         int8 byte;
         if (message->FindInt8("byte", &byte) != B_OK)
             return B_DISPATCH_MESSAGE;

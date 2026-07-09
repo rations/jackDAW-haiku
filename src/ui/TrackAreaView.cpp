@@ -924,9 +924,13 @@ void TrackAreaView::MouseDown(BPoint where)
         return;
     }
 
-    // Plain press on an already-selected section → arm a potential move-drag.
-    // If the pointer doesn't travel, MouseUp falls through to a plain seek.
-    if (r && m_sel_track == t && SectionSelContains(r)) {
+    // Plain press on a region → select it (keeping an existing multi-selection
+    // that already contains it) and arm a move-drag, so a single click-drag
+    // moves the clip. A press that never travels falls through in MouseUp to a
+    // plain seek, so clicking a clip still drops the play head into it.
+    if (r) {
+        if (!(m_sel_track == t && SectionSelContains(r)))
+            SelectRegionAt(t, frame);
         m_move_armed = true;
         m_moving = false;
         m_move_committed = false;
@@ -940,7 +944,8 @@ void TrackAreaView::MouseDown(BPoint where)
         return;
     }
 
-    // Otherwise: locate the playhead and start a potential rubber-band range.
+    // Empty lane (a gap between clips): locate the play head and start a
+    // potential rubber-band time-range (drives delete/copy/gain over a span).
     ClearSectionSelection();
     m_timeline->LocateTo(frame);
     m_selecting = true;
