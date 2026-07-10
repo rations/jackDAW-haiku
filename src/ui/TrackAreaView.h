@@ -70,6 +70,9 @@ private:
     void DrawWaveforms(BRect lane);
     // Live red waveform for tracks currently capturing a take (P7).
     void DrawRecordOverlay(BRect lane);
+    // Instrument-track MIDI note rectangles + the live red note overlay (P8).
+    void DrawMidiNotes(BRect lane);
+    void DrawMidiRecOverlay(BRect lane);
 
     // ---- Region-edit helpers ----
     JackDawTrack *TrackAtRow(int row) const;

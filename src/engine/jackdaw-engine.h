@@ -30,10 +30,14 @@ G_BEGIN_DECLS
 typedef enum {
     JACKDAW_ENGINE_EVENT_PORTS_CHANGED = 1,
     JACKDAW_ENGINE_EVENT_CONNECTIONS_CHANGED,
-    JACKDAW_ENGINE_EVENT_SHUTDOWN,      /* JACK server went away; engine is inactive */
-    JACKDAW_ENGINE_EVENT_TAKE_FINALIZED /* a recorded take is on disk and ready to
-                                         * place — call jackdaw_engine_finalize_takes()
-                                         * on the main thread to drain it */
+    JACKDAW_ENGINE_EVENT_SHUTDOWN,           /* JACK server went away; engine is inactive */
+    JACKDAW_ENGINE_EVENT_TAKE_FINALIZED,     /* a recorded audio take is on disk and ready
+                                              * to place — call jackdaw_engine_finalize_takes()
+                                              * on the main thread to drain it */
+    JACKDAW_ENGINE_EVENT_MIDI_TAKE_FINALIZED /* a MIDI take was captured and the RT
+                                              * thread has stopped writing — call
+                                              * jackdaw_engine_finalize_midi_takes()
+                                              * on the main thread to build the notes */
 } JackDawEngineEvent;
 
 typedef void (*JackDawEngineEventHook)(int event, void *user);
@@ -118,6 +122,32 @@ int jackdaw_engine_get_record_mode(void);
  * AudioClips and edits the track region lists (which are main-thread-owned).
  * No-op when nothing is pending. */
 void jackdaw_engine_finalize_takes(void);
+
+/* Build recorded MIDI into clip notes. Call on the MAIN thread in response to
+ * JACKDAW_ENGINE_EVENT_MIDI_TAKE_FINALIZED: it drains each armed instrument
+ * track's capture ringbuffer into MidiNotes, merges them into the track clip and
+ * republishes the RT snapshot. No-op when nothing was captured. */
+void jackdaw_engine_finalize_midi_takes(void);
+
+/* --- Live MIDI recording preview (main thread / draw only) ---
+ * One in-progress recorded note, in ABSOLUTE timeline frames. Note-ons are
+ * paired with note-offs; notes still held are extended to the current playhead. */
+typedef struct {
+    off_t start_frame, end_frame;
+    guint8 pitch, velocity, channel;
+} JackDawRecNote;
+/* Non-destructively peek the MIDI captured so far for `t` (instrument track being
+ * recorded). Returns a borrowed pointer to a static array valid until the next
+ * call, with *count set; NULL/0 if nothing is being recorded. */
+const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count);
+
+/* --- Preview note (main thread only) ---
+ * Inject a single live note-on (on=TRUE) or note-off (on=FALSE) onto an
+ * instrument track's MIDI output, played immediately regardless of transport
+ * state. Lock-free: queued to the RT thread via a ringbuffer. Used by the
+ * piano-roll keyboard to audition pitches. No-op if the track is not an
+ * instrument track registered with the engine. */
+void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch, guint8 velocity, gboolean on);
 
 /* TRUE while a count-in pre-roll is sounding (transport not yet engaged). */
 gboolean jackdaw_engine_is_counting_in(void);

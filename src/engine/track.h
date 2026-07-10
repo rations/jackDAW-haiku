@@ -6,6 +6,7 @@
 
 #include "audio_clip.h"
 #include "clipregion.h"
+#include "midiclip.h"
 
 G_BEGIN_DECLS
 
@@ -25,6 +26,9 @@ typedef enum { JACKDAW_TRACK_AUDIO = 0, JACKDAW_TRACK_INSTRUMENT } JackDawTrackK
 
 /* Max tracks the engine supports */
 #define JACKDAW_MAX_TRACKS 64
+
+/* MIDI capture ringbuffer size — event-based, not sample-rate-dependent. */
+#define TRACK_MIDI_RINGBUF_BYTES 65536
 
 typedef struct _JackDawTrack JackDawTrack;
 typedef struct _JackDawTrackClass JackDawTrackClass;
@@ -47,6 +51,21 @@ struct _JackDawTrack {
     gchar *audio_src_port_r;
     gchar *midi_src_port;  /* external MIDI source (instrument tracks); NULL = none */
     gboolean stereo_input; /* TRUE = the track captures a stereo pair */
+
+    /* MIDI clip model (instrument tracks; main-thread). Notes are stored in the
+     * source clip at musical ticks; midi_regions window into it and drive the
+     * immutable rt_midi event snapshot the RT callback reads (published lock-free
+     * like rt_snapshot). rt_midi is a MidiEventSnapshot* swapped atomically; the
+     * previous one is deferred on retire_midi and freed on the next commit. */
+    MidiClip *midi_clip;     /* single source clip (all notes) */
+    GPtrArray *midi_regions; /* GPtrArray of MidiRegion* windowing into midi_clip */
+    gpointer rt_midi;        /* MidiEventSnapshot* (atomic) */
+    GPtrArray *retire_midi;  /* MidiEventSnapshot* awaiting free */
+
+    /* MIDI capture ringbuffer: written by the RT callback while recording an
+     * armed instrument track, drained on the main thread when recording stops
+     * (turned into clip notes). Allocated with the play buffers. */
+    jack_ringbuffer_t *midi_rec_buf;
 
     /* RT-safe state: written atomically by main thread */
     volatile gint32 state_flags;
@@ -152,6 +171,23 @@ ClipRegionSnapshot *jackdaw_track_ref_snapshot(JackDawTrack *t);
 JackDawTrackKind jackdaw_track_get_kind(JackDawTrack *t);
 void jackdaw_track_set_kind(JackDawTrack *t, JackDawTrackKind kind);
 gboolean jackdaw_track_is_instrument(JackDawTrack *t);
+
+/* ---- MIDI clip / regions (main thread; instrument tracks) ----
+ * get_midi_clip / get_midi_regions return borrowed pointers — edit the region
+ * list or notes in place, then call jackdaw_track_commit_midi() to rebuild and
+ * publish the immutable RT event snapshot. ensure_midi_region seeds the default
+ * full-clip region if the list is empty (so the whole clip is grabbable). */
+MidiClip *jackdaw_track_get_midi_clip(JackDawTrack *t);
+GPtrArray *jackdaw_track_get_midi_regions(JackDawTrack *t);
+void jackdaw_track_ensure_midi_region(JackDawTrack *t);
+
+/* Rebuild + publish the RT MIDI event snapshot from the region list. Converts
+ * ticks to frames with frames_per_beat (= sample_rate * 60 / bpm). */
+void jackdaw_track_commit_midi(JackDawTrack *t, double frames_per_beat);
+
+/* Replace the track's MIDI clip wholesale (consumes `clip`; frees the old one)
+ * and republish the snapshot. Used by editor undo/redo restore. */
+void jackdaw_track_set_midi_clip(JackDawTrack *t, MidiClip *clip, double frames_per_beat);
 
 /* State flag helpers — use g_atomic_int_or/and for thread safety */
 void jackdaw_track_set_armed(JackDawTrack *t, gboolean armed);

@@ -72,6 +72,9 @@ static void engine_event_hook(int event, void *user)
         case JACKDAW_ENGINE_EVENT_TAKE_FINALIZED:
             what = MSG_ENGINE_TAKE_READY;
             break;
+        case JACKDAW_ENGINE_EVENT_MIDI_TAKE_FINALIZED:
+            what = MSG_ENGINE_MIDI_TAKE_READY;
+            break;
         default:
             return;
     }
@@ -861,6 +864,12 @@ void MainWindow::MessageReceived(BMessage *message)
             // timeline (main-thread region-list edits). The lane redraws via the
             // track's state-changed signal.
             jackdaw_engine_finalize_takes();
+            break;
+
+        case MSG_ENGINE_MIDI_TAKE_READY:
+            // A MIDI take was captured: drain each armed instrument track's ring
+            // into clip notes and republish the RT snapshot (main-thread edits).
+            jackdaw_engine_finalize_midi_takes();
             break;
 
         default:

@@ -107,4 +107,5 @@ enum {
     MSG_ENGINE_CONNECTIONS_CHANGED = 'econ',
     MSG_ENGINE_SHUTDOWN = 'edwn',
     MSG_ENGINE_TAKE_READY = 'etak',
+    MSG_ENGINE_MIDI_TAKE_READY = 'emtk',
 };

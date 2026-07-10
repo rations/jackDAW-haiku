@@ -34,6 +34,25 @@ static const rgb_color kRangeTint = {90, 110, 150, 70};
 // Live-record waveform overlay (drawn while a take is being captured).
 static const rgb_color kRecWave = {214, 74, 64, 255};
 static const rgb_color kRecMid = {150, 46, 40, 255};
+// Instrument-track MIDI note rectangles (blue) + live red record overlay.
+static const rgb_color kMidiNote = {96, 156, 230, 255};
+static const rgb_color kMidiRecNote = {230, 96, 88, 255};
+
+// MIDI pitch display window on the timeline lane (the piano-roll editor in a
+// later phase shows the full range): map this span across the band height.
+static const int kMidiLoPitch = 24;
+static const int kMidiHiPitch = 96;
+
+// Map a MIDI pitch to a lane y (high pitch near the top of the band).
+static float MidiPitchToY(int pitch, float band_y0, float band_h)
+{
+    if (pitch < kMidiLoPitch)
+        pitch = kMidiLoPitch;
+    if (pitch > kMidiHiPitch)
+        pitch = kMidiHiPitch;
+    float frac = (float)(pitch - kMidiLoPitch) / (float)(kMidiHiPitch - kMidiLoPitch);
+    return band_y0 + band_h * (1.0f - frac);
+}
 
 // Pointer travel (px) before an armed press on a selected section becomes a move.
 static const float kMoveThreshold = 3.0f;
@@ -830,6 +849,144 @@ void TrackAreaView::DrawRecordOverlay(BRect lane)
     }
 }
 
+/* Draw every instrument track's MIDI notes as rectangles: for each region,
+ * emit the notes of its clip that fall in the region window, mapping tick->frame
+ * ->x with the project tempo and pitch->y across the band. Region edges are
+ * drawn like audio regions so splits/moves read the same. */
+void TrackAreaView::DrawMidiNotes(BRect lane)
+{
+    JackDawProject *p = m_timeline->Project();
+    guint n = jackdaw_project_track_count(p);
+    double spp = m_timeline->Spp();
+    if (spp <= 0.0)
+        return;
+
+    TempoMap tm;
+    tempomap_from_project(&tm, p, jackdaw_engine_get_sample_rate());
+    double fpb = tempomap_frames_per_beat(&tm);
+    double f_per_tick = (fpb > 0.0) ? fpb / (double)JACKDAW_PPQ : 0.0;
+    if (f_per_tick <= 0.0)
+        return;
+
+    off_t start = m_timeline->ViewStart();
+    off_t view1 = start + (off_t)((double)lane.Width() * spp) + 1;
+
+    for (guint i = 0; i < n; i++) {
+        float row_top = (float)i * kTimelineTrackHeight - m_scroll_y;
+        float row_bot = row_top + kTimelineTrackHeight - 1.0f;
+        if (row_bot < lane.top || row_top > lane.bottom)
+            continue;
+        JackDawTrack *t = jackdaw_project_get_track(p, i);
+        if (!t || !jackdaw_track_is_instrument(t))
+            continue;
+        GPtrArray *regs = jackdaw_track_get_midi_regions(t);
+        if (!regs)
+            continue;
+
+        float band_y0 = row_top + 3.0f;
+        float band_h = kTimelineTrackHeight - 6.0f;
+
+        for (guint ri = 0; ri < regs->len; ri++) {
+            MidiRegion *r = (MidiRegion *)g_ptr_array_index(regs, ri);
+            if (!r->clip || !r->clip->notes)
+                continue;
+            off_t r_tl0 = r->tl_pos;
+            off_t r_tl1 = midi_region_end(r, f_per_tick);
+            if (r_tl1 <= start || r_tl0 >= view1)
+                continue;
+
+            guint32 win0 = r->clip_in;
+            guint32 win1 = r->clip_in + r->length;
+            GArray *notes = r->clip->notes;
+            SetHighColor(kMidiNote);
+            for (guint ni = 0; ni < notes->len; ni++) {
+                MidiNote *nt = &g_array_index(notes, MidiNote, ni);
+                if (nt->velocity == 0)
+                    continue;
+                if (nt->start < win0 || nt->start >= win1)
+                    continue;
+                guint32 note_end = nt->start + nt->length;
+                if (note_end > win1)
+                    note_end = win1;
+                off_t on_f = r_tl0 + (off_t)((double)(nt->start - win0) * f_per_tick + 0.5);
+                off_t off_f = r_tl0 + (off_t)((double)(note_end - win0) * f_per_tick + 0.5);
+                if (off_f < start || on_f > view1)
+                    continue;
+                float x0 = lane.left + m_timeline->FrameToX(on_f);
+                float x1 = lane.left + m_timeline->FrameToX(off_f);
+                if (x1 < x0 + 2.0f)
+                    x1 = x0 + 2.0f;
+                if (x0 < lane.left)
+                    x0 = lane.left;
+                if (x1 > lane.right)
+                    x1 = lane.right;
+                float y = MidiPitchToY(nt->pitch, band_y0, band_h);
+                FillRect(BRect(x0, y - 1.0f, x1, y + 1.0f));
+            }
+
+            // Region boundary edges (skip the first region's start at frame 0).
+            SetHighColor(kRegionEdge);
+            if (r_tl0 > 0) {
+                float bx = lane.left + m_timeline->FrameToX(r_tl0);
+                if (bx >= lane.left && bx <= lane.right)
+                    StrokeLine(BPoint(bx, row_top), BPoint(bx, row_bot));
+            }
+            float ex = lane.left + m_timeline->FrameToX(r_tl1);
+            if (ex >= lane.left && ex <= lane.right)
+                StrokeLine(BPoint(ex, row_top), BPoint(ex, row_bot));
+        }
+    }
+}
+
+/* Live red MIDI note overlay for any instrument track currently capturing: the
+ * engine peeks its capture ring and returns in-progress notes in absolute frames
+ * (held notes extended to the playhead). */
+void TrackAreaView::DrawMidiRecOverlay(BRect lane)
+{
+    if (!jackdaw_engine_is_recording())
+        return;
+    JackDawProject *p = m_timeline->Project();
+    guint n = jackdaw_project_track_count(p);
+    double spp = m_timeline->Spp();
+    if (spp <= 0.0)
+        return;
+    off_t start = m_timeline->ViewStart();
+    off_t view1 = start + (off_t)((double)lane.Width() * spp) + 1;
+
+    for (guint i = 0; i < n; i++) {
+        float row_top = (float)i * kTimelineTrackHeight - m_scroll_y;
+        float row_bot = row_top + kTimelineTrackHeight - 1.0f;
+        if (row_bot < lane.top || row_top > lane.bottom)
+            continue;
+        JackDawTrack *t = jackdaw_project_get_track(p, i);
+        if (!t || !jackdaw_track_is_instrument(t) || !jackdaw_track_is_armed(t))
+            continue;
+
+        guint cnt = 0;
+        const JackDawRecNote *rn = jackdaw_engine_rec_preview(t, &cnt);
+        if (!rn || cnt == 0)
+            continue;
+
+        float band_y0 = row_top + 3.0f;
+        float band_h = kTimelineTrackHeight - 6.0f;
+        SetHighColor(kMidiRecNote);
+        for (guint k = 0; k < cnt; k++) {
+            if (rn[k].end_frame < start || rn[k].start_frame > view1)
+                continue;
+            float x0 = lane.left + m_timeline->FrameToX(rn[k].start_frame);
+            float x1 = lane.left + m_timeline->FrameToX(rn[k].end_frame);
+            if (x1 < x0 + 2.0f)
+                x1 = x0 + 2.0f;
+            if (x0 < lane.left)
+                x0 = lane.left;
+            if (x1 > lane.right)
+                x1 = lane.right;
+            float y = MidiPitchToY(rn[k].pitch, band_y0, band_h);
+            FillRect(BRect(x0, y - 1.0f, x1, y + 1.0f));
+        }
+    }
+}
+
 void TrackAreaView::Draw(BRect updateRect)
 {
     (void)updateRect;
@@ -917,8 +1074,14 @@ void TrackAreaView::Draw(BRect updateRect)
     // Clip-region waveforms (drawn over the grid, under the playhead).
     DrawWaveforms(lane);
 
+    // Instrument-track MIDI note rectangles (over the grid, under the playhead).
+    DrawMidiNotes(lane);
+
     // Live red waveform for any take currently being captured (over the clips).
     DrawRecordOverlay(lane);
+
+    // Live red MIDI notes for any instrument take currently being captured.
+    DrawMidiRecOverlay(lane);
 
     // Playhead line.
     float x = lane.left + m_timeline->FrameToX(jackdaw_engine_get_play_pos());
