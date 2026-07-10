@@ -82,10 +82,11 @@ TrackAreaView::TrackAreaView(TimelineView *timeline)
       m_timeline(timeline), m_scroll_y(0.0f), m_drop_gap(-1), m_sel_track(NULL), m_selecting(false),
       m_range_active(false), m_range_start(0), m_range_end(0), m_move_armed(false), m_moving(false),
       m_move_committed(false), m_move_press_x(0.0f), m_move_press_y(0.0f), m_move_src(NULL),
-      m_menu_track(NULL), m_menu_frame(0), m_added_handler(0), m_removed_handler(0),
-      m_reordered_handler(0), m_selection_handler(0)
+      m_clipboard_midi(false), m_menu_track(NULL), m_menu_frame(0), m_added_handler(0),
+      m_removed_handler(0), m_reordered_handler(0), m_selection_handler(0)
 {
     m_clipboard = clip_region_list_new();
+    m_midi_clipboard = midi_region_list_new();
 }
 
 TrackAreaView::~TrackAreaView()
@@ -93,6 +94,8 @@ TrackAreaView::~TrackAreaView()
     ClearMovePre();
     if (m_clipboard)
         g_ptr_array_unref(m_clipboard);
+    if (m_midi_clipboard)
+        g_ptr_array_unref(m_midi_clipboard);
 }
 
 void TrackAreaView::AttachedToWindow()
@@ -220,8 +223,10 @@ int TrackAreaView::RowAtY(float y) const
 /* -----------------------------------------------------------------------
  * Region-edit helpers + operations. Ported from the Linux JackDAW timeline;
  * all run on this looper, the single project mutator, so they touch the model
- * directly. Any list-mutating op clears the section selection because the edit
- * frees/rebuilds ClipRegion pointers (split, delete, gain all re-slice).
+ * directly. A "section" is a ClipRegion* on an audio track or a MidiRegion*
+ * on an instrument track; the Sec... and SectionList... helpers dispatch on
+ * the owning track's kind. Any list-mutating op clears the section selection
+ * because the edit frees/rebuilds the section pointers.
  * ----------------------------------------------------------------------- */
 
 JackDawTrack *TrackAreaView::TrackAtRow(int row) const
@@ -240,10 +245,72 @@ off_t TrackAreaView::LaneXToFrame(float x) const
     return f < 0 ? 0 : f;
 }
 
-bool TrackAreaView::SectionSelContains(ClipRegion *r) const
+/* ---- Kind-aware section dispatch (audio ClipRegion / instrument MidiRegion),
+ * the same generalization the Linux timeline uses. A section pointer is only
+ * valid together with the track that owns it. ---- */
+
+double TrackAreaView::FramesPerTick() const
 {
-    for (ClipRegion *s : m_sel_regions)
-        if (s == r)
+    JackDawProject *p = m_timeline->Project();
+    if (!p)
+        return 0.0;
+    double fpb = jackdaw_project_frames_per_beat(p, jackdaw_engine_get_sample_rate());
+    return fpb / (double)JACKDAW_PPQ;
+}
+
+GPtrArray *TrackAreaView::SectionList(JackDawTrack *t) const
+{
+    return jackdaw_track_is_instrument(t) ? jackdaw_track_get_midi_regions(t)
+                                          : jackdaw_track_get_regions(t);
+}
+
+GPtrArray *TrackAreaView::SectionListCopy(JackDawTrack *t) const
+{
+    return jackdaw_track_is_instrument(t) ? midi_region_list_copy(jackdaw_track_get_midi_regions(t))
+                                          : clip_region_list_copy(jackdaw_track_get_regions(t));
+}
+
+off_t TrackAreaView::SecTlPos(JackDawTrack *t, void *s) const
+{
+    return jackdaw_track_is_instrument(t) ? ((MidiRegion *)s)->tl_pos : ((ClipRegion *)s)->tl_pos;
+}
+
+void TrackAreaView::SecSetTlPos(JackDawTrack *t, void *s, off_t pos)
+{
+    if (jackdaw_track_is_instrument(t))
+        ((MidiRegion *)s)->tl_pos = pos;
+    else
+        ((ClipRegion *)s)->tl_pos = pos;
+}
+
+off_t TrackAreaView::SecEnd(JackDawTrack *t, void *s) const
+{
+    if (jackdaw_track_is_instrument(t))
+        return midi_region_end((MidiRegion *)s, FramesPerTick());
+    return clip_region_end((ClipRegion *)s);
+}
+
+void *TrackAreaView::SecListAt(JackDawTrack *t, off_t frame) const
+{
+    if (jackdaw_track_is_instrument(t))
+        return midi_region_list_at(jackdaw_track_get_midi_regions(t), frame, FramesPerTick());
+    return clip_region_list_at(jackdaw_track_get_regions(t), frame);
+}
+
+void TrackAreaView::PushRegionUndo(JackDawTrack *t)
+{
+    JackDawProject *p = m_timeline->Project();
+    if (jackdaw_track_is_instrument(t))
+        jackdaw_project_push_midi_region_undo(
+            p, t, jackdaw_project_frames_per_beat(p, jackdaw_engine_get_sample_rate()));
+    else
+        jackdaw_project_push_region_undo(p, t);
+}
+
+bool TrackAreaView::SectionSelContains(void *s) const
+{
+    for (void *m : m_sel_regions)
+        if (m == s)
             return true;
     return false;
 }
@@ -271,32 +338,38 @@ void TrackAreaView::ClearSectionSelection()
     Invalidate();
 }
 
-// Select the single audio section covering `frame` on `track` (highlights its
-// whole span); clears the selection when the frame lands in a gap.
+// Select the single section covering `frame` on `track` (highlights its whole
+// span); clears the selection when the frame lands in a gap.
 void TrackAreaView::SelectRegionAt(JackDawTrack *t, off_t frame)
 {
     m_sel_track = NULL;
     m_sel_regions.clear();
     m_range_active = false;
-    if (t && !jackdaw_track_is_instrument(t)) {
-        ClipRegion *r = clip_region_list_at(jackdaw_track_get_regions(t), frame);
-        if (r) {
-            m_sel_track = t;
-            m_sel_regions.push_back(r);
-        }
+    void *r = t ? SecListAt(t, frame) : NULL;
+    if (r) {
+        m_sel_track = t;
+        m_sel_regions.push_back(r);
     }
     Invalidate();
 }
 
 void TrackAreaView::CommitTrack(JackDawTrack *t)
 {
-    clip_region_list_sort(jackdaw_track_get_regions(t));
-    jackdaw_track_commit_regions(t);
+    if (jackdaw_track_is_instrument(t)) {
+        midi_region_list_sort(jackdaw_track_get_midi_regions(t));
+        JackDawProject *p = m_timeline->Project();
+        jackdaw_track_commit_midi(
+            t, jackdaw_project_frames_per_beat(p, jackdaw_engine_get_sample_rate()));
+    } else {
+        clip_region_list_sort(jackdaw_track_get_regions(t));
+        jackdaw_track_commit_regions(t);
+    }
 }
 
 bool TrackAreaView::CanPaste() const
 {
-    return m_clipboard && m_clipboard->len > 0;
+    GPtrArray *cb = m_clipboard_midi ? m_midi_clipboard : m_clipboard;
+    return cb && cb->len > 0;
 }
 
 // Snap a section-move delta (timeline frames): consider both the beat grid (the
@@ -337,16 +410,16 @@ off_t TrackAreaView::SnapMoveDelta(off_t raw_delta) const
         }
     }
 
-    GPtrArray *regs = jackdaw_track_get_regions(m_sel_track);
+    GPtrArray *regs = SectionList(m_sel_track);
     for (guint i = 0; i < n; i++) {
-        ClipRegion *m = m_sel_regions[i];
-        off_t m_len = m->length;
+        void *m = m_sel_regions[i];
+        off_t m_len = SecEnd(m_sel_track, m) - SecTlPos(m_sel_track, m);
         off_t mine[2] = {m_move_orig[i] + raw_delta, m_move_orig[i] + raw_delta + m_len};
         for (guint j = 0; j < regs->len; j++) {
-            ClipRegion *o = (ClipRegion *)g_ptr_array_index(regs, j);
+            void *o = g_ptr_array_index(regs, j);
             if (SectionSelContains(o))
                 continue;
-            off_t edges[2] = {o->tl_pos, clip_region_end(o)};
+            off_t edges[2] = {SecTlPos(m_sel_track, o), SecEnd(m_sel_track, o)};
             for (int em = 0; em < 2; em++)
                 for (int eo = 0; eo < 2; eo++) {
                     off_t corr = edges[eo] - mine[em];
@@ -371,23 +444,37 @@ off_t TrackAreaView::SnapMoveDelta(off_t raw_delta) const
 namespace
 {
 struct MoveUndoCtx {
+    JackDawProject *project; /* strong ref (for the MIDI tick->frame factor) */
     guint n;
     JackDawTrack **tracks; /* strong refs */
 };
+GPtrArray *move_track_sections_copy(JackDawTrack *t)
+{
+    return jackdaw_track_is_instrument(t) ? midi_region_list_copy(jackdaw_track_get_midi_regions(t))
+                                          : clip_region_list_copy(jackdaw_track_get_regions(t));
+}
 gpointer move_undo_capture(gpointer ctx)
 {
     MoveUndoCtx *c = (MoveUndoCtx *)ctx;
     GPtrArray *lists = g_ptr_array_new();
     for (guint i = 0; i < c->n; i++)
-        g_ptr_array_add(lists, clip_region_list_copy(jackdaw_track_get_regions(c->tracks[i])));
+        g_ptr_array_add(lists, move_track_sections_copy(c->tracks[i]));
     return lists;
 }
 void move_undo_restore(gpointer ctx, gpointer state)
 {
     MoveUndoCtx *c = (MoveUndoCtx *)ctx;
     GPtrArray *lists = (GPtrArray *)state;
-    for (guint i = 0; i < c->n && i < lists->len; i++)
-        jackdaw_track_apply_regions(c->tracks[i], (GPtrArray *)g_ptr_array_index(lists, i));
+    for (guint i = 0; i < c->n && i < lists->len; i++) {
+        JackDawTrack *t = c->tracks[i];
+        GPtrArray *list = (GPtrArray *)g_ptr_array_index(lists, i);
+        if (jackdaw_track_is_instrument(t))
+            jackdaw_track_apply_midi_regions(
+                t, list,
+                jackdaw_project_frames_per_beat(c->project, jackdaw_engine_get_sample_rate()));
+        else
+            jackdaw_track_apply_regions(t, list);
+    }
 }
 void move_undo_free_state(gpointer state)
 {
@@ -404,6 +491,8 @@ void move_undo_ctx_free(gpointer ctx)
     for (guint i = 0; i < c->n; i++)
         if (c->tracks[i])
             g_object_unref(c->tracks[i]);
+    if (c->project)
+        g_object_unref(c->project);
     g_free(c->tracks);
     g_free(c);
 }
@@ -416,6 +505,7 @@ void TrackAreaView::PushMoveUndo()
         return;
     guint n = (guint)m_move_pre.size();
     MoveUndoCtx *c = g_new0(MoveUndoCtx, 1);
+    c->project = (JackDawProject *)g_object_ref(p);
     c->n = n;
     c->tracks = g_new0(JackDawTrack *, n);
     GPtrArray *saved = g_ptr_array_new();
@@ -444,14 +534,17 @@ void TrackAreaView::SplitAtCursor()
 {
     JackDawProject *p = m_timeline->Project();
     JackDawTrack *t = jackdaw_project_get_active_track(p);
-    if (!t || jackdaw_track_is_instrument(t))
+    if (!t)
         return;
     off_t cur = jackdaw_engine_get_play_pos();
-    if (!clip_region_list_at(jackdaw_track_get_regions(t), cur))
-        return; // only split if the cut lands inside a region
-    jackdaw_project_push_region_undo(p, t);
-    clip_region_list_split_at(jackdaw_track_get_regions(t), cur,
-                              (int)jackdaw_engine_get_sample_rate());
+    if (!SecListAt(t, cur))
+        return; // only split if the cut lands inside a section
+    PushRegionUndo(t);
+    if (jackdaw_track_is_instrument(t))
+        midi_region_list_split_at(jackdaw_track_get_midi_regions(t), cur, FramesPerTick());
+    else
+        clip_region_list_split_at(jackdaw_track_get_regions(t), cur,
+                                  (int)jackdaw_engine_get_sample_rate());
     CommitTrack(t);
     SelectRegionAt(t, cur); // focus the new right-hand region for the next edit
 }
@@ -461,13 +554,25 @@ void TrackAreaView::DeleteSelection()
     JackDawProject *p = m_timeline->Project();
     int sr = (int)jackdaw_engine_get_sample_rate();
 
+    // Instrument track: remove the selected MIDI sections outright.
+    if (m_sel_track && jackdaw_track_is_instrument(m_sel_track) && !m_sel_regions.empty()) {
+        JackDawTrack *t = m_sel_track;
+        PushRegionUndo(t);
+        GPtrArray *regs = jackdaw_track_get_midi_regions(t);
+        for (void *s : m_sel_regions)
+            g_ptr_array_remove(regs, s);
+        ClearSectionSelection();
+        CommitTrack(t);
+        return;
+    }
+
     if (m_sel_track && !m_sel_regions.empty()) {
         JackDawTrack *t = m_sel_track;
         guint n = (guint)m_sel_regions.size();
         std::vector<off_t> aa(n), bb(n);
         for (guint i = 0; i < n; i++) {
-            aa[i] = m_sel_regions[i]->tl_pos;
-            bb[i] = clip_region_end(m_sel_regions[i]);
+            aa[i] = ((ClipRegion *)m_sel_regions[i])->tl_pos;
+            bb[i] = clip_region_end((ClipRegion *)m_sel_regions[i]);
         }
         jackdaw_project_push_region_undo(p, t);
         GPtrArray *regs = jackdaw_track_get_regions(t);
@@ -518,14 +623,32 @@ void TrackAreaView::CopySelection()
     JackDawProject *p = m_timeline->Project();
     int sr = (int)jackdaw_engine_get_sample_rate();
 
+    // Instrument track: normalized MidiRegion copies into the MIDI clipboard.
+    // Copies are frozen (auto_grow off) so a pasted section keeps its size
+    // instead of re-growing to the source clip's content.
+    if (m_sel_track && jackdaw_track_is_instrument(m_sel_track) && !m_sel_regions.empty()) {
+        g_ptr_array_set_size(m_midi_clipboard, 0);
+        off_t origin = G_MAXINT64;
+        for (void *s : m_sel_regions)
+            if (((MidiRegion *)s)->tl_pos < origin)
+                origin = ((MidiRegion *)s)->tl_pos;
+        for (void *s : m_sel_regions) {
+            MidiRegion *c = midi_region_copy((MidiRegion *)s);
+            c->tl_pos -= origin;
+            c->auto_grow = FALSE;
+            g_ptr_array_add(m_midi_clipboard, c);
+        }
+        m_clipboard_midi = true;
+        return;
+    }
+
     if (m_sel_track && !m_sel_regions.empty()) {
-        if (jackdaw_track_is_instrument(m_sel_track))
-            return;
         GPtrArray *tmp = g_ptr_array_new(); // borrowed pointers, no free func
-        for (ClipRegion *r : m_sel_regions)
+        for (void *r : m_sel_regions)
             g_ptr_array_add(tmp, r);
         clipboard_set(m_clipboard, tmp);
         g_ptr_array_free(tmp, TRUE);
+        m_clipboard_midi = false;
         return;
     }
 
@@ -550,13 +673,55 @@ void TrackAreaView::CopySelection()
         clip_region_list_delete_range(tmp, b, big, sr);
     clipboard_set(m_clipboard, tmp);
     g_ptr_array_unref(tmp);
+    m_clipboard_midi = false;
 }
 
 void TrackAreaView::PasteAtCursor()
 {
     JackDawProject *p = m_timeline->Project();
     JackDawTrack *t = jackdaw_project_get_active_track(p);
-    if (!t || jackdaw_track_is_instrument(t))
+    if (!t)
+        return;
+
+    // MIDI clipboard pastes only onto an instrument track (and vice versa).
+    if (m_clipboard_midi) {
+        if (!jackdaw_track_is_instrument(t) || m_midi_clipboard->len == 0)
+            return;
+        double fpt = FramesPerTick();
+        if (fpt <= 0.0)
+            return;
+        off_t at = jackdaw_engine_get_play_pos();
+        if (at < 0)
+            at = 0;
+        off_t span = 0; // normalized clipboard width
+        for (guint i = 0; i < m_midi_clipboard->len; i++) {
+            off_t e = midi_region_end((MidiRegion *)g_ptr_array_index(m_midi_clipboard, i), fpt);
+            if (e > span)
+                span = e;
+        }
+        GPtrArray *regs = jackdaw_track_get_midi_regions(t);
+        PushRegionUndo(t);
+        // Overwrite the span: split at both edges, then drop what falls inside
+        // (edge positions are tick-quantized, so allow one tick of slack).
+        midi_region_list_split_at(regs, at, fpt);
+        midi_region_list_split_at(regs, at + span, fpt);
+        off_t eps = (off_t)fpt + 1;
+        for (guint i = regs->len; i > 0; i--) {
+            MidiRegion *r = (MidiRegion *)g_ptr_array_index(regs, i - 1);
+            if (r->tl_pos >= at - eps && midi_region_end(r, fpt) <= at + span + eps)
+                g_ptr_array_remove_index(regs, i - 1);
+        }
+        for (guint i = 0; i < m_midi_clipboard->len; i++) {
+            MidiRegion *c = midi_region_copy((MidiRegion *)g_ptr_array_index(m_midi_clipboard, i));
+            c->tl_pos += at;
+            g_ptr_array_add(regs, c);
+        }
+        ClearSectionSelection();
+        CommitTrack(t);
+        return;
+    }
+
+    if (jackdaw_track_is_instrument(t))
         return;
     if (!m_clipboard || m_clipboard->len == 0)
         return;
@@ -593,7 +758,7 @@ void TrackAreaView::GroupSelection()
     guint n = (guint)m_sel_regions.size();
     off_t *tlpos = g_new(off_t, n);
     for (guint i = 0; i < n; i++)
-        tlpos[i] = m_sel_regions[i]->tl_pos;
+        tlpos[i] = ((ClipRegion *)m_sel_regions[i])->tl_pos;
     jackdaw_project_push_region_undo(p, t);
     clip_region_list_group(jackdaw_track_get_regions(t), tlpos, n,
                            (int)jackdaw_engine_get_sample_rate());
@@ -609,12 +774,14 @@ void TrackAreaView::SetSelectionGain(float db)
     int sr = (int)jackdaw_engine_get_sample_rate();
 
     if (m_sel_track && !m_sel_regions.empty()) {
+        if (jackdaw_track_is_instrument(m_sel_track))
+            return; // gain is audio-only
         JackDawTrack *t = m_sel_track;
         guint n = (guint)m_sel_regions.size();
         std::vector<off_t> aa(n), bb(n);
         for (guint i = 0; i < n; i++) {
-            aa[i] = m_sel_regions[i]->tl_pos;
-            bb[i] = clip_region_end(m_sel_regions[i]);
+            aa[i] = ((ClipRegion *)m_sel_regions[i])->tl_pos;
+            bb[i] = clip_region_end((ClipRegion *)m_sel_regions[i]);
         }
         GPtrArray *regs = jackdaw_track_get_regions(t);
         jackdaw_project_push_region_undo(p, t);
@@ -895,6 +1062,23 @@ void TrackAreaView::DrawMidiNotes(BRect lane)
             if (r_tl1 <= start || r_tl0 >= view1)
                 continue;
 
+            // Selected-section highlight: same translucent wash as audio regions.
+            if (m_sel_track == t && SectionSelContains(r)) {
+                float rx0 = lane.left + m_timeline->FrameToX(r_tl0);
+                float rx1 = lane.left + m_timeline->FrameToX(r_tl1);
+                if (rx0 < lane.left)
+                    rx0 = lane.left;
+                if (rx1 > lane.right)
+                    rx1 = lane.right;
+                if (rx1 > rx0) {
+                    SetDrawingMode(B_OP_ALPHA);
+                    SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+                    SetHighColor(kSelRegionTint);
+                    FillRect(BRect(rx0, row_top, rx1, row_bot));
+                    SetDrawingMode(B_OP_COPY);
+                }
+            }
+
             guint32 win0 = r->clip_in;
             guint32 win1 = r->clip_in + r->length;
             GArray *notes = r->clip->notes;
@@ -1131,9 +1315,7 @@ void TrackAreaView::MouseDown(BPoint where)
         Window()->PostMessage(&open);
         return;
     }
-    ClipRegion *r = (t && !jackdaw_track_is_instrument(t))
-                        ? clip_region_list_at(jackdaw_track_get_regions(t), frame)
-                        : NULL;
+    void *r = t ? SecListAt(t, frame) : NULL;
 
     // Unify strip + timeline selection: a plain click selects just this track;
     // Ctrl+click keeps any multi-track selection and only makes this active.
@@ -1189,8 +1371,8 @@ void TrackAreaView::MouseDown(BPoint where)
         m_move_press_y = where.y;
         m_move_src = t;
         m_move_orig.clear();
-        for (ClipRegion *s : m_sel_regions)
-            m_move_orig.push_back(s->tl_pos);
+        for (void *s : m_sel_regions)
+            m_move_orig.push_back(SecTlPos(t, s));
         SetMouseEventMask(B_POINTER_EVENTS, B_LOCK_WINDOW_FOCUS);
         return;
     }
@@ -1223,22 +1405,22 @@ void TrackAreaView::MouseMoved(BPoint where, uint32 code, const BMessage *dragMe
     }
 
     if (m_moving && !m_sel_regions.empty() && !m_move_orig.empty() && m_sel_track) {
-        // Vertical: relocate the block to the audio track under the pointer. The
+        // Vertical: relocate the block to the track under the pointer, if it is
+        // a different track of the same kind (audio<->audio, MIDI<->MIDI). The
         // section pointers are stolen between the two lists so the selection (and
         // m_move_orig, which drives the horizontal offset below) stay valid.
         JackDawTrack *tgt = TrackAtRow(RowAtY(where.y));
-        if (tgt && tgt != m_sel_track && !jackdaw_track_is_instrument(tgt) &&
-            !jackdaw_track_is_instrument(m_sel_track)) {
+        if (tgt && tgt != m_sel_track &&
+            jackdaw_track_is_instrument(tgt) == jackdaw_track_is_instrument(m_sel_track)) {
             if (m_move_pre.find(m_sel_track) == m_move_pre.end())
-                m_move_pre[m_sel_track] =
-                    clip_region_list_copy(jackdaw_track_get_regions(m_sel_track));
+                m_move_pre[m_sel_track] = SectionListCopy(m_sel_track);
             if (m_move_pre.find(tgt) == m_move_pre.end())
-                m_move_pre[tgt] = clip_region_list_copy(jackdaw_track_get_regions(tgt));
+                m_move_pre[tgt] = SectionListCopy(tgt);
             m_move_committed = true;
 
-            GPtrArray *from = jackdaw_track_get_regions(m_sel_track);
-            GPtrArray *to = jackdaw_track_get_regions(tgt);
-            for (ClipRegion *s : m_sel_regions) {
+            GPtrArray *from = SectionList(m_sel_track);
+            GPtrArray *to = SectionList(tgt);
+            for (void *s : m_sel_regions) {
                 guint idx;
                 if (g_ptr_array_find(from, s, &idx)) {
                     g_ptr_array_steal_index_fast(from, idx);
@@ -1262,12 +1444,11 @@ void TrackAreaView::MouseMoved(BPoint where, uint32 code, const BMessage *dragMe
 
         if (delta != 0 && !m_move_committed) {
             if (m_move_pre.find(m_sel_track) == m_move_pre.end())
-                m_move_pre[m_sel_track] =
-                    clip_region_list_copy(jackdaw_track_get_regions(m_sel_track));
+                m_move_pre[m_sel_track] = SectionListCopy(m_sel_track);
             m_move_committed = true;
         }
         for (guint i = 0; i < n; i++)
-            m_sel_regions[i]->tl_pos = m_move_orig[i] + delta;
+            SecSetTlPos(m_sel_track, m_sel_regions[i], m_move_orig[i] + delta);
         Invalidate();
         return;
     }
@@ -1336,13 +1517,14 @@ void TrackAreaView::FrameResized(float w, float h)
 void TrackAreaView::ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_where)
 {
     (void)frame;
-    JackDawProject *p = m_timeline->Project();
     bool sel_audio = m_sel_track && !jackdaw_track_is_instrument(m_sel_track);
     bool op_audio = sel_audio || (!m_sel_track && t && !jackdaw_track_is_instrument(t));
     bool have_sel = !m_sel_regions.empty() || m_range_active;
     bool can_group = m_sel_regions.size() >= 2 && sel_audio;
-    bool can_paste = CanPaste() && t && !jackdaw_track_is_instrument(t);
-    bool audio_here = t && !jackdaw_track_is_instrument(t);
+    // Delete/Copy act on a section selection of either kind; only the
+    // rubber-band range form is audio-only. Paste needs a kind-matching track.
+    bool sec_ops = !m_sel_regions.empty() || (m_range_active && op_audio);
+    bool can_paste = CanPaste() && t && jackdaw_track_is_instrument(t) == m_clipboard_midi;
 
     BPopUpMenu menu("region_context", false, false);
     BMenuItem *mi_piano = NULL;
@@ -1352,13 +1534,13 @@ void TrackAreaView::ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_
         menu.AddSeparatorItem();
     }
     BMenuItem *mi_split = new BMenuItem("Split at Playhead", NULL);
-    mi_split->SetEnabled(audio_here);
+    mi_split->SetEnabled(t != NULL);
     menu.AddItem(mi_split);
     BMenuItem *mi_del = new BMenuItem("Delete Selected Area", NULL);
-    mi_del->SetEnabled(have_sel && op_audio);
+    mi_del->SetEnabled(sec_ops);
     menu.AddItem(mi_del);
     BMenuItem *mi_copy = new BMenuItem("Copy", NULL);
-    mi_copy->SetEnabled(have_sel && op_audio);
+    mi_copy->SetEnabled(sec_ops);
     menu.AddItem(mi_copy);
     BMenuItem *mi_paste = new BMenuItem("Paste at Playhead", NULL);
     mi_paste->SetEnabled(can_paste);
@@ -1370,7 +1552,7 @@ void TrackAreaView::ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_
     mi_group->SetEnabled(can_group);
     menu.AddItem(mi_group);
     BMenuItem *mi_delreg = new BMenuItem("Delete Region", NULL);
-    mi_delreg->SetEnabled(audio_here);
+    mi_delreg->SetEnabled(t != NULL);
     menu.AddItem(mi_delreg);
     BMenuItem *mi_clrloop = new BMenuItem("Clear Loop Region", NULL);
     mi_clrloop->SetEnabled(jackdaw_engine_has_loop_region());
@@ -1403,8 +1585,8 @@ void TrackAreaView::ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_
     else if (chosen == mi_gain) {
         // Seed the dialog with the current gain of the first target region.
         ClipRegion *cur = NULL;
-        if (!m_sel_regions.empty()) {
-            cur = m_sel_regions[0];
+        if (!m_sel_regions.empty() && sel_audio) {
+            cur = (ClipRegion *)m_sel_regions[0];
         } else if (op_audio) {
             JackDawTrack *gt = m_sel_track ? m_sel_track : t;
             off_t a = m_range_start < m_range_end ? m_range_start : m_range_end;
@@ -1418,9 +1600,16 @@ void TrackAreaView::ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_
     } else if (chosen == mi_group) {
         GroupSelection();
     } else if (chosen == mi_delreg) {
-        if (m_menu_track && !jackdaw_track_is_instrument(m_menu_track)) {
-            jackdaw_project_push_region_undo(p, m_menu_track);
-            clip_region_list_remove_at(jackdaw_track_get_regions(m_menu_track), m_menu_frame);
+        if (m_menu_track) {
+            PushRegionUndo(m_menu_track);
+            if (jackdaw_track_is_instrument(m_menu_track)) {
+                GPtrArray *regs = jackdaw_track_get_midi_regions(m_menu_track);
+                MidiRegion *r = midi_region_list_at(regs, m_menu_frame, FramesPerTick());
+                if (r)
+                    g_ptr_array_remove(regs, r);
+            } else {
+                clip_region_list_remove_at(jackdaw_track_get_regions(m_menu_track), m_menu_frame);
+            }
             ClearSectionSelection();
             CommitTrack(m_menu_track);
         }

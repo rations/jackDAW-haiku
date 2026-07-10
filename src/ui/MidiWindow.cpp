@@ -44,6 +44,26 @@ enum {
     MSG_MW_SNAP = 'mwsn',
 };
 
+// The clip's dominant MIDI channel. New and auditioned notes follow the
+// existing content (e.g. channel 10 for a take recorded from a drum kit) so
+// they reach the same voice on the connected module; 0 for an empty clip.
+// Caller holds the main lock (clip is model state).
+static guint8 ClipDefaultChannel(MidiClip *clip)
+{
+    if (!clip || !clip->notes || clip->notes->len == 0)
+        return 0;
+    guint counts[16] = {0};
+    for (guint i = 0; i < clip->notes->len; i++) {
+        const MidiNote *n = &g_array_index(clip->notes, MidiNote, i);
+        counts[n->channel & 0x0F]++;
+    }
+    guint8 best = 0;
+    for (guint8 c = 1; c < 16; c++)
+        if (counts[c] > counts[best])
+            best = c;
+    return best;
+}
+
 // velocity 1..127 -> blue(low) .. green .. red(high), same ramp as Linux.
 static rgb_color VelColor(int v)
 {
@@ -329,16 +349,17 @@ MidiWindow::MidiWindow(JackDawTrack *track, JackDawProject *project, BWindow *ma
       m_roll(NULL), m_keys(NULL), m_vel(NULL), m_ruler(NULL), m_hscroll(NULL), m_vscroll(NULL),
       m_btn_play(NULL), m_btn_loop(NULL), m_btn_snap(NULL), m_time_label(NULL), m_runner(NULL),
       m_tpx(20.0), m_key_h(kDefaultKeyH), m_h_tick(0.0), m_v_row(48.0), m_fpb(0.0), m_bpb(4),
-      m_drag_mode(0), m_drag_note(-1), m_press_x(0), m_press_y(0), m_orig_start(0), m_orig_len(0),
-      m_orig_pitch(0), m_ctx_note_idx(-1), m_sel_dragging(false), m_sel_moved(false), m_sel_x0(0),
-      m_sel_y0(0), m_sel_x1(0), m_sel_y1(0), m_hl_pitch(-1), m_key_playing(-1), m_play_tick(-1.0),
-      m_prev_play_pos(-1), m_ruler_dragging(false), m_loop_drag_edge(0)
+      m_chan(0), m_drag_mode(0), m_drag_note(-1), m_press_x(0), m_press_y(0), m_orig_start(0),
+      m_orig_len(0), m_orig_pitch(0), m_ctx_note_idx(-1), m_sel_dragging(false), m_sel_moved(false),
+      m_sel_x0(0), m_sel_y0(0), m_sel_x1(0), m_sel_y1(0), m_hl_pitch(-1), m_key_playing(-1),
+      m_play_tick(-1.0), m_prev_play_pos(-1), m_ruler_dragging(false), m_loop_drag_edge(0)
 {
     // Constructed on the main window's looper, which owns the model.
     g_object_ref(m_track);
     m_clip = jackdaw_track_get_midi_clip(m_track);
     m_fpb = jackdaw_project_frames_per_beat(m_project, jackdaw_engine_get_sample_rate());
     m_bpb = m_project->beats_per_bar ? m_project->beats_per_bar : 4;
+    m_chan = ClipDefaultChannel(m_clip);
 
     char title[160];
     snprintf(title, sizeof(title), "Piano Roll: %s", jackdaw_track_get_name(m_track));
@@ -443,6 +464,7 @@ bool MidiWindow::QuitRequested()
         off.AddPointer("track", m_track);
         off.AddInt8("pitch", (int8)m_key_playing);
         off.AddInt8("velocity", 0);
+        off.AddInt8("channel", (int8)m_chan);
         off.AddBool("on", false);
         m_main_msgr.SendMessage(&off);
         m_key_playing = -1;
@@ -973,6 +995,7 @@ void MidiWindow::KeysPlay(int pitch)
         off.AddPointer("track", m_track);
         off.AddInt8("pitch", (int8)m_key_playing);
         off.AddInt8("velocity", 0);
+        off.AddInt8("channel", (int8)m_chan);
         off.AddBool("on", false);
         m_main_msgr.SendMessage(&off);
     }
@@ -982,6 +1005,7 @@ void MidiWindow::KeysPlay(int pitch)
     on.AddPointer("track", m_track);
     on.AddInt8("pitch", (int8)pitch);
     on.AddInt8("velocity", (int8)kDefaultVel);
+    on.AddInt8("channel", (int8)m_chan);
     on.AddBool("on", true);
     m_main_msgr.SendMessage(&on);
     m_keys->Invalidate();
@@ -995,6 +1019,7 @@ void MidiWindow::KeysStop()
         off.AddPointer("track", m_track);
         off.AddInt8("pitch", (int8)m_key_playing);
         off.AddInt8("velocity", 0);
+        off.AddInt8("channel", (int8)m_chan);
         off.AddBool("on", false);
         m_main_msgr.SendMessage(&off);
         m_key_playing = -1;
@@ -1383,7 +1408,8 @@ void MidiWindow::RollMouseDown(BView *v, BPoint where)
         n.length = SnapStep() > 1 ? (guint32)SnapStep() : JACKDAW_PPQ / 4;
         n.pitch = (guint8)YToPitch(where.y);
         n.velocity = kDefaultVel;
-        n.channel = 0;
+        n.channel = ClipDefaultChannel(m_clip); // follow the clip's voice
+        m_chan = n.channel;
         idx = (int)midi_clip_add_note(m_clip, n);
         m_drag_mode = 1;
     } else {
@@ -1611,6 +1637,7 @@ void MidiWindow::Tick()
     LockMain();
     m_fpb = jackdaw_project_frames_per_beat(m_project, jackdaw_engine_get_sample_rate());
     m_bpb = m_project->beats_per_bar ? m_project->beats_per_bar : 4;
+    m_chan = ClipDefaultChannel(m_clip); // recording may have added content
     bool snap_on = m_project->snap_enabled;
     UnlockMain();
     want = snap_on ? B_CONTROL_ON : B_CONTROL_OFF;

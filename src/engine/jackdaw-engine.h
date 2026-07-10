@@ -145,9 +145,12 @@ const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count);
  * Inject a single live note-on (on=TRUE) or note-off (on=FALSE) onto an
  * instrument track's MIDI output, played immediately regardless of transport
  * state. Lock-free: queued to the RT thread via a ringbuffer. Used by the
- * piano-roll keyboard to audition pitches. No-op if the track is not an
- * instrument track registered with the engine. */
-void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch, guint8 velocity, gboolean on);
+ * piano-roll keyboard to audition pitches. `channel` (0-15) selects the MIDI
+ * channel so previews reach the same voice as the clip's notes (e.g. drums on
+ * channel 10). No-op if the track is not an instrument track registered with
+ * the engine. */
+void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch, guint8 velocity, guint8 channel,
+                                 gboolean on);
 
 /* TRUE while a count-in pre-roll is sounding (transport not yet engaged). */
 gboolean jackdaw_engine_is_counting_in(void);

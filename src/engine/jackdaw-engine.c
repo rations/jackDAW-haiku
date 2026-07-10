@@ -2425,7 +2425,8 @@ const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count)
     return nn ? notes : NULL;
 }
 
-void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch, guint8 velocity, gboolean on)
+void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch, guint8 velocity, guint8 channel,
+                                 gboolean on)
 {
     if (!engine.active || !eng_preview_rb || !t)
         return;
@@ -2433,7 +2434,7 @@ void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch, guint8 velocity,
         return;
     EngPrevMsg msg;
     msg.slot = (gint32)t->slot;
-    msg.data[0] = (guint8)((on ? 0x90 : 0x80) | 0);
+    msg.data[0] = (guint8)((on ? 0x90 : 0x80) | (channel & 0x0F));
     msg.data[1] = pitch & 0x7F;
     msg.data[2] = on ? velocity : 0;
     if (jack_ringbuffer_write_space(eng_preview_rb) >= sizeof msg)

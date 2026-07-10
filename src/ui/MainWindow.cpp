@@ -947,12 +947,15 @@ void MainWindow::MessageReceived(BMessage *message)
             // Audition a note from a piano-roll keyboard. Routed here so the
             // engine's preview ring keeps a single producer thread.
             JackDawTrack *t = NULL;
-            int8 pitch = 0, vel = 0;
+            int8 pitch = 0, vel = 0, chan = 0;
             bool on = false;
+            if (message->FindInt8("channel", &chan) != B_OK)
+                chan = 0;
             if (message->FindPointer("track", (void **)&t) == B_OK && t && TrackInProject(t) &&
                 message->FindInt8("pitch", &pitch) == B_OK &&
                 message->FindInt8("velocity", &vel) == B_OK && message->FindBool("on", &on) == B_OK)
-                jackdaw_engine_preview_note(t, (guint8)pitch, (guint8)vel, on ? TRUE : FALSE);
+                jackdaw_engine_preview_note(t, (guint8)pitch, (guint8)vel, (guint8)chan,
+                                            on ? TRUE : FALSE);
             break;
         }
 

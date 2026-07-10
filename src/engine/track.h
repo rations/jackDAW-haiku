@@ -189,6 +189,11 @@ void jackdaw_track_commit_midi(JackDawTrack *t, double frames_per_beat);
  * and republish the snapshot. Used by editor undo/redo restore. */
 void jackdaw_track_set_midi_clip(JackDawTrack *t, MidiClip *clip, double frames_per_beat);
 
+/* Replace the MIDI region list with deep copies from `list` (borrowed) and
+ * republish the snapshot. MIDI counterpart of jackdaw_track_apply_regions(),
+ * used by timeline region-edit undo/redo restore. */
+void jackdaw_track_apply_midi_regions(JackDawTrack *t, GPtrArray *list, double frames_per_beat);
+
 /* State flag helpers — use g_atomic_int_or/and for thread safety */
 void jackdaw_track_set_armed(JackDawTrack *t, gboolean armed);
 void jackdaw_track_set_muted(JackDawTrack *t, gboolean muted);

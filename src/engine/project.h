@@ -126,6 +126,12 @@ void jackdaw_project_redo(JackDawProject *p);
  * Restore re-applies the captured regions and republishes the feeder snapshot. */
 void jackdaw_project_push_region_undo(JackDawProject *p, JackDawTrack *t);
 
+/* Same for an instrument track's MidiRegion list. frames_per_beat (from the
+ * current tempo + sample rate) is captured so restore can republish the RT
+ * MIDI snapshot. */
+void jackdaw_project_push_midi_region_undo(JackDawProject *p, JackDawTrack *t,
+                                           double frames_per_beat);
+
 /* Master volume */
 void jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol);
 gfloat jackdaw_project_get_master_volume(JackDawProject *p);

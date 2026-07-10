@@ -161,8 +161,9 @@ private:
     double m_v_row;  // topmost visible row (0 = pitch 127)
 
     // Cached per-tick project values so Draw() stays consistent between locks.
-    double m_fpb; // frames per beat
-    guint m_bpb;  // beats per bar
+    double m_fpb;  // frames per beat
+    guint m_bpb;   // beats per bar
+    guint8 m_chan; // clip's dominant MIDI channel — new/auditioned notes use it
 
     // Interaction state (mirrors the Linux editor).
     int m_drag_mode; // 0 none, 1 move, 2 resize, 3 velocity, 4 group move

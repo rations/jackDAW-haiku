@@ -46,9 +46,13 @@ public:
     // Push fresh peak values into each strip's VU (called on the UI tick).
     void UpdateMeters();
 
-    // ---- Region editing (audio tracks only in P6) ----
-    // Called from MainWindow message routing (keyboard/menu) and the context
-    // menu. All run on this looper — the single project mutator.
+    // ---- Region editing (audio + instrument tracks) ----
+    // A "section" is a ClipRegion* on an audio track or a MidiRegion* on an
+    // instrument track; selection/move/split/copy machinery is shared across
+    // both via the Sec* dispatch helpers below (same generalization as the
+    // Linux timeline). Gain/group stay audio-only. Called from MainWindow
+    // message routing (keyboard/menu) and the context menu. All run on this
+    // looper — the single project mutator.
     void SplitAtCursor();            // split the active track's region at the play head
     void DeleteSelection();          // delete the selected sections, else the range
     void CopySelection();            // sections, else the range, to the clipboard
@@ -77,10 +81,19 @@ private:
     // ---- Region-edit helpers ----
     JackDawTrack *TrackAtRow(int row) const;
     off_t LaneXToFrame(float x) const; // lane x (incl. header offset) -> snapped frame
-    bool SectionSelContains(ClipRegion *r) const;
+    // Kind-aware section dispatch (audio ClipRegion* / instrument MidiRegion*).
+    double FramesPerTick() const;                      // MIDI tick->frame factor, 0 = unknown
+    GPtrArray *SectionList(JackDawTrack *t) const;     // the track's live section list
+    GPtrArray *SectionListCopy(JackDawTrack *t) const; // deep copy (move-undo memento)
+    off_t SecTlPos(JackDawTrack *t, void *s) const;
+    void SecSetTlPos(JackDawTrack *t, void *s, off_t pos);
+    off_t SecEnd(JackDawTrack *t, void *s) const;
+    void *SecListAt(JackDawTrack *t, off_t frame) const; // section covering frame, or NULL
+    void PushRegionUndo(JackDawTrack *t);                // kind-aware project undo memento
+    bool SectionSelContains(void *s) const;
     void SelectRegionAt(JackDawTrack *t, off_t frame); // select the section covering frame
     off_t SnapMoveDelta(off_t raw_delta) const;        // snap a block-move delta
-    void CommitTrack(JackDawTrack *t);                 // sort + republish feeder snapshot
+    void CommitTrack(JackDawTrack *t);                 // sort + republish RT snapshot
     void ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_where);
     void ClearMovePre(); // free the pristine per-track move-undo copies
     void PushMoveUndo(); // combined multi-track move undo from m_move_pre
@@ -92,11 +105,12 @@ private:
     float m_scroll_y;
     int m_drop_gap; // reorder insertion boundary, or -1 when not dragging
 
-    // ---- Section selection + editing state (audio tracks only) ----
-    // Selected sections are ClipRegion* borrowed from m_sel_track's live list;
-    // any list-mutating edit clears the selection because the pointers go stale.
+    // ---- Section selection + editing state ----
+    // Selected sections are ClipRegion*/MidiRegion* (per m_sel_track's kind)
+    // borrowed from the track's live list; any list-mutating edit clears the
+    // selection because the pointers go stale.
     JackDawTrack *m_sel_track; // owner of the selected sections, or NULL
-    std::vector<ClipRegion *> m_sel_regions;
+    std::vector<void *> m_sel_regions;
 
     // Rubber-band range selection (used by delete/copy/gain when no section sel).
     bool m_selecting;    // extending a rubber band this drag
@@ -114,8 +128,12 @@ private:
     std::vector<off_t> m_move_orig;                   // original tl_pos per selected section
     std::map<JackDawTrack *, GPtrArray *> m_move_pre; // pristine lists (combined undo)
 
-    // Clipboard: normalized ClipRegion* copies (earliest at frame 0).
-    GPtrArray *m_clipboard;
+    // Clipboards: normalized section copies (earliest at frame 0). The audio
+    // and MIDI lists are separate; m_clipboard_midi says which one the last
+    // Copy filled, and Paste only targets a track of that kind.
+    GPtrArray *m_clipboard;      // ClipRegion* copies
+    GPtrArray *m_midi_clipboard; // MidiRegion* copies
+    bool m_clipboard_midi;
 
     // Last right-clicked target (context-menu ops on a bare region / track).
     JackDawTrack *m_menu_track;

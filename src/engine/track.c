@@ -364,6 +364,18 @@ void jackdaw_track_set_midi_clip(JackDawTrack *t, MidiClip *clip, double frames_
     jackdaw_track_commit_midi(t, frames_per_beat);
 }
 
+void jackdaw_track_apply_midi_regions(JackDawTrack *t, GPtrArray *list, double frames_per_beat)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (t->midi_regions->len > 0)
+        g_ptr_array_remove_range(t->midi_regions, 0, t->midi_regions->len);
+    if (list) {
+        for (guint i = 0; i < list->len; i++)
+            g_ptr_array_add(t->midi_regions, midi_region_copy(g_ptr_array_index(list, i)));
+    }
+    jackdaw_track_commit_midi(t, frames_per_beat);
+}
+
 /* ---- State flags ---- */
 
 void jackdaw_track_set_armed(JackDawTrack *t, gboolean armed)

@@ -318,6 +318,55 @@ void jackdaw_project_push_region_undo(JackDawProject *p, JackDawTrack *t)
     undo_manager_push(p->undo, &a);
 }
 
+/* MIDI counterpart: the memento is the MidiRegion list. The tick->frame factor
+ * is captured with the action (the caller derives it from the current tempo and
+ * sample rate) so restore can republish the RT snapshot without this file
+ * depending on the engine. */
+typedef struct {
+    JackDawTrack *t; /* strong ref */
+    double fpb;      /* frames per beat at push time */
+} MidiRegionUndoCtx;
+
+static gpointer midi_region_undo_capture(gpointer ctx)
+{
+    MidiRegionUndoCtx *c = ctx;
+    return midi_region_list_copy(jackdaw_track_get_midi_regions(c->t));
+}
+
+static void midi_region_undo_restore(gpointer ctx, gpointer state)
+{
+    MidiRegionUndoCtx *c = ctx;
+    jackdaw_track_apply_midi_regions(c->t, (GPtrArray *)state, c->fpb);
+}
+
+static void midi_region_undo_ctx_free(gpointer ctx)
+{
+    MidiRegionUndoCtx *c = ctx;
+    g_object_unref(c->t);
+    g_free(c);
+}
+
+void jackdaw_project_push_midi_region_undo(JackDawProject *p, JackDawTrack *t,
+                                           double frames_per_beat)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    MidiRegionUndoCtx *c = g_new0(MidiRegionUndoCtx, 1);
+    c->t = g_object_ref(t);
+    c->fpb = frames_per_beat;
+    JackDawUndoAction a = {
+        .ctx = c,
+        .saved_state = midi_region_list_copy(jackdaw_track_get_midi_regions(t)),
+        .capture_fn = midi_region_undo_capture,
+        .restore_fn = midi_region_undo_restore,
+        .free_fn = region_undo_free_state,
+        .after_fn = NULL,
+        .ctx_free_fn = midi_region_undo_ctx_free,
+        .desc = g_strdup("Region edit"),
+    };
+    undo_manager_push(p->undo, &a);
+}
+
 /* ---- Master volume ---- */
 
 void jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol)
