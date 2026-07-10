@@ -1071,6 +1071,13 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                     off_t a = base + (off_t)k;
                     if (a < 0)
                         continue;
+                    /* The pre-roll sounds exactly `beats` clicks: the click at the
+                     * resolution point (count-in position countin_len) belongs to
+                     * the project's first downbeat, which the hand-off cycle plays
+                     * from play_pos. Suppressing it here avoids a doubled click
+                     * (a flam/pop) at the count-in -> transport transition. */
+                    if (preroll && a >= engine.countin_len)
+                        break;
                     off_t beat = (off_t)((double)a / fpb);
                     off_t boundary = (off_t)((double)beat * fpb + 0.5);
                     off_t off = a - boundary;
