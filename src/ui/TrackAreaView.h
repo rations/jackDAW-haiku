@@ -68,6 +68,8 @@ private:
     int RowAtY(float y) const; // track index under a lane y, or -1
     // Draw every track's clip-region waveforms + region boundaries into the lane.
     void DrawWaveforms(BRect lane);
+    // Live red waveform for tracks currently capturing a take (P7).
+    void DrawRecordOverlay(BRect lane);
 
     // ---- Region-edit helpers ----
     JackDawTrack *TrackAtRow(int row) const;

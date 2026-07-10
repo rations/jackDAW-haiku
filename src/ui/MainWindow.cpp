@@ -69,6 +69,9 @@ static void engine_event_hook(int event, void *user)
         case JACKDAW_ENGINE_EVENT_SHUTDOWN:
             what = MSG_ENGINE_SHUTDOWN;
             break;
+        case JACKDAW_ENGINE_EVENT_TAKE_FINALIZED:
+            what = MSG_ENGINE_TAKE_READY;
+            break;
         default:
             return;
     }
@@ -853,6 +856,13 @@ void MainWindow::MessageReceived(BMessage *message)
             // shutdown alert can hang off MSG_ENGINE_SHUTDOWN later.
             break;
 
+        case MSG_ENGINE_TAKE_READY:
+            // A recorded take is on disk: create its clip and place it on the
+            // timeline (main-thread region-list edits). The lane redraws via the
+            // track's state-changed signal.
+            jackdaw_engine_finalize_takes();
+            break;
+
         default:
             BWindow::MessageReceived(message);
             break;
@@ -869,6 +879,17 @@ bool MainWindow::QuitRequested()
     if (m_mixer_window && m_mixer_window->Lock()) {
         m_mixer_window->Quit(); // deletes the window
         m_mixer_window = NULL;
+    }
+    // The metronome option singletons hide (QuitRequested returns false) so they
+    // survive being reopened; force them closed here or they block app shutdown
+    // the same way the detached mixer would. Quit() tears down without asking.
+    if (m_metro_volume_window && m_metro_volume_window->Lock()) {
+        m_metro_volume_window->Quit();
+        m_metro_volume_window = NULL;
+    }
+    if (m_countin_window && m_countin_window->Lock()) {
+        m_countin_window->Quit();
+        m_countin_window = NULL;
     }
     be_app->PostMessage(B_QUIT_REQUESTED);
     return true;

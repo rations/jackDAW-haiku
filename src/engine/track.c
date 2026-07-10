@@ -30,6 +30,11 @@ static void jackdaw_track_finalize(GObject *obj)
         jack_ringbuffer_free(t->play_buf_L);
     if (t->play_buf_R)
         jack_ringbuffer_free(t->play_buf_R);
+    if (t->rec_buf_L)
+        jack_ringbuffer_free(t->rec_buf_L);
+    if (t->rec_buf_R)
+        jack_ringbuffer_free(t->rec_buf_R);
+    g_free((gpointer)t->rec_peak_buf);
 
     G_OBJECT_CLASS(jackdaw_track_parent_class)->finalize(obj);
 }
@@ -73,6 +78,13 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->clip_start = 0;
     t->play_buf_L = NULL;
     t->play_buf_R = NULL;
+    t->rec_buf_L = NULL;
+    t->rec_buf_R = NULL;
+    t->rec_start_frame = 0;
+    t->rec_latency = 0;
+    t->rec_peak_buf = NULL;
+    t->rec_peak_count = 0;
+    t->rec_peak_block = 0;
     t->played_frames = 0;
 }
 

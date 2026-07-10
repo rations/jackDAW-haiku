@@ -30,7 +30,10 @@ G_BEGIN_DECLS
 typedef enum {
     JACKDAW_ENGINE_EVENT_PORTS_CHANGED = 1,
     JACKDAW_ENGINE_EVENT_CONNECTIONS_CHANGED,
-    JACKDAW_ENGINE_EVENT_SHUTDOWN /* JACK server went away; engine is inactive */
+    JACKDAW_ENGINE_EVENT_SHUTDOWN,      /* JACK server went away; engine is inactive */
+    JACKDAW_ENGINE_EVENT_TAKE_FINALIZED /* a recorded take is on disk and ready to
+                                         * place — call jackdaw_engine_finalize_takes()
+                                         * on the main thread to drain it */
 } JackDawEngineEvent;
 
 typedef void (*JackDawEngineEventHook)(int event, void *user);
@@ -109,6 +112,12 @@ gboolean jackdaw_engine_has_loop_region(void); /* TRUE when loop_end > loop_star
 enum { RECORD_MODE_NORMAL = 0, RECORD_MODE_PUNCH = 1 };
 void jackdaw_engine_set_record_mode(int mode);
 int jackdaw_engine_get_record_mode(void);
+
+/* Drain any finished recorded takes into placed regions. Call on the MAIN
+ * thread in response to JACKDAW_ENGINE_EVENT_TAKE_FINALIZED: it creates the
+ * AudioClips and edits the track region lists (which are main-thread-owned).
+ * No-op when nothing is pending. */
+void jackdaw_engine_finalize_takes(void);
 
 /* TRUE while a count-in pre-roll is sounding (transport not yet engaged). */
 gboolean jackdaw_engine_is_counting_in(void);

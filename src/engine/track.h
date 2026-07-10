@@ -75,6 +75,28 @@ struct _JackDawTrack {
     jack_ringbuffer_t *play_buf_L;
     jack_ringbuffer_t *play_buf_R;
 
+    /* Capture ringbuffers: written by the RT callback while recording, drained
+     * by the recorder thread into a WAV file. Allocated with the play buffers.
+     * A mono track duplicates its one input into both. */
+    jack_ringbuffer_t *rec_buf_L;
+    jack_ringbuffer_t *rec_buf_R;
+
+    /* Recording anchor (timeline frame the take begins at) and the input port's
+     * capture latency in frames, used to align the finalised clip under the
+     * audio the performer actually played against. Set on the main thread when
+     * a capture slot is opened. */
+    off_t rec_start_frame;
+    off_t rec_latency;
+
+    /* Live record waveform: one (min,max) float pair per JACK period, written
+     * by the RT callback while recording and read by the UI overlay. Allocated
+     * on record-arm, freed when the take is finalised. rec_peak_count only ever
+     * grows during a take (racy UI reads are safe); rec_peak_block is the
+     * frames-per-bucket (the JACK buffer size). */
+    volatile gfloat *rec_peak_buf;
+    volatile gint rec_peak_count;
+    gint rec_peak_block;
+
     /* Feeder's playback position in timeline frames (feeder-owned; the RT
      * callback does not read it). */
     volatile off_t played_frames;

@@ -187,10 +187,20 @@ void TimelineView::TickUpdate()
     m_ruler->Invalidate(BRect(x_old - 5, r.top, x_old + 5, r.bottom));
     m_ruler->Invalidate(BRect(x_new - 5, r.top, x_new + 5, r.bottom));
     BRect a = m_track_area->Bounds();
-    m_track_area->Invalidate(
-        BRect(kTimelineHeaderWidth + x_old - 2, a.top, kTimelineHeaderWidth + x_old + 2, a.bottom));
-    m_track_area->Invalidate(
-        BRect(kTimelineHeaderWidth + x_new - 2, a.top, kTimelineHeaderWidth + x_new + 2, a.bottom));
+    // While recording, the live waveform grows in the band the playhead sweeps,
+    // so invalidate the whole span between the old and new position; otherwise
+    // just the two narrow playhead strips.
+    if (jackdaw_engine_is_recording()) {
+        float lo = (x_old < x_new ? x_old : x_new) - 2;
+        float hi = (x_old > x_new ? x_old : x_new) + 2;
+        m_track_area->Invalidate(
+            BRect(kTimelineHeaderWidth + lo, a.top, kTimelineHeaderWidth + hi, a.bottom));
+    } else {
+        m_track_area->Invalidate(BRect(kTimelineHeaderWidth + x_old - 2, a.top,
+                                       kTimelineHeaderWidth + x_old + 2, a.bottom));
+        m_track_area->Invalidate(BRect(kTimelineHeaderWidth + x_new - 2, a.top,
+                                       kTimelineHeaderWidth + x_new + 2, a.bottom));
+    }
 }
 
 void TimelineView::InvalidateAll()

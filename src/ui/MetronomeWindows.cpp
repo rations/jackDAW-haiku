@@ -100,6 +100,11 @@ CountInWindow::CountInWindow(BMessenger target)
         .Add(m_rec)
         .Add(m_play)
         .Add(hint);
+
+    // Route the steppers' outward value messages to this window (a StepperControl
+    // is a BView+BInvoker, not a BControl, so it does not auto-target its window).
+    m_rec->SetTarget(this);
+    m_play->SetTarget(this);
 }
 
 void CountInWindow::SyncCountin(int rec_beats, int play_beats)

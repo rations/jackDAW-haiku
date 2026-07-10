@@ -31,6 +31,9 @@ static const rgb_color kRegionEdge = {230, 220, 120, 255};
 // Selected-section fill tint + rubber-band range wash (over the lane bg).
 static const rgb_color kSelRegionTint = {70, 90, 130, 90};
 static const rgb_color kRangeTint = {90, 110, 150, 70};
+// Live-record waveform overlay (drawn while a take is being captured).
+static const rgb_color kRecWave = {214, 74, 64, 255};
+static const rgb_color kRecMid = {150, 46, 40, 255};
 
 // Pointer travel (px) before an armed press on a selected section becomes a move.
 static const float kMoveThreshold = 3.0f;
@@ -754,6 +757,79 @@ void TrackAreaView::DrawWaveforms(BRect lane)
     }
 }
 
+void TrackAreaView::DrawRecordOverlay(BRect lane)
+{
+    if (!jackdaw_engine_is_recording())
+        return;
+    JackDawProject *p = m_timeline->Project();
+    guint n = jackdaw_project_track_count(p);
+    double spp = m_timeline->Spp();
+    if (spp <= 0.0)
+        return;
+    off_t start = m_timeline->ViewStart();
+    off_t view1 = start + (off_t)((double)lane.Width() * spp) + 1;
+
+    for (guint i = 0; i < n; i++) {
+        float row_top = (float)i * kTimelineTrackHeight - m_scroll_y;
+        float row_bot = row_top + kTimelineTrackHeight - 1.0f;
+        if (row_bot < lane.top || row_top > lane.bottom)
+            continue;
+        JackDawTrack *t = jackdaw_project_get_track(p, i);
+        if (!t || !jackdaw_track_is_armed(t))
+            continue;
+
+        // Snapshot the racy RT-written fields once (count only ever grows).
+        gint count = t->rec_peak_count;
+        gint block = t->rec_peak_block;
+        const gfloat *peaks = (const gfloat *)t->rec_peak_buf;
+        if (!peaks || count <= 0 || block <= 0)
+            continue;
+        off_t rec0 = t->rec_start_frame;
+
+        // Only walk the buckets that fall inside the visible span.
+        gint kfirst = (start > rec0) ? (gint)((start - rec0) / block) : 0;
+        gint klast = (gint)((view1 - rec0) / block) + 1;
+        if (kfirst < 0)
+            kfirst = 0;
+        if (klast > count)
+            klast = count;
+
+        float band_y0 = row_top + 3.0f;
+        float band_h = kTimelineTrackHeight - 6.0f;
+        float mid_y = band_y0 + band_h / 2.0f;
+        float half = (band_h / 2.0f) * 3.0f;
+
+        SetHighColor(kRecMid);
+        StrokeLine(BPoint(lane.left, mid_y), BPoint(lane.right, mid_y));
+
+        SetHighColor(kRecWave);
+        for (gint k = kfirst; k < klast; k++) {
+            off_t f0 = rec0 + (off_t)k * block;
+            float x0 = lane.left + m_timeline->FrameToX(f0);
+            float x1 = lane.left + m_timeline->FrameToX(f0 + block);
+            if (x1 < lane.left || x0 > lane.right)
+                continue;
+            if (x0 < lane.left)
+                x0 = lane.left;
+            if (x1 > lane.right)
+                x1 = lane.right;
+            if (x1 < x0 + 1.0f)
+                x1 = x0 + 1.0f;
+            float mn = peaks[k * 2];
+            float mx = peaks[k * 2 + 1];
+            float y_top = mid_y - mx * half;
+            float y_bot = mid_y - mn * half;
+            if (y_top < band_y0)
+                y_top = band_y0;
+            if (y_bot > band_y0 + band_h)
+                y_bot = band_y0 + band_h;
+            if (y_bot < y_top + 1.0f)
+                y_bot = y_top + 1.0f;
+            FillRect(BRect(x0, y_top, x1, y_bot));
+        }
+    }
+}
+
 void TrackAreaView::Draw(BRect updateRect)
 {
     (void)updateRect;
@@ -840,6 +916,9 @@ void TrackAreaView::Draw(BRect updateRect)
 
     // Clip-region waveforms (drawn over the grid, under the playhead).
     DrawWaveforms(lane);
+
+    // Live red waveform for any take currently being captured (over the clips).
+    DrawRecordOverlay(lane);
 
     // Playhead line.
     float x = lane.left + m_timeline->FrameToX(jackdaw_engine_get_play_pos());
