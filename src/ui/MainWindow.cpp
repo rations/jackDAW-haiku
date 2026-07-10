@@ -23,6 +23,7 @@
 
 #include "engine/jackdaw-engine.h"
 #include "engine/settings.h"
+#include "host/pluginhost.h"
 #include "Messages.h"
 #include "MetronomeWindows.h"
 #include "MidiWindow.h"
@@ -384,7 +385,7 @@ BMenuBar *MainWindow::BuildMenuBar()
     // Options — I/O routing, plugins (excluded on Haiku), MIDI control surface.
     BMenu *options = new BMenu("Options");
     AddItem(options, "Inputs/Outputs…", MSG_OPT_IO, 0, 0, false);
-    AddItem(options, "Plugins…", MSG_OPT_PLUGINS, 0, 0, false);
+    AddItem(options, "Rescan Plugins", MSG_OPT_PLUGINS);
     AddItem(options, "MIDI Control…", MSG_OPT_MIDI_CONTROL, 0, 0, false);
     bar->AddItem(options);
 
@@ -831,6 +832,18 @@ void MainWindow::MessageReceived(BMessage *message)
             int32 beats = 0;
             message->FindInt32("beats", &beats);
             jackdaw_project_set_countin_before_play(m_project, (guint)(beats < 0 ? 0 : beats));
+            break;
+        }
+
+        case MSG_OPT_PLUGINS: {
+            // Drop the catalog; the next FX-window "Add effect" menu rebuild
+            // rescans the VST3 add-on directories out-of-process.
+            pluginhost_rescan();
+            guint n = g_list_length((GList *)pluginhost_catalog());
+            char text[96];
+            snprintf(text, sizeof(text), "Plugin rescan complete: %u effects found.", n);
+            BAlert *alert = new BAlert("plugins", text, "OK");
+            alert->Go(NULL); // async; the alert deletes itself
             break;
         }
 

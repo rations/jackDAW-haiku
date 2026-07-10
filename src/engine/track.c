@@ -1,5 +1,6 @@
 #include <string.h>
 #include "track.h"
+#include "host/pluginhost.h"
 #include "jackdaw-engine.h"
 #include "message.h"
 
@@ -50,6 +51,34 @@ static void jackdaw_track_finalize(GObject *obj)
         g_ptr_array_unref(t->midi_regions);
     if (t->midi_clip)
         midi_clip_free(t->midi_clip);
+
+    /* FX: the engine slot was cleared before the track died, so the RT thread
+     * no longer reads rt_chain — free the live chain, everything retired, and
+     * the instances themselves. */
+    JackDawFxChain *live = t->rt_chain;
+    t->rt_chain = NULL;
+    if (live) {
+        g_free(live->fx);
+        g_free(live);
+    }
+    if (t->retire_chains) {
+        for (guint i = 0; i < t->retire_chains->len; i++) {
+            JackDawFxChain *c = g_ptr_array_index(t->retire_chains, i);
+            g_free(c->fx);
+            g_free(c);
+        }
+        g_ptr_array_free(t->retire_chains, TRUE);
+    }
+    if (t->retire_fx) {
+        for (guint i = 0; i < t->retire_fx->len; i++)
+            pluginhost_free(g_ptr_array_index(t->retire_fx, i));
+        g_ptr_array_free(t->retire_fx, TRUE);
+    }
+    if (t->fx_list) {
+        for (guint i = 0; i < t->fx_list->len; i++)
+            pluginhost_free(g_ptr_array_index(t->fx_list, i));
+        g_ptr_array_free(t->fx_list, TRUE);
+    }
 
     G_OBJECT_CLASS(jackdaw_track_parent_class)->finalize(obj);
 }
@@ -110,6 +139,11 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->rec_peak_count = 0;
     t->rec_peak_block = 0;
     t->played_frames = 0;
+
+    t->fx_list = g_ptr_array_new();
+    t->rt_chain = NULL;
+    t->retire_chains = g_ptr_array_new();
+    t->retire_fx = g_ptr_array_new();
 }
 
 /* ---- Constructor ---- */
@@ -518,4 +552,80 @@ void jackdaw_track_get_peaks(JackDawTrack *t, gfloat *out_L, gfloat *out_R)
         *out_L = t->peak_L;
     if (out_R)
         *out_R = t->peak_R;
+}
+
+/* ---- FX chain ---- */
+
+/* Reclaim chains/instances retired by the PREVIOUS edit (the RT thread has
+ * had many cycles to move past them by now), then publish a fresh chain built
+ * from fx_list and retire the old one. */
+static void track_publish_chain(JackDawTrack *t)
+{
+    for (guint i = 0; i < t->retire_chains->len; i++) {
+        JackDawFxChain *c = g_ptr_array_index(t->retire_chains, i);
+        g_free(c->fx);
+        g_free(c);
+    }
+    g_ptr_array_set_size(t->retire_chains, 0);
+    for (guint i = 0; i < t->retire_fx->len; i++)
+        pluginhost_free(g_ptr_array_index(t->retire_fx, i));
+    g_ptr_array_set_size(t->retire_fx, 0);
+
+    JackDawFxChain *nc = g_new0(JackDawFxChain, 1);
+    nc->n = (int)t->fx_list->len;
+    if (nc->n > 0) {
+        nc->fx = g_new0(gpointer, nc->n);
+        for (int i = 0; i < nc->n; i++)
+            nc->fx[i] = g_ptr_array_index(t->fx_list, i);
+    }
+
+    JackDawFxChain *old = t->rt_chain;
+    g_atomic_pointer_set(&t->rt_chain, nc);
+    if (old)
+        g_ptr_array_add(t->retire_chains, old);
+}
+
+void jackdaw_track_fx_add(JackDawTrack *t, gpointer instance)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (!instance)
+        return;
+    g_ptr_array_add(t->fx_list, instance);
+    track_publish_chain(t);
+}
+
+void jackdaw_track_fx_remove(JackDawTrack *t, guint index)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (index >= t->fx_list->len)
+        return;
+    gpointer inst = g_ptr_array_index(t->fx_list, index);
+    g_ptr_array_remove_index(t->fx_list, index);
+    track_publish_chain(t);
+    /* Defer the instance free until the next edit so the retired chain that
+     * still references it is no longer read by the RT thread. */
+    g_ptr_array_add(t->retire_fx, inst);
+}
+
+void jackdaw_track_fx_move(JackDawTrack *t, guint from, guint to)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (from >= t->fx_list->len || to >= t->fx_list->len || from == to)
+        return;
+    gpointer inst = g_ptr_array_index(t->fx_list, from);
+    g_ptr_array_remove_index(t->fx_list, from);
+    g_ptr_array_insert(t->fx_list, (gint)to, inst);
+    track_publish_chain(t);
+}
+
+guint jackdaw_track_fx_count(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), 0);
+    return t->fx_list->len;
+}
+
+gpointer jackdaw_track_fx_get(JackDawTrack *t, guint index)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), NULL);
+    return index < t->fx_list->len ? g_ptr_array_index(t->fx_list, index) : NULL;
 }

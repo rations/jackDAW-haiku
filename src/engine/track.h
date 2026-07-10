@@ -12,7 +12,8 @@ G_BEGIN_DECLS
 
 /* Track kind: an audio track streams AudioClip regions; an instrument track
  * sequences MidiRegions into its first FX-chain plugin (the instrument).
- * Audio clip regions are present; MIDI/FX members return in later phases. */
+ * Audio clip regions, MIDI and the FX chain are present; routing MIDI into an
+ * instrument plugin is a later phase. */
 typedef enum { JACKDAW_TRACK_AUDIO = 0, JACKDAW_TRACK_INSTRUMENT } JackDawTrackKind;
 
 #define JACKDAW_TYPE_TRACK (jackdaw_track_get_type())
@@ -119,7 +120,24 @@ struct _JackDawTrack {
     /* Feeder's playback position in timeline frames (feeder-owned; the RT
      * callback does not read it). */
     volatile off_t played_frames;
+
+    /* FX: main-thread list of PluginInstance* (effects on this track). */
+    GPtrArray *fx_list;
+
+    /* Immutable FX chain snapshot read by the RT callback (JackDawFxChain*),
+     * published with g_atomic_pointer_set. Old chains/instances are reclaimed
+     * on the NEXT edit (deferred so the RT thread is never left dangling). */
+    gpointer rt_chain;
+    GPtrArray *retire_chains; /* JackDawFxChain* awaiting free */
+    GPtrArray *retire_fx;     /* PluginInstance* awaiting free */
 };
+
+/* Immutable FX chain snapshot. fx[i] is a PluginInstance* (opaque here, so
+ * track.h consumers don't pull in the plugin host headers). */
+typedef struct {
+    int n;
+    gpointer *fx;
+} JackDawFxChain;
 
 struct _JackDawTrackClass {
     GObjectClass parent_class;
@@ -226,6 +244,18 @@ gboolean jackdaw_track_is_stereo(JackDawTrack *t);
 
 /* Peak meter read (call from main thread) */
 void jackdaw_track_get_peaks(JackDawTrack *t, gfloat *out_L, gfloat *out_R);
+
+/* ---- FX chain (main thread) ----
+ * Instances are PluginInstance* (from pluginhost.h); kept as gpointer here to
+ * avoid pulling plugin-host headers into every track.h consumer. fx_add takes
+ * ownership; fx_remove defers the pluginhost_free until the RT thread has
+ * moved past the retired chain snapshot. Every edit atomically republishes
+ * the immutable rt_chain the RT callback reads. */
+void jackdaw_track_fx_add(JackDawTrack *t, gpointer instance);
+void jackdaw_track_fx_remove(JackDawTrack *t, guint index);
+void jackdaw_track_fx_move(JackDawTrack *t, guint from, guint to);
+guint jackdaw_track_fx_count(JackDawTrack *t);
+gpointer jackdaw_track_fx_get(JackDawTrack *t, guint index);
 
 G_END_DECLS
 

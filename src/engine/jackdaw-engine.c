@@ -15,6 +15,7 @@
 #include "rt_denormal.h" /* FTZ/DAZ for the RT thread */
 
 #include "jackdaw-engine.h"
+#include "host/pluginhost.h"
 #include "settings.h"
 #include "message.h"
 
@@ -997,6 +998,9 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * suspenders). */
     engine_rt_set_denormal_mode();
 
+    /* Mark this thread RT for the plugin host's allocation diagnostics. */
+    ph_rt_mark(1);
+
     /* Clear master mix buffers */
     memset(engine.master_L, 0, nframes * sizeof(float));
     memset(engine.master_R, 0, nframes * sizeof(float));
@@ -1235,6 +1239,16 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             }
         }
 
+        /* Per-track FX chain, in place on bL/bR (pre-fader, like the Linux
+         * engine). The snapshot pointer is published atomically by the main
+         * thread; instances it references are retired, never freed, while any
+         * chain that names them can still be read here. */
+        JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
+        if (chain) {
+            for (int fi = 0; fi < chain->n; fi++)
+                pluginhost_process((PluginInstance *)chain->fx[fi], bL, bR, (int)nframes);
+        }
+
         /* Constant-power pan + effective fader; meter post-fader with a decay
          * hold so the strip/mixer VU falls back smoothly between peaks. */
         gfloat vol = muted ? 0.0f : t->volume;
@@ -1380,6 +1394,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             g_diag_cb_max_us = d;
     }
 
+    ph_rt_mark(0);
     return 0;
 }
 

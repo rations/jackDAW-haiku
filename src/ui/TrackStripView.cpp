@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "engine/jackdaw-engine.h"
+#include "FxWindow.h"
 #include "KnobView.h"
 #include "Messages.h"
 #include "TimelineView.h"  // kTimelineTrackHeight (row geometry for the reorder drag)
@@ -39,6 +40,7 @@ enum {
     MSG_S_VOL = 'svol',
     MSG_S_PAN = 'span',
     MSG_S_INPUT = 'sinp',
+    MSG_S_FX = 'sfx ',
 };
 
 // Short JACK port name (drop the "client:" prefix) for menu labels.
@@ -64,13 +66,12 @@ TrackStripView::TrackStripView(JackDawProject *project, JackDawTrack *track, con
     m_mute = new BButton("M", "M", new BMessage(MSG_S_MUTE));
     m_solo = new BButton("S", "S", new BMessage(MSG_S_SOLO));
     m_stereo = new BButton("Mo", "Mo", new BMessage(MSG_S_STEREO));
-    m_fx = new BButton("Fx", "Fx", new BMessage('sfx '));
+    m_fx = new BButton("Fx", "Fx", new BMessage(MSG_S_FX));
     m_arm->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_mute->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_solo->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_stereo->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
-    m_fx->SetEnabled(false); // plugin hosting not yet available on Haiku
-    m_fx->SetToolTip("Plugin hosting not yet available on Haiku");
+    m_fx->SetToolTip("Effects (VST3 chain)");
     for (BButton *b : {m_arm, m_mute, m_solo, m_stereo, m_fx}) {
         b->SetExplicitMinSize(BSize(24.0f, 20.0f));
         b->SetExplicitMaxSize(BSize(30.0f, 20.0f));
@@ -130,6 +131,7 @@ void TrackStripView::AttachedToWindow()
     m_mute->SetTarget(this);
     m_solo->SetTarget(this);
     m_stereo->SetTarget(this);
+    m_fx->SetTarget(this);
     m_vol->SetTarget(this);
     m_pan->SetTarget(this);
 
@@ -382,6 +384,18 @@ void TrackStripView::MessageReceived(BMessage *message)
             float pan = 0.0f;
             message->FindFloat("value", &pan);
             jackdaw_track_set_pan(m_track, (gfloat)pan);
+            break;
+        }
+        case MSG_S_FX: {
+            // One FX window per track: raise it if it is still open (the
+            // messenger goes invalid when the window quits), else create it.
+            if (m_fx_window.IsValid()) {
+                m_fx_window.SendMessage('fxrs');
+            } else {
+                FxWindow *win = new FxWindow(m_track);
+                m_fx_window = BMessenger(win);
+                win->Show();
+            }
             break;
         }
         case MSG_S_INPUT: {

@@ -14,11 +14,11 @@ class KnobView;
 class VuView;
 
 // One track's header strip (the 235 px column left of its timeline lane): name
-// entry; Arm/Mute/Solo/Mono-Stereo/Fx buttons (Fx disabled — no plugins on
-// Haiku yet); trim (V) and pan (P) knobs; a JACK capture-port input selector;
-// and a stereo VU. It lives on the MainWindow looper, so it calls the track /
-// engine API directly; structural actions (select, delete, context menu) go to
-// MainWindow. SyncFromTrack() re-reads engine state after external changes.
+// entry; Arm/Mute/Solo/Mono-Stereo/Fx buttons (Fx opens the track's VST3 FX
+// chain window); trim (V) and pan (P) knobs; a JACK capture-port input
+// selector; and a stereo VU. It lives on the MainWindow looper, so it calls
+// the track / engine API directly; structural actions (select, delete,
+// context menu) go to MainWindow. SyncFromTrack() re-reads engine state.
 class TrackStripView : public BView
 {
 public:
@@ -53,7 +53,7 @@ private:
     BButton *m_mute;
     BButton *m_solo;
     BButton *m_stereo; // Mo <-> St
-    BButton *m_fx;     // disabled/greyed
+    BButton *m_fx;     // opens this track's FxWindow
     KnobView *m_vol;   // trim (V)
     KnobView *m_pan;   // pan (P)
     BMenuField *m_input_field;
@@ -62,6 +62,9 @@ private:
 
     gulong m_state_handler;   // track "state-changed" -> SyncFromTrack
     gulong m_routing_handler; // track "routing-changed" -> SyncFromTrack
+
+    // This track's FX chain window; invalid once the user closes it.
+    BMessenger m_fx_window;
 
     // Drag-to-reorder gesture state (a Haiku-port addition; the Linux UI has no
     // track-reorder drag). A left-press primes a drag; once the pointer moves

@@ -1,0 +1,69 @@
+#ifndef FX_WINDOW_H
+#define FX_WINDOW_H
+
+#include <Window.h>
+
+#include <vector>
+
+#include "engine/track.h"
+
+class BButton;
+class BCheckBox;
+class BFilePanel;
+class BGroupView;
+class BListView;
+class BMenuField;
+class BPopUpMenu;
+class BSlider;
+class BStringView;
+
+typedef struct PluginInstance PluginInstance;
+
+/* Per-track FX chain editor: add/remove/reorder plugins, a generic parameter
+ * panel (one BSlider per VST3 parameter, values shown with the plug-in's own
+ * display strings), bypass + wet/dry mix, and — for plug-ins implementing the
+ * INamFileLoader host extension (NAMku) — "Load model…"/"Load IR…" buttons
+ * backed by a BFilePanel.
+ *
+ * Threading: this window's looper thread is the ONLY mutator of its track's
+ * FX chain and the only caller into each instance's non-RT plugin-host API
+ * (instances are created and freed here too, satisfying the pluginhost.h
+ * same-thread contract). The window holds a GObject ref on the track so the
+ * chain outlives track removal while the window is open. */
+class FxWindow : public BWindow
+{
+public:
+    FxWindow(JackDawTrack *track);
+    virtual ~FxWindow();
+
+    virtual void MessageReceived(BMessage *message);
+
+private:
+    void BuildAddMenu();
+    void RebuildChainList(int select);
+    void RebuildParamPanel();
+    void SyncControlsRow();
+    void UpdateValueLabel(guint param);
+    void UpdateFileLabels();
+    PluginInstance *Selected();
+
+    JackDawTrack *m_track;
+
+    BMenuField *m_add_field;
+    BPopUpMenu *m_add_menu;
+    BListView *m_chain_list;
+    BButton *m_remove;
+    BButton *m_up;
+    BButton *m_down;
+    BCheckBox *m_bypass;
+    BSlider *m_mix;
+    BGroupView *m_param_group;
+    BFilePanel *m_file_panel;
+
+    std::vector<BSlider *> m_sliders;
+    std::vector<BStringView *> m_value_labels;
+    BStringView *m_model_label;
+    BStringView *m_ir_label;
+};
+
+#endif // FX_WINDOW_H
