@@ -1110,11 +1110,12 @@ void TrackAreaView::MouseDown(BPoint where)
         return;
     }
 
-    int32 buttons = 0, mods = 0;
+    int32 buttons = 0, mods = 0, clicks = 1;
     BMessage *msg = Window() ? Window()->CurrentMessage() : NULL;
     if (msg) {
         msg->FindInt32("buttons", &buttons);
         msg->FindInt32("modifiers", &mods);
+        msg->FindInt32("clicks", &clicks);
     }
     bool ctrl = (mods & (B_COMMAND_KEY | B_CONTROL_KEY)) != 0;
     bool secondary = (buttons & B_SECONDARY_MOUSE_BUTTON) != 0;
@@ -1122,6 +1123,14 @@ void TrackAreaView::MouseDown(BPoint where)
     int row = RowAtY(where.y);
     JackDawTrack *t = TrackAtRow(row);
     off_t frame = LaneXToFrame(where.x);
+
+    // Double-click on an instrument lane opens the track's piano-roll editor.
+    if (!secondary && clicks == 2 && t && jackdaw_track_is_instrument(t)) {
+        BMessage open(MSG_MIDI_OPEN_EDITOR);
+        open.AddPointer("track", t);
+        Window()->PostMessage(&open);
+        return;
+    }
     ClipRegion *r = (t && !jackdaw_track_is_instrument(t))
                         ? clip_region_list_at(jackdaw_track_get_regions(t), frame)
                         : NULL;
@@ -1336,6 +1345,12 @@ void TrackAreaView::ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_
     bool audio_here = t && !jackdaw_track_is_instrument(t);
 
     BPopUpMenu menu("region_context", false, false);
+    BMenuItem *mi_piano = NULL;
+    if (t && jackdaw_track_is_instrument(t)) {
+        mi_piano = new BMenuItem("Open Piano Roll", NULL);
+        menu.AddItem(mi_piano);
+        menu.AddSeparatorItem();
+    }
     BMenuItem *mi_split = new BMenuItem("Split at Playhead", NULL);
     mi_split->SetEnabled(audio_here);
     menu.AddItem(mi_split);
@@ -1371,6 +1386,12 @@ void TrackAreaView::ShowContextMenu(JackDawTrack *t, off_t frame, BPoint screen_
     BMenuItem *chosen = menu.Go(screen_where, false, true);
     if (!chosen)
         return;
+    if (mi_piano && chosen == mi_piano) {
+        BMessage open(MSG_MIDI_OPEN_EDITOR);
+        open.AddPointer("track", t);
+        Window()->PostMessage(&open);
+        return;
+    }
     if (chosen == mi_split)
         SplitAtCursor();
     else if (chosen == mi_del)

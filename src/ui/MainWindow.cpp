@@ -25,6 +25,7 @@
 #include "engine/settings.h"
 #include "Messages.h"
 #include "MetronomeWindows.h"
+#include "MidiWindow.h"
 #include "MixerView.h"
 #include "MixerWindow.h"
 #include "TimelineView.h"
@@ -477,9 +478,48 @@ void MainWindow::DeleteTrack(JackDawTrack *track)
 {
     if (!track)
         return;
+    // Close the track's piano-roll editor (async — the editor holds its own
+    // GObject ref on the track, so it stays valid until the window dies).
+    MidiWindow *mw = (MidiWindow *)g_object_get_data(G_OBJECT(track), "midi-window");
+    if (mw)
+        mw->PostMessage(B_QUIT_REQUESTED);
     // Clear the RT slot before dropping the last GObject ref.
     jackdaw_engine_remove_track(track);
     jackdaw_project_remove_track(m_project, track);
+}
+
+bool MainWindow::TrackInProject(JackDawTrack *track) const
+{
+    guint n = jackdaw_project_track_count(m_project);
+    for (guint i = 0; i < n; i++)
+        if (jackdaw_project_get_track(m_project, i) == track)
+            return true;
+    return false;
+}
+
+void MainWindow::OpenMidiEditor(JackDawTrack *track)
+{
+    if (!track || !jackdaw_track_is_instrument(track))
+        return;
+    MidiWindow *w = (MidiWindow *)g_object_get_data(G_OBJECT(track), "midi-window");
+    if (w) {
+        w->PostMessage(MSG_MIDI_EDITOR_PRESENT);
+        return;
+    }
+    w = new MidiWindow(track, m_project, this);
+    g_object_set_data(G_OBJECT(track), "midi-window", w);
+    m_midi_editors.push_back(w);
+    w->Show();
+}
+
+void MainWindow::UnregisterMidiEditor(MidiWindow *w)
+{
+    for (size_t i = 0; i < m_midi_editors.size(); i++) {
+        if (m_midi_editors[i] == w) {
+            m_midi_editors.erase(m_midi_editors.begin() + i);
+            return;
+        }
+    }
 }
 
 void MainWindow::LoadFileAsTrack(const char *path)
@@ -872,6 +912,50 @@ void MainWindow::MessageReceived(BMessage *message)
             jackdaw_engine_finalize_midi_takes();
             break;
 
+        case MSG_MIDI_OPEN_EDITOR: {
+            JackDawTrack *t = NULL;
+            if (message->FindPointer("track", (void **)&t) == B_OK && t && TrackInProject(t))
+                OpenMidiEditor(t);
+            break;
+        }
+
+        case MSG_MIDI_LOCATE: {
+            // Seek requested from a piano-roll ruler (engine mutation runs here,
+            // the single-mutator looper).
+            int64 frame = 0;
+            if (message->FindInt64("frame", &frame) == B_OK) {
+                jackdaw_engine_locate((off_t)(frame < 0 ? 0 : frame));
+                m_timeline->InvalidateAll();
+            }
+            break;
+        }
+
+        case MSG_MIDI_SET_LOOP: {
+            int64 start = 0, end = 0;
+            if (message->FindInt64("start", &start) == B_OK &&
+                message->FindInt64("end", &end) == B_OK) {
+                jackdaw_engine_set_loop_range((off_t)start, (off_t)end);
+                bool disable = false;
+                if (message->FindBool("disable", &disable) == B_OK && disable)
+                    jackdaw_engine_set_loop_enabled(FALSE);
+                m_timeline->InvalidateAll();
+            }
+            break;
+        }
+
+        case MSG_MIDI_PREVIEW: {
+            // Audition a note from a piano-roll keyboard. Routed here so the
+            // engine's preview ring keeps a single producer thread.
+            JackDawTrack *t = NULL;
+            int8 pitch = 0, vel = 0;
+            bool on = false;
+            if (message->FindPointer("track", (void **)&t) == B_OK && t && TrackInProject(t) &&
+                message->FindInt8("pitch", &pitch) == B_OK &&
+                message->FindInt8("velocity", &vel) == B_OK && message->FindBool("on", &on) == B_OK)
+                jackdaw_engine_preview_note(t, (guint8)pitch, (guint8)vel, on ? TRUE : FALSE);
+            break;
+        }
+
         default:
             BWindow::MessageReceived(message);
             break;
@@ -883,6 +967,20 @@ bool MainWindow::QuitRequested()
     // Stop engine events reaching a window that is about to die. The engine
     // itself is torn down by main() after the app loop exits.
     jackdaw_engine_set_event_hook(NULL, NULL);
+
+    // Piano-roll editors lock THIS window's looper for model access, so they
+    // must be gone before this window dies — but locking them from here could
+    // deadlock against an editor waiting for our lock. Instead: ask each to
+    // quit (async), then drop our lock while waiting for their destructors
+    // (which unregister here under our lock) to drain the registry.
+    for (size_t i = 0; i < m_midi_editors.size(); i++)
+        m_midi_editors[i]->PostMessage(B_QUIT_REQUESTED);
+    for (int spin = 0; !m_midi_editors.empty() && spin < 2000; spin++) {
+        Unlock();
+        snooze(1000);
+        Lock();
+    }
+
     // Force the detached mixer window closed first (its QuitRequested normally
     // re-docks rather than quits, which would otherwise block app shutdown).
     if (m_mixer_window && m_mixer_window->Lock()) {

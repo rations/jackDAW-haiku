@@ -2,6 +2,8 @@
 
 #include <Window.h>
 
+#include <vector>
+
 #include "engine/project.h"
 
 class BFilePanel;
@@ -11,6 +13,7 @@ class BMessageRunner;
 class BPoint;
 class CountInWindow;
 class MetroVolumeWindow;
+class MidiWindow;
 class MixerView;
 class MixerWindow;
 class TimelineView;
@@ -28,6 +31,12 @@ public:
     // Rebuild both mixers' channel strips (called from GObject track-list
     // signal trampolines, which run on this looper).
     void RebuildMixers();
+
+    // Piano-roll editor registry. Editors acquire this window's looper lock
+    // for model access, so this window must never lock them — communication
+    // back is async PostMessage only. Unregister runs on the editor's thread
+    // (its destructor) while holding this window's lock.
+    void UnregisterMidiEditor(MidiWindow *w);
 
 private:
     BMenuBar *BuildMenuBar();
@@ -56,6 +65,10 @@ private:
     void OpenMetroVolumeWindow();
     void OpenCountInWindow();
 
+    // Piano-roll MIDI editor (per-instrument-track window; presents if open).
+    void OpenMidiEditor(JackDawTrack *track);
+    bool TrackInProject(JackDawTrack *track) const;
+
     // Mixer (docked pane + optional detached window).
     void ApplyMixerState();               // show/hide dock vs. window
     void SyncMixers();                    // per-tick control/meter refresh
@@ -76,6 +89,9 @@ private:
     bool m_mixer_visible;        // user toggled the mixer on
 
     BFilePanel *m_load_panel; // "Load File as New Track" open panel (lazy)
+
+    // Open piano-roll editors (guarded by this window's looper lock).
+    std::vector<MidiWindow *> m_midi_editors;
 
     gulong m_track_added_h;
     gulong m_track_removed_h;

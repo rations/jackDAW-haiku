@@ -160,6 +160,12 @@ static gpointer diag_thread_func(gpointer arg)
         g_diag_cb_max_us = 0;
         g_message("[diag] xruns +%d (total %d)  cb_last=%ldus cb_max=%ldus period=%ldus", dx, x,
                   (long)g_diag_cb_last_us, (long)cb_max, (long)g_diag_period_us);
+        /* MIDI path: raw events seen on instrument midi_in ports, events written
+         * to the record ring, and the gate state bitmask
+         * (1=armed 2=recording 4=playing 8=rec-ring-allocated; -1 = no
+         * instrument track with a registered midi_in reached the RT pass). */
+        g_message("[diag] midi_in=%d midi_rec=%d instr_state=%d", g_atomic_int_get(&g_diag_midi_in),
+                  g_atomic_int_get(&g_diag_midi_rec), g_atomic_int_get(&g_diag_instr_state));
     }
     return NULL;
 }
@@ -913,6 +919,12 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
             jack_midi_event_t ev;
             if (jack_midi_event_get(&ev, mbuf, m) != 0 || ev.size < 1)
                 continue;
+            /* Don't thru system realtime (0xF8..0xFF): with a single MIDI device
+             * the default wiring loops midi_out back to the source device, and
+             * echoing its own clock/active-sensing back at it can confuse its
+             * tempo sync. Voice messages (the notes) pass through. */
+            if (ev.buffer[0] >= 0xF8)
+                continue;
             mev[nev].time = ev.time;
             mev[nev].size = (guint8)(ev.size > 3 ? 3 : ev.size);
             mev[nev].data[0] = ev.buffer[0];
@@ -1179,8 +1191,23 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             }
         }
 
+        /* MIDI-path diagnostics (JACKDAW_DIAG): count raw events on this
+         * instrument track's midi_in BEFORE any arm/record gate, and expose the
+         * gate state, so a dead port read can be told apart from a wrong gate. */
+        if (g_diag_on && jackdaw_track_is_instrument(t) && t->midi_in_idx >= 0 &&
+            t->midi_in_idx < JACKDAW_MAX_TRACKS && engine.midi_in[t->midi_in_idx]) {
+            void *dbuf = jack_port_get_buffer(engine.midi_in[t->midi_in_idx], nframes);
+            g_diag_midi_in += (gint)jack_midi_get_event_count(dbuf);
+            g_diag_instr_state = ((tflags & TRACK_ARMED) ? 1 : 0) |
+                                 ((flags & ENGINE_RECORDING) ? 2 : 0) |
+                                 ((flags & ENGINE_PLAYING) ? 4 : 0) | (t->midi_rec_buf ? 8 : 0);
+        }
+
         /* MIDI record: capture an armed instrument track's live input events with
-         * absolute timeline frames. Status bytes only (skip realtime/clock). The
+         * absolute timeline frames. Voice/common messages only — system realtime
+         * (0xF8..0xFF: clock, active sensing) is dropped, because devices like
+         * drum modules stream clock continuously (~50 events/s), which would fill
+         * the fixed capture ring mid-take and drop the performance itself. The
          * ring is drained into notes on the main thread when recording stops. */
         if (jackdaw_track_is_instrument(t) && (tflags & TRACK_ARMED) &&
             (flags & ENGINE_RECORDING) && t->midi_in_idx >= 0 &&
@@ -1192,7 +1219,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                 jack_midi_event_t ev;
                 if (jack_midi_event_get(&ev, mbuf, m) != 0 || ev.size < 1)
                     continue;
-                if (!(ev.buffer[0] & 0x80))
+                if (!(ev.buffer[0] & 0x80) || ev.buffer[0] >= 0xF8)
                     continue;
                 MidiRecEvent r;
                 r.frame = (gint64)(blk_start + (off_t)ev.time);
@@ -1200,8 +1227,11 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                 r.data[0] = ev.buffer[0];
                 r.data[1] = ev.size > 1 ? ev.buffer[1] : 0;
                 r.data[2] = ev.size > 2 ? ev.buffer[2] : 0;
-                if (jack_ringbuffer_write_space(t->midi_rec_buf) >= sizeof r)
+                if (jack_ringbuffer_write_space(t->midi_rec_buf) >= sizeof r) {
                     jack_ringbuffer_write(t->midi_rec_buf, (const char *)&r, sizeof r);
+                    if (g_diag_on)
+                        g_diag_midi_rec++;
+                }
             }
         }
 

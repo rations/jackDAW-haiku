@@ -108,4 +108,14 @@ enum {
     MSG_ENGINE_SHUTDOWN = 'edwn',
     MSG_ENGINE_TAKE_READY = 'etak',
     MSG_ENGINE_MIDI_TAKE_READY = 'emtk',
+
+    // Piano-roll MIDI editor <-> main window. The editor runs its own looper,
+    // so engine/transport mutation is routed here as messages; the main window
+    // only ever posts back asynchronously (never locks an editor window).
+    MSG_MIDI_OPEN_EDITOR = 'mope',    // pointer "track": open/present the editor
+    MSG_MIDI_LOCATE = 'mloc',         // int64 "frame": seek from the editor ruler
+    MSG_MIDI_SET_LOOP = 'mslp',       // int64 "start"/"end" [+ bool "disable"]
+    MSG_MIDI_PREVIEW = 'mprv',        // pointer "track", int8 "pitch"/"velocity", bool "on"
+    MSG_MIDI_EDITOR_PRESENT = 'mwpr', // main -> editor: raise the window
+    MSG_MIDI_EDITOR_REFRESH = 'mwrf', // main -> editor: clip replaced (undo/redo)
 };
