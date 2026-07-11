@@ -42,6 +42,7 @@ private:
     void BuildAddMenu();
     void RebuildChainList(int select);
     void RebuildParamPanel();
+    void ClearParamPanel();
     void SyncControlsRow();
     void UpdateValueLabel(guint param);
     void UpdateFileLabels();

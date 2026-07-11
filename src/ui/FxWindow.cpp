@@ -2,13 +2,16 @@
 
 #include <Button.h>
 #include <CheckBox.h>
+#include <ControlLook.h>
 #include <FilePanel.h>
+#include <GroupView.h>
 #include <LayoutBuilder.h>
 #include <ListView.h>
 #include <MenuField.h>
 #include <MenuItem.h>
 #include <Path.h>
 #include <PopUpMenu.h>
+#include <ScrollBar.h>
 #include <ScrollView.h>
 #include <Slider.h>
 #include <StringItem.h>
@@ -18,6 +21,90 @@
 #include <string.h>
 
 #include "host/pluginhost.h"
+
+// ---------------------------------------------------------------------------
+// Scrollable parameter panel. The parameter list varies wildly between
+// plug-ins (a couple of sliders for a delay, dozens for a synth), so rather
+// than resize the window to fit — which fights the layout system, because the
+// sliders have unbounded maximum width and the window's preferred size then
+// tracks its own frame — the panel lives in a vertical scroll view. The
+// window keeps a fixed, user-settable size; a plug-in with more parameters
+// than fit simply scrolls. This is the Interface Kit's standard idiom for a
+// layout-managed group inside a scroll view (see Haiku's HaikuDepot).
+// ---------------------------------------------------------------------------
+namespace
+{
+
+class ParamGroupView : public BGroupView
+{
+public:
+    ParamGroupView() : BGroupView(B_VERTICAL, 4.0f)
+    {
+    }
+
+    // Let the group be laid out much shorter than its content: the scroll
+    // view sizes it to the viewport, and anything taller scrolls.
+    BSize MinSize() override
+    {
+        BSize min = BGroupView::MinSize();
+        return BSize(min.width, 60.0f);
+    }
+
+protected:
+    void DoLayout() override
+    {
+        BGroupView::DoLayout();
+        BScrollBar *scrollBar = ScrollBar(B_VERTICAL);
+        if (scrollBar == NULL)
+            return;
+
+        // The real content height is the bottom of the last laid-out item
+        // (MinSize is not reliable for height-for-width children).
+        float contentHeight = GroupLayout()->LayoutArea().Height();
+        int32 count = GroupLayout()->CountItems();
+        if (count > 0) {
+            BLayoutItem *last = GroupLayout()->ItemAt(count - 1);
+            if (last != NULL)
+                contentHeight = last->Frame().bottom;
+        }
+        float viewHeight = Bounds().Height();
+        float max = contentHeight - viewHeight;
+        scrollBar->SetRange(0.0f, max > 0.0f ? max : 0.0f);
+        scrollBar->SetProportion(contentHeight > 0.0f ? viewHeight / contentHeight : 1.0f);
+        scrollBar->SetSteps(16.0f, viewHeight);
+    }
+};
+
+class ParamScrollView : public BScrollView
+{
+public:
+    ParamScrollView(const char *name, BView *target)
+        : BScrollView(name, target, 0, false, true, B_NO_BORDER)
+    {
+    }
+
+protected:
+    void DoLayout() override
+    {
+        float sbWidth = be_control_look->GetScrollBarWidth(B_VERTICAL);
+        BRect inner = Bounds();
+        inner.right -= sbWidth + 1.0f;
+
+        if (BView *target = Target()) {
+            target->MoveTo(inner.left, inner.top);
+            target->ResizeTo(inner.Width(), inner.Height());
+        }
+        if (BScrollBar *scrollBar = ScrollBar(B_VERTICAL)) {
+            BRect r = inner;
+            r.left = r.right + 1.0f;
+            r.right = r.left + sbWidth;
+            scrollBar->MoveTo(r.left, r.top);
+            scrollBar->ResizeTo(r.Width(), r.Height());
+        }
+    }
+};
+
+} // namespace
 
 enum {
     MSG_FX_ADD = 'fxad',    // string "key", "name", "category"
@@ -67,7 +154,8 @@ FxWindow::FxWindow(JackDawTrack *track)
     m_mix->SetModificationMessage(new BMessage(MSG_FX_MIX));
     m_mix->SetValue(kSliderSteps);
 
-    m_param_group = new BGroupView(B_VERTICAL, 4.0f);
+    m_param_group = new ParamGroupView();
+    BScrollView *param_scroll = new ParamScrollView("param-scroll", m_param_group);
 
     // clang-format off
     BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
@@ -89,7 +177,7 @@ FxWindow::FxWindow(JackDawTrack *track)
                 .Add(m_mix)
                 .AddGlue()
             .End()
-            .Add(m_param_group)
+            .Add(param_scroll)
         .End();
     // clang-format on
 
@@ -204,17 +292,31 @@ void FxWindow::UpdateFileLabels()
     m_ir_label->SetText(label);
 }
 
-void FxWindow::RebuildParamPanel()
+// Fully tear the parameter panel down. Removing only the child VIEWS (as the
+// first version did) leaks the layout items the builder created — the nested
+// BGroupLayouts of each row and the trailing glue are BLayoutItems, not views,
+// so they accumulate on every rebuild and inflate the panel's reported size.
+// Clear both: delete the child views, then any layout items left behind.
+void FxWindow::ClearParamPanel()
 {
     m_sliders.clear();
     m_value_labels.clear();
     m_model_label = NULL;
     m_ir_label = NULL;
+
     BView *child;
     while ((child = m_param_group->ChildAt(0)) != NULL) {
         m_param_group->RemoveChild(child);
         delete child;
     }
+    BLayout *layout = m_param_group->GroupLayout();
+    while (layout->CountItems() > 0)
+        delete layout->RemoveItem((int32)0);
+}
+
+void FxWindow::RebuildParamPanel()
+{
+    ClearParamPanel();
 
     PluginInstance *inst = Selected();
     SyncControlsRow();
@@ -283,6 +385,8 @@ void FxWindow::RebuildParamPanel()
         m_value_labels.push_back(value);
         UpdateValueLabel(i);
     }
+    // Trailing glue keeps the parameters packed at the top; the scroll view
+    // handles any overflow, so the window frame never has to change.
     builder.AddGlue();
 }
 
