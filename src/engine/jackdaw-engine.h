@@ -170,6 +170,28 @@ void jackdaw_engine_get_master_peaks(gfloat *out_L, gfloat *out_R);
 /* Cumulative xrun count reported by JACK since engine init (display only). */
 guint jackdaw_engine_get_xrun_count(void);
 
+/* ---- Render / export support (P11) ----
+ * The offline render (render.c) reads track audio synchronously through an
+ * EngTrackReader and mixes on a worker thread while the RT graph is held off
+ * the plugins via render_suspend. The realtime bounce taps the post-fader
+ * master into a ring drained by a writer thread. jackdaw_engine_set_suspended
+ * uses the same suspend flag to freeze the graph while a project load rebuilds
+ * the FX chains. eng_gather_render_midi is declared in render.h (its signature
+ * needs PhMidiEvent). */
+typedef struct EngTrackReader EngTrackReader;
+EngTrackReader *engine_track_reader_new(JackDawTrack *t, int render_sr);
+void engine_track_reader_free(EngTrackReader *r);
+gboolean engine_track_reader_read(EngTrackReader *r, JackDawTrack *t, off_t start, jack_nframes_t n,
+                                  float *outL, float *outR);
+
+void jackdaw_engine_render_suspend(gboolean on);
+void jackdaw_engine_set_suspended(gboolean on);
+
+void jackdaw_engine_render_tap_start(off_t end_frame);
+void jackdaw_engine_render_tap_stop(void);
+gboolean jackdaw_engine_render_tap_done(void);
+size_t jackdaw_engine_render_tap_read(float *L, float *R, size_t max_frames);
+
 G_END_DECLS
 
 #endif /* JACKDAW_ENGINE_H_INCLUDED */

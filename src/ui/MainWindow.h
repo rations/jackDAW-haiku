@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "engine/project.h"
+#include "engine/render.h"
 
 class BFilePanel;
 class BLayoutItem;
@@ -16,6 +17,7 @@ class MetroVolumeWindow;
 class MidiWindow;
 class MixerView;
 class MixerWindow;
+class RenderWindow;
 class TimelineView;
 class TransportView;
 
@@ -56,6 +58,22 @@ private:
     // Import an audio file onto a fresh audio track (region placed at timeline 0).
     void LoadFileAsTrack(const char *path);
 
+    // Project save/load (single-mutator: all engine/project edits run here).
+    void SaveProjectTo(const char *path); // write bundle, update title + last-project
+    void ShowSaveAsPanel();               // save panel seeded with the current name
+    void ShowOpenPanel();                 // open panel in the projects dir
+    void OpenProject(const char *path);   // stop, tear down, load, rebuild UI
+    void NewSession();                    // clear all tracks; reset to defaults
+    void UpdateTitle();                   // window title from the project file name
+    void CloseAllMidiEditors();           // async-quit every piano-roll + drain
+
+    // Render/export dialog (P11); region=TRUE renders the loop-tab selection.
+    void OpenRenderDialog(bool region);
+    void StartRenderFromMessage(BMessage *msg); // build options + kick off
+    void RenderTick();                          // poll progress; finalize when done
+    void SendRenderProgress(int state);         // notify the dialog (0..3)
+    void CleanupRender();                       // join/stop, drop tick + thread
+
     // Right-click context popups (built fresh so their marks are current).
     void ShowRecordMenu(BPoint screen_where);
     void ShowMetroMenu(BPoint screen_where);
@@ -89,6 +107,17 @@ private:
     bool m_mixer_visible;        // user toggled the mixer on
 
     BFilePanel *m_load_panel; // "Load File as New Track" open panel (lazy)
+    BFilePanel *m_save_panel; // "Save Project As" save panel (lazy)
+    BFilePanel *m_open_panel; // "Open Project" open panel (lazy)
+
+    RenderWindow *m_render_window; // render/export dialog (NULL until opened)
+
+    // Active render state (driven on this looper; see the render dialog note).
+    JackDawRenderProgress m_render_prog;
+    GThread *m_render_thread;      // offline worker (NULL for realtime/idle)
+    BMessageRunner *m_render_tick; // poll timer while a render runs
+    RenderMethod m_render_method;
+    bool m_render_active;
 
     // Open piano-roll editors (guarded by this window's looper lock).
     std::vector<MidiWindow *> m_midi_editors;

@@ -73,6 +73,7 @@ enum {
     MSG_FILE_RENDER = 'frnd',
     MSG_FILE_RENDER_REGION = 'frrg',
     MSG_FILE_NEW = 'fnew',
+    MSG_OPEN_PROJECT_REFS = 'popn', // refs from the Open-Project panel (vs. load-file)
     // (Quit uses B_QUIT_REQUESTED.)
 
     // Menu bar — Edit.
@@ -118,4 +119,15 @@ enum {
     MSG_MIDI_PREVIEW = 'mprv',        // pointer "track", int8 "pitch"/"velocity", bool "on"
     MSG_MIDI_EDITOR_PRESENT = 'mwpr', // main -> editor: raise the window
     MSG_MIDI_EDITOR_REFRESH = 'mwrf', // main -> editor: clip replaced (undo/redo)
+
+    // Render/export dialog <-> main window. The render drives the engine's
+    // non-RT API (suspend, locate, transport, tap), which is the MAIN looper's
+    // to call — so the dialog only posts options/cancel here and the main window
+    // owns the render lifecycle + poll tick, posting progress back to the dialog.
+    MSG_RENDER_START = 'rnds',    // dialog -> main: int32 format/bit_depth/source/
+                                  // scope/method/sample_rate/channels; string out_path
+    MSG_RENDER_CANCEL = 'rndc',   // dialog -> main: request abort
+    MSG_RENDER_TICK = 'rndt',     // main's own poll tick while a render runs
+    MSG_RENDER_PROGRESS = 'rndp', // main -> dialog: double "frac", int32 "state"
+                                  // (0 running, 1 done, 2 cancelled, 3 failed)
 };

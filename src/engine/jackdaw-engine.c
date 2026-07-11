@@ -125,6 +125,21 @@ typedef struct {
     volatile gfloat master_peak_L;
     volatile gfloat master_peak_R;
 
+    /* Render support (P11 export + project load). While render_suspend is set
+     * the RT callback outputs silence and touches no plugin, so the main thread
+     * can drive the offline render (which owns every PluginInstance) or tear
+     * down / rebuild the FX graph on load without racing the audio thread.
+     * render_active taps the post-master-fader mix into render_rb_L/R for the
+     * realtime bounce; render_done is set once play_pos reaches render_end. */
+    volatile gint render_suspend;
+    volatile gint render_active;
+    volatile gint render_done;
+    off_t render_end;
+    float *render_tap_L;
+    float *render_tap_R;
+    jack_ringbuffer_t *render_rb_L;
+    jack_ringbuffer_t *render_rb_R;
+
     gboolean active;
 } JackDawEngine;
 
@@ -1005,6 +1020,31 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     /* Mark this thread RT for the plugin host's allocation diagnostics. */
     ph_rt_mark(1);
 
+    /* Offline render / graph-rebuild in progress: the render worker (or a
+     * project load) owns the PluginInstances, so the live graph must touch none
+     * of them. Output silence, freeze the transport, and return before any mix
+     * or plugin work. */
+    if (g_atomic_int_get(&engine.render_suspend)) {
+        for (i = 0; i < engine.audio_out_count; i++) {
+            if (!engine.audio_out[i])
+                continue;
+            port_buf = jack_port_get_buffer(engine.audio_out[i], nframes);
+            memset(port_buf, 0, nframes * sizeof(float));
+        }
+        if (engine.midi_out) {
+            for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+                if (engine.midi_out[i])
+                    jack_midi_clear_buffer(jack_port_get_buffer(engine.midi_out[i], nframes));
+            }
+        }
+        if (engine.metro_out) {
+            port_buf = jack_port_get_buffer(engine.metro_out, nframes);
+            memset(port_buf, 0, nframes * sizeof(float));
+        }
+        ph_rt_mark(0);
+        return 0;
+    }
+
     /* Clear master mix buffers */
     memset(engine.master_L, 0, nframes * sizeof(float));
     memset(engine.master_R, 0, nframes * sizeof(float));
@@ -1321,6 +1361,34 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     if (peak_R > engine.master_peak_R)
         engine.master_peak_R = peak_R;
 
+    /* Realtime render tap: mirror the post-master-fader mix into the render ring
+     * for the writer thread (master_L/R already carry the master fader here).
+     * Capture only the frames of this block that fall before render_end so the
+     * file ends exactly at the requested point; signal completion when the
+     * playhead reaches it. */
+    if (g_atomic_int_get(&engine.render_active) && engine.render_rb_L && engine.render_rb_R) {
+        off_t blk_start = engine.play_pos - (off_t)nframes;
+        off_t in_range = engine.render_end - blk_start;
+        if (in_range < 0)
+            in_range = 0;
+        if (in_range > (off_t)nframes)
+            in_range = (off_t)nframes;
+        if (in_range > 0) {
+            for (k = 0; k < (jack_nframes_t)in_range; k++) {
+                engine.render_tap_L[k] = engine.master_L[k];
+                engine.render_tap_R[k] = engine.master_R[k];
+            }
+            size_t bytes = (size_t)in_range * sizeof(float);
+            if (jack_ringbuffer_write_space(engine.render_rb_L) >= bytes &&
+                jack_ringbuffer_write_space(engine.render_rb_R) >= bytes) {
+                jack_ringbuffer_write(engine.render_rb_L, (const char *)engine.render_tap_L, bytes);
+                jack_ringbuffer_write(engine.render_rb_R, (const char *)engine.render_tap_R, bytes);
+            }
+        }
+        if (engine.play_pos >= engine.render_end)
+            g_atomic_int_set(&engine.render_done, 1);
+    }
+
     /* Copy the master mix to the output ports */
     for (i = 0; i < engine.audio_out_count; i++) {
         if (!engine.audio_out[i])
@@ -1438,10 +1506,14 @@ static int engine_buffer_size_cb(jack_nframes_t nframes, void *arg)
     g_free(engine.master_R);
     g_free(engine.track_L);
     g_free(engine.track_R);
+    g_free(engine.render_tap_L);
+    g_free(engine.render_tap_R);
     engine.master_L = g_malloc0(nframes * sizeof(float));
     engine.master_R = g_malloc0(nframes * sizeof(float));
     engine.track_L = g_malloc0(nframes * sizeof(float));
     engine.track_R = g_malloc0(nframes * sizeof(float));
+    engine.render_tap_L = g_malloc0(nframes * sizeof(float));
+    engine.render_tap_R = g_malloc0(nframes * sizeof(float));
     engine.buf_size = nframes;
 
     return 0;
@@ -1548,6 +1620,8 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     engine.master_R = g_malloc0(bs * sizeof(float));
     engine.track_L = g_malloc0(bs * sizeof(float));
     engine.track_R = g_malloc0(bs * sizeof(float));
+    engine.render_tap_L = g_malloc0(bs * sizeof(float));
+    engine.render_tap_R = g_malloc0(bs * sizeof(float));
 
     /* Register callbacks */
     jack_set_thread_init_callback(engine.client, engine_thread_init_cb, NULL);
@@ -1667,6 +1741,18 @@ fail:
     engine.track_L = NULL;
     g_free(engine.track_R);
     engine.track_R = NULL;
+    g_free(engine.render_tap_L);
+    engine.render_tap_L = NULL;
+    g_free(engine.render_tap_R);
+    engine.render_tap_R = NULL;
+    if (engine.render_rb_L) {
+        jack_ringbuffer_free(engine.render_rb_L);
+        engine.render_rb_L = NULL;
+    }
+    if (engine.render_rb_R) {
+        jack_ringbuffer_free(engine.render_rb_R);
+        engine.render_rb_R = NULL;
+    }
     g_free(engine.click_buf);
     engine.click_buf = NULL;
     engine.click_len = 0;
@@ -1718,6 +1804,18 @@ void jackdaw_engine_quit(void)
     engine.track_L = NULL;
     g_free(engine.track_R);
     engine.track_R = NULL;
+    g_free(engine.render_tap_L);
+    engine.render_tap_L = NULL;
+    g_free(engine.render_tap_R);
+    engine.render_tap_R = NULL;
+    if (engine.render_rb_L) {
+        jack_ringbuffer_free(engine.render_rb_L);
+        engine.render_rb_L = NULL;
+    }
+    if (engine.render_rb_R) {
+        jack_ringbuffer_free(engine.render_rb_R);
+        engine.render_rb_R = NULL;
+    }
     g_free(engine.click_buf);
     engine.click_buf = NULL;
     engine.click_len = 0;
@@ -2636,4 +2734,324 @@ void jackdaw_engine_get_master_peaks(gfloat *out_L, gfloat *out_R)
 guint jackdaw_engine_get_xrun_count(void)
 {
     return (guint)g_atomic_int_get(&engine_xruns);
+}
+
+/* ======================================================================
+ * Render / export primitives (P11)
+ * ----------------------------------------------------------------------
+ * Offline render drives these directly from a non-RT worker thread; the RT
+ * callback is held off the plugins with render_suspend while it runs. The
+ * realtime path taps the post-fader master into a ring drained by a writer.
+ * libsamplerate is always present on Haiku (as in the feeder), so the Linux
+ * HAVE_SAMPLERATE guards are dropped here. */
+
+/* Scratch sizes for one reader chunk; matches the feeder's headroom rationale
+ * so the resampler always has enough input frames staged. */
+#define RR_RAW_FRAMES (4096 * 6)
+#define RR_MAX_CHANNELS 8
+
+/* A synchronous, render-only equivalent of one feeder slot: reads a contiguous
+ * span of a track's timeline audio into caller buffers, resampling clip→render
+ * SR as needed. It deliberately duplicates the feeder's clip-walk rather than
+ * refactoring the live path, to avoid any risk of regressing realtime playback. */
+struct EngTrackReader {
+    int render_sr;
+    ClipRegionSnapshot *snap; /* held ref; regions are stable while suspended */
+    SNDFILE *sf;
+    int open_region;
+    int open_clip_sr, open_clip_ch;
+    SRC_STATE *src_L, *src_R;
+    float *raw;  /* RR_RAW_FRAMES * RR_MAX_CHANNELS */
+    float *mono; /* RR_RAW_FRAMES */
+};
+
+static void eng_reader_close_file(EngTrackReader *r)
+{
+    if (r->sf) {
+        sf_close(r->sf);
+        r->sf = NULL;
+    }
+    if (r->src_L) {
+        src_delete(r->src_L);
+        r->src_L = NULL;
+    }
+    if (r->src_R) {
+        src_delete(r->src_R);
+        r->src_R = NULL;
+    }
+    r->open_region = -1;
+}
+
+EngTrackReader *engine_track_reader_new(JackDawTrack *t, int render_sr)
+{
+    EngTrackReader *r = g_new0(EngTrackReader, 1);
+    r->render_sr = render_sr;
+    r->open_region = -1;
+    r->snap = jackdaw_track_ref_snapshot(t); /* may be NULL */
+    r->raw = g_new(float, RR_RAW_FRAMES *RR_MAX_CHANNELS);
+    r->mono = g_new(float, RR_RAW_FRAMES);
+    return r;
+}
+
+void engine_track_reader_free(EngTrackReader *r)
+{
+    if (!r)
+        return;
+    eng_reader_close_file(r);
+    if (r->snap)
+        clip_region_snapshot_unref(r->snap);
+    g_free(r->raw);
+    g_free(r->mono);
+    g_free(r);
+}
+
+/* Fill outL/outR (caller-owned, >= n frames) with the track's timeline audio in
+ * [start, start+n), region gain applied, resampled to render_sr. Gaps/missing
+ * files become silence. n must be <= RR_RAW_FRAMES. Returns FALSE (success). */
+gboolean engine_track_reader_read(EngTrackReader *r, JackDawTrack *t, off_t start, jack_nframes_t n,
+                                  float *outL, float *outR)
+{
+    (void)t;
+    memset(outL, 0, n * sizeof(float));
+    memset(outR, 0, n * sizeof(float));
+    ClipRegionSnapshot *snap = r->snap;
+    if (!snap || snap->n == 0)
+        return FALSE;
+
+    int sr = r->render_sr;
+    jack_nframes_t done = 0;
+    off_t pf = start;
+
+    while (done < n) {
+        jack_nframes_t want = n - done;
+
+        /* Region covering pf, plus the nearest region start after pf. */
+        ClipRegion *reg = NULL;
+        int reg_idx = -1;
+        off_t next_start = -1;
+        for (int k = 0; k < snap->n; k++) {
+            ClipRegion *cr = &snap->r[k];
+            if (pf >= cr->tl_pos && pf < cr->tl_pos + cr->length) {
+                reg = cr;
+                reg_idx = k;
+                break;
+            }
+            if (cr->tl_pos > pf && (next_start < 0 || cr->tl_pos < next_start))
+                next_start = cr->tl_pos;
+        }
+
+        if (!reg) {
+            /* Gap / before first / past end → leave silence, advance. */
+            off_t sil = want;
+            if (next_start >= 0) {
+                off_t to_next = next_start - pf;
+                if (to_next > 0 && to_next < (off_t)sil)
+                    sil = to_next;
+            }
+            done += (jack_nframes_t)sil;
+            pf += sil;
+            if (next_start < 0)
+                break; /* nothing more ahead */
+            continue;
+        }
+
+        int clip_sr = reg->clip ? reg->clip->info.samplerate : sr;
+        int clip_ch = reg->clip ? reg->clip->info.channels : 1;
+        int eff_ch = clip_ch > RR_MAX_CHANNELS ? RR_MAX_CHANNELS : clip_ch;
+        gboolean needs_src = (clip_sr != sr);
+        off_t d = pf - reg->tl_pos;
+        off_t reg_remain = reg->length - d;
+        if (reg_remain <= 0) {
+            pf = reg->tl_pos + reg->length;
+            continue;
+        }
+
+        off_t chunk = want;
+        if (chunk > reg_remain)
+            chunk = (off_t)reg_remain;
+
+        if (reg_idx != r->open_region || !r->sf) {
+            eng_reader_close_file(r);
+            SF_INFO sfi = {0};
+            SNDFILE *sf = reg->clip ? sf_open(reg->clip->path, SFM_READ, &sfi) : NULL;
+            if (!sf) {
+                done += (jack_nframes_t)chunk;
+                pf += chunk;
+                continue;
+            }
+            off_t file_off =
+                reg->file_in + ((clip_sr == sr) ? d : (off_t)((double)d * clip_sr / sr + 0.5));
+            sf_seek(sf, file_off, SEEK_SET);
+            r->sf = sf;
+            r->open_clip_sr = clip_sr;
+            r->open_clip_ch = clip_ch;
+            r->open_region = reg_idx;
+            if (needs_src) {
+                int e = 0;
+                r->src_L = src_new(SRC_SINC_FASTEST, 1, &e);
+                if (eff_ch > 1)
+                    r->src_R = src_new(SRC_SINC_FASTEST, 1, &e);
+            }
+        }
+
+        gfloat gain = reg->gain;
+        float *dstL = outL + done;
+        float *dstR = outR + done;
+
+        if (!needs_src) {
+            sf_count_t got = sf_readf_float(r->sf, r->raw, (sf_count_t)chunk);
+            if (got < 0)
+                got = 0;
+            if (eff_ch == 1) {
+                for (sf_count_t f = 0; f < got; f++)
+                    dstL[f] = dstR[f] = r->raw[f] * gain;
+            } else {
+                for (sf_count_t f = 0; f < got; f++) {
+                    dstL[f] = r->raw[f * eff_ch] * gain;
+                    dstR[f] = r->raw[f * eff_ch + 1] * gain;
+                }
+            }
+            /* tail beyond `got` stays zero from the initial memset */
+        } else if (r->src_L) {
+            double ratio = (double)sr / (double)clip_sr;
+            long want_l = (long)chunk;
+            long in_need = (long)ceil((double)chunk / ratio) + 8;
+            if (in_need > RR_RAW_FRAMES)
+                in_need = RR_RAW_FRAMES;
+            int eoi = (chunk == reg_remain);
+
+            sf_count_t got = sf_readf_float(r->sf, r->raw, (sf_count_t)in_need);
+            if (got < 0)
+                got = 0;
+
+            for (sf_count_t f = 0; f < got; f++)
+                r->mono[f] = r->raw[f * eff_ch];
+            SRC_DATA sd_L = {.data_in = r->mono,
+                             .data_out = dstL,
+                             .input_frames = (long)got,
+                             .output_frames = want_l,
+                             .src_ratio = ratio,
+                             .end_of_input = eoi};
+            src_process(r->src_L, &sd_L);
+            long out_gen = sd_L.output_frames_gen;
+
+            if (eff_ch > 1 && r->src_R) {
+                for (sf_count_t f = 0; f < got; f++)
+                    r->mono[f] = r->raw[f * eff_ch + 1];
+                SRC_DATA sd_R = {.data_in = r->mono,
+                                 .data_out = dstR,
+                                 .input_frames = (long)got,
+                                 .output_frames = want_l,
+                                 .src_ratio = ratio,
+                                 .end_of_input = eoi};
+                src_process(r->src_R, &sd_R);
+            } else if (out_gen > 0) {
+                memcpy(dstR, dstL, (size_t)out_gen * sizeof(float));
+            }
+            for (long x = 0; x < out_gen; x++) {
+                dstL[x] *= gain;
+                dstR[x] *= gain;
+            }
+
+            long used = sd_L.input_frames_used;
+            if (used < got)
+                sf_seek(r->sf, -(sf_count_t)(got - used), SEEK_CUR);
+        }
+        /* else: SRC needed but instance missing — leave silence */
+
+        done += (jack_nframes_t)chunk;
+        pf += chunk;
+    }
+    return FALSE;
+}
+
+/* Render-only MIDI gather for an instrument track: emit just the sequenced
+ * events from the published snapshot that fall in [blk_start, blk_start+n). */
+int eng_gather_render_midi(JackDawTrack *t, off_t blk_start, jack_nframes_t nframes,
+                           PhMidiEvent *mev, int cap)
+{
+    int nev = 0;
+    MidiEventSnapshot *ms = g_atomic_pointer_get(&t->rt_midi);
+    if (!ms || !ms->n)
+        return 0;
+
+    off_t end = blk_start + nframes;
+    guint lo = 0, hi = ms->n; /* lower_bound(blk_start) */
+    while (lo < hi) {
+        guint mid = (lo + hi) / 2;
+        if (ms->ev[mid].frame < blk_start)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    for (guint e = lo; e < ms->n && ms->ev[e].frame < end && nev < cap; e++) {
+        MidiSnapEvent *se = &ms->ev[e];
+        mev[nev].time = (guint32)(se->frame - blk_start);
+        mev[nev].size = 3;
+        mev[nev].data[0] = se->s;
+        mev[nev].data[1] = se->d1;
+        mev[nev].data[2] = se->d2;
+        nev++;
+    }
+    return nev;
+}
+
+void jackdaw_engine_render_suspend(gboolean on)
+{
+    g_atomic_int_set(&engine.render_suspend, on ? 1 : 0);
+}
+
+/* Suspend the live audio graph while the main thread instantiates or frees
+ * plugins (project load). Same effect as render_suspend: the RT callback
+ * outputs silence and runs no plugins, so heavy non-RT work (VST3 module load,
+ * setupProcessing, buffer allocation) can't stall the audio thread into an
+ * xrun. There is nothing to play during a load anyway. */
+void jackdaw_engine_set_suspended(gboolean on)
+{
+    g_atomic_int_set(&engine.render_suspend, on ? 1 : 0);
+}
+
+void jackdaw_engine_render_tap_start(off_t end_frame)
+{
+    size_t bytes = (size_t)engine.buf_size * 64 * sizeof(float);
+    if (bytes < 65536)
+        bytes = 65536;
+    if (!engine.render_rb_L)
+        engine.render_rb_L = jack_ringbuffer_create(bytes);
+    if (!engine.render_rb_R)
+        engine.render_rb_R = jack_ringbuffer_create(bytes);
+    if (engine.render_rb_L)
+        jack_ringbuffer_reset(engine.render_rb_L);
+    if (engine.render_rb_R)
+        jack_ringbuffer_reset(engine.render_rb_R);
+    engine.render_end = end_frame;
+    g_atomic_int_set(&engine.render_done, 0);
+    g_atomic_int_set(&engine.render_active, 1);
+}
+
+void jackdaw_engine_render_tap_stop(void)
+{
+    g_atomic_int_set(&engine.render_active, 0);
+    /* Rings are kept for reuse; freed in jackdaw_engine_quit(). */
+}
+
+gboolean jackdaw_engine_render_tap_done(void)
+{
+    return g_atomic_int_get(&engine.render_done) != 0;
+}
+
+size_t jackdaw_engine_render_tap_read(float *L, float *R, size_t max_frames)
+{
+    if (!engine.render_rb_L || !engine.render_rb_R)
+        return 0;
+    size_t avL = jack_ringbuffer_read_space(engine.render_rb_L) / sizeof(float);
+    size_t avR = jack_ringbuffer_read_space(engine.render_rb_R) / sizeof(float);
+    size_t av = avL < avR ? avL : avR;
+    if (av > max_frames)
+        av = max_frames;
+    if (av == 0)
+        return 0;
+    jack_ringbuffer_read(engine.render_rb_L, (char *)L, av * sizeof(float));
+    jack_ringbuffer_read(engine.render_rb_R, (char *)R, av * sizeof(float));
+    return av;
 }

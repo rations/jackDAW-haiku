@@ -29,6 +29,7 @@
 #include "MidiWindow.h"
 #include "MixerView.h"
 #include "MixerWindow.h"
+#include "RenderWindow.h"
 #include "TimelineView.h"
 #include "TrackAreaView.h"
 #include "TransportView.h"
@@ -210,9 +211,23 @@ MainWindow::MainWindow(JackDawProject *project)
     : BWindow(BRect(100, 100, 1100, 700), "JackDAW", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
       m_project(project), m_transport(NULL), m_timeline(NULL), m_tick_runner(NULL),
       m_metro_volume_window(NULL), m_countin_window(NULL), m_mixer(NULL), m_mixer_item(NULL),
-      m_mixer_window(NULL), m_mixer_visible(false), m_load_panel(NULL), m_track_added_h(0),
+      m_mixer_window(NULL), m_mixer_visible(false), m_load_panel(NULL), m_save_panel(NULL),
+      m_open_panel(NULL), m_render_window(NULL), m_render_thread(NULL), m_render_tick(NULL),
+      m_render_method(RENDER_METHOD_OFFLINE), m_render_active(false), m_track_added_h(0),
       m_track_removed_h(0), m_tracks_reordered_h(0)
 {
+    memset(&m_render_prog, 0, sizeof(m_render_prog));
+    // Restore the saved window frame (defaults match the BWindow rect above).
+    {
+        float x = (float)(gint32)settings_get_uint32("win_x", 100);
+        float y = (float)(gint32)settings_get_uint32("win_y", 100);
+        float w = (float)settings_get_uint32("win_w", 1000);
+        float h = (float)settings_get_uint32("win_h", 600);
+        if (w >= 400 && h >= 300 && w < 20000 && h < 20000) {
+            MoveTo(x, y);
+            ResizeTo(w, h);
+        }
+    }
     BMenuBar *menu_bar = BuildMenuBar();
     m_transport = new TransportView(project);
     m_timeline = new TimelineView(project);
@@ -259,6 +274,8 @@ MainWindow::~MainWindow()
         g_signal_handler_disconnect(m_project, m_tracks_reordered_h);
     delete m_tick_runner;
     delete m_load_panel;
+    delete m_save_panel;
+    delete m_open_panel;
 }
 
 void MainWindow::ApplyMixerState()
@@ -322,17 +339,16 @@ BMenuBar *MainWindow::BuildMenuBar()
 {
     BMenuBar *bar = new BMenuBar("menubar");
 
-    // File — session I/O lands in the save/load phase; render in the export
-    // phase. Present but disabled until then.
+    // File — session I/O (save/load) and render/export.
     BMenu *file = new BMenu("File");
-    AddItem(file, "Open Project…", MSG_FILE_OPEN, 'O', B_COMMAND_KEY, false);
-    AddItem(file, "Save Project", MSG_FILE_SAVE, 'S', B_COMMAND_KEY, false);
-    AddItem(file, "Save Project As…", MSG_FILE_SAVE_AS, 'S', B_COMMAND_KEY | B_SHIFT_KEY, false);
+    AddItem(file, "Open Project…", MSG_FILE_OPEN, 'O', B_COMMAND_KEY);
+    AddItem(file, "Save Project", MSG_FILE_SAVE, 'S', B_COMMAND_KEY);
+    AddItem(file, "Save Project As…", MSG_FILE_SAVE_AS, 'S', B_COMMAND_KEY | B_SHIFT_KEY);
     file->AddSeparatorItem();
-    AddItem(file, "Render…", MSG_FILE_RENDER, 0, 0, false);
-    AddItem(file, "Render Region…", MSG_FILE_RENDER_REGION, 0, 0, false);
+    AddItem(file, "Render…", MSG_FILE_RENDER);
+    AddItem(file, "Render Region…", MSG_FILE_RENDER_REGION);
     file->AddSeparatorItem();
-    AddItem(file, "New Session", MSG_FILE_NEW, 'N', B_COMMAND_KEY, false);
+    AddItem(file, "New Session", MSG_FILE_NEW, 'N', B_COMMAND_KEY);
     file->AddSeparatorItem();
     AddItem(file, "Quit", B_QUIT_REQUESTED, 'Q', B_COMMAND_KEY);
     bar->AddItem(file);
@@ -554,6 +570,284 @@ void MainWindow::LoadFileAsTrack(const char *path)
     g_object_unref(t);
 }
 
+// ---- Project save / load ---------------------------------------------------
+
+void MainWindow::UpdateTitle()
+{
+    const gchar *f = jackdaw_project_get_file(m_project);
+    if (f && *f) {
+        gchar *base = g_path_get_basename(f);
+        BString title(base);
+        if (title.EndsWith(".jdaw"))
+            title.Truncate(title.Length() - 5);
+        title << " — JackDAW";
+        SetTitle(title.String());
+        g_free(base);
+    } else {
+        SetTitle("JackDAW");
+    }
+}
+
+void MainWindow::SaveProjectTo(const char *path)
+{
+    if (!path || !*path)
+        return;
+    if (jackdaw_project_save(m_project, path)) {
+        BString msg("Could not save project to:\n");
+        msg << path;
+        (new BAlert("Save error", msg.String(), "OK", NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT))
+            ->Go();
+        return;
+    }
+    UpdateTitle();
+    const gchar *saved = jackdaw_project_get_file(m_project);
+    if (saved && *saved)
+        settings_set_string("last_project", saved);
+    settings_save();
+}
+
+void MainWindow::ShowSaveAsPanel()
+{
+    if (!m_save_panel)
+        m_save_panel = new BFilePanel(B_SAVE_PANEL, new BMessenger(this), NULL, 0, false);
+    gchar *dir = jackdaw_default_projects_dir();
+    BEntry dent(dir, true);
+    entry_ref dref;
+    if (dent.GetRef(&dref) == B_OK)
+        m_save_panel->SetPanelDirectory(&dref);
+    g_free(dir);
+    const gchar *cur = jackdaw_project_get_file(m_project);
+    if (cur && *cur) {
+        gchar *base = g_path_get_basename(cur);
+        BString leaf(base);
+        if (leaf.EndsWith(".jdaw"))
+            leaf.Truncate(leaf.Length() - 5);
+        m_save_panel->SetSaveText(leaf.String());
+        g_free(base);
+    } else {
+        m_save_panel->SetSaveText("Untitled");
+    }
+    m_save_panel->Show();
+}
+
+void MainWindow::ShowOpenPanel()
+{
+    if (!m_open_panel) {
+        m_open_panel = new BFilePanel(B_OPEN_PANEL, new BMessenger(this), NULL, B_FILE_NODE, false);
+        BMessage msg(MSG_OPEN_PROJECT_REFS); // distinct from load-file B_REFS_RECEIVED
+        m_open_panel->SetMessage(&msg);
+    }
+    gchar *dir = jackdaw_default_projects_dir();
+    BEntry dent(dir, true);
+    entry_ref dref;
+    if (dent.GetRef(&dref) == B_OK)
+        m_open_panel->SetPanelDirectory(&dref);
+    g_free(dir);
+    m_open_panel->Show();
+}
+
+// Async-quit every piano-roll editor and drain the registry. Mirrors the
+// QuitRequested handshake: editors lock THIS window for model access, so we
+// only PostMessage (never lock them) and drop our lock while they tear down.
+void MainWindow::CloseAllMidiEditors()
+{
+    for (size_t i = 0; i < m_midi_editors.size(); i++)
+        m_midi_editors[i]->PostMessage(B_QUIT_REQUESTED);
+    for (int spin = 0; !m_midi_editors.empty() && spin < 2000; spin++) {
+        Unlock();
+        snooze(1000);
+        Lock();
+    }
+}
+
+void MainWindow::OpenProject(const char *path)
+{
+    if (!path || !*path)
+        return;
+    // Load mutates tracks/engine slots + rebuilds FX chains; do it from a quiet
+    // transport with the editors gone and stale selections cleared.
+    jackdaw_engine_stop_playback();
+    jackdaw_engine_locate(0);
+    CloseAllMidiEditors();
+    if (m_timeline && m_timeline->TrackArea())
+        m_timeline->TrackArea()->ClearSectionSelection();
+    jackdaw_project_clear_selection(m_project);
+
+    if (jackdaw_project_load(m_project, path)) {
+        BString msg("Could not open project (missing or corrupt file):\n");
+        msg << path;
+        (new BAlert("Open error", msg.String(), "OK", NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT))
+            ->Go();
+        return;
+    }
+    // track-added / timing-changed signals emitted during load already rebuilt
+    // the strips, lanes and mixers; refresh the canvas + title.
+    if (m_timeline)
+        m_timeline->InvalidateAll();
+    UpdateTitle();
+    settings_set_string("last_project", path);
+    settings_save();
+}
+
+void MainWindow::NewSession()
+{
+    jackdaw_engine_stop_playback();
+    jackdaw_engine_locate(0);
+    CloseAllMidiEditors();
+    if (m_timeline && m_timeline->TrackArea())
+        m_timeline->TrackArea()->ClearSectionSelection();
+    jackdaw_project_clear_selection(m_project);
+
+    // Undo mementos reference the tracks we are about to remove.
+    undo_manager_clear(jackdaw_project_get_undo(m_project));
+
+    // Hold the RT graph off the plugins while the FX chains are torn down.
+    jackdaw_engine_set_suspended(TRUE);
+    guint cur = jackdaw_project_track_count(m_project);
+    while (cur-- > 0) {
+        JackDawTrack *t = jackdaw_project_get_track(m_project, 0);
+        jackdaw_engine_remove_track(t);
+        jackdaw_project_remove_track(m_project, t);
+    }
+    jackdaw_engine_set_suspended(FALSE);
+
+    jackdaw_project_set_master_volume(m_project, 1.0f);
+    jackdaw_project_set_master_muted(m_project, FALSE);
+    jackdaw_project_set_file(m_project, NULL);
+    UpdateTitle();
+    if (m_timeline)
+        m_timeline->InvalidateAll();
+}
+
+// ---- Render / export (P11) -------------------------------------------------
+// The dialog runs its own looper and never calls the engine; it posts options
+// here (MSG_RENDER_START) and this looper owns the whole render lifecycle so
+// every engine non-RT call (suspend, locate, transport, tap) has a single
+// caller. Progress is posted back to the dialog as MSG_RENDER_PROGRESS.
+
+static const bigtime_t kRenderTickUsec = 66000; // ~15 Hz progress poll
+
+void MainWindow::OpenRenderDialog(bool region)
+{
+    if (!m_render_window)
+        m_render_window = new RenderWindow(m_project, BMessenger(this));
+    if (m_render_window->LockLooper()) {
+        m_render_window->Present(region);
+        m_render_window->UnlockLooper();
+    }
+}
+
+void MainWindow::StartRenderFromMessage(BMessage *msg)
+{
+    if (m_render_active)
+        return; // one render at a time
+
+    RenderOptions o;
+    memset(&o, 0, sizeof o);
+    o.format = (RenderFormat)msg->GetInt32("format", RENDER_FMT_WAV);
+    o.bit_depth = (RenderBitDepth)msg->GetInt32("bit_depth", RENDER_BITS_24);
+    o.source = (RenderSource)msg->GetInt32("source", RENDER_SRC_MASTER);
+    o.scope = (RenderScope)msg->GetInt32("scope", RENDER_SCOPE_PROJECT);
+    o.method = (RenderMethod)msg->GetInt32("method", RENDER_METHOD_OFFLINE);
+    o.sample_rate = msg->GetInt32("sample_rate", 48000);
+    o.channels = msg->GetInt32("channels", 2);
+    o.out_path = g_strdup(msg->GetString("out_path", ""));
+    o.project = m_project;
+    o.selected_tracks = NULL;
+    if (o.source == RENDER_SRC_SELECTED) {
+        GPtrArray *sel = jackdaw_project_get_selected_tracks(m_project);
+        o.selected_tracks = g_ptr_array_new();
+        for (guint i = 0; sel && i < sel->len; i++)
+            g_ptr_array_add(o.selected_tracks, g_ptr_array_index(sel, i));
+    }
+
+    if (!o.out_path || !*o.out_path || !jackdaw_render_format_supported(&o)) {
+        render_options_free_contents(&o);
+        SendRenderProgress(3); // failed
+        return;
+    }
+
+    // Region scope with no loop tabs -> empty span; reject before starting.
+    if (o.scope == RENDER_SCOPE_REGION && !jackdaw_engine_has_loop_region()) {
+        render_options_free_contents(&o);
+        SendRenderProgress(3);
+        return;
+    }
+
+    // The engine must be quiet before a render takes over the graph/transport.
+    jackdaw_engine_stop_playback();
+
+    memset(&m_render_prog, 0, sizeof m_render_prog);
+    m_render_method = o.method;
+    m_render_thread = NULL;
+
+    if (o.method == RENDER_METHOD_OFFLINE) {
+        m_render_thread = jackdaw_render_offline_start(&o, &m_render_prog);
+    } else {
+        if (jackdaw_render_realtime_start(&o, &m_render_prog)) {
+            render_options_free_contents(&o);
+            SendRenderProgress(3);
+            return;
+        }
+    }
+    render_options_free_contents(&o); // both start paths deep-copied the options
+
+    m_render_active = true;
+    m_render_tick =
+        new BMessageRunner(BMessenger(this), BMessage(MSG_RENDER_TICK), kRenderTickUsec);
+}
+
+void MainWindow::RenderTick()
+{
+    if (!m_render_active)
+        return;
+    if (m_render_method == RENDER_METHOD_REALTIME)
+        jackdaw_render_realtime_poll(&m_render_prog);
+
+    if (!g_atomic_int_get(&m_render_prog.finished)) {
+        SendRenderProgress(0); // running
+        return;
+    }
+
+    bool cancelled = g_atomic_int_get(&m_render_prog.cancel) != 0;
+    bool failed = g_atomic_int_get(&m_render_prog.failed) != 0;
+    CleanupRender();
+    SendRenderProgress(failed ? 3 : (cancelled ? 2 : 1));
+}
+
+void MainWindow::SendRenderProgress(int state)
+{
+    if (!m_render_window)
+        return;
+    double frac = 1.0;
+    off_t total = m_render_prog.frames_total;
+    off_t done = m_render_prog.frames_done;
+    if (total > 0) {
+        frac = (double)done / (double)total;
+        if (frac < 0.0)
+            frac = 0.0;
+        if (frac > 1.0)
+            frac = 1.0;
+    }
+    BMessage p(MSG_RENDER_PROGRESS);
+    p.AddDouble("frac", frac);
+    p.AddInt32("state", state);
+    BMessenger(m_render_window).SendMessage(&p);
+}
+
+void MainWindow::CleanupRender()
+{
+    if (m_render_tick) {
+        delete m_render_tick;
+        m_render_tick = NULL;
+    }
+    if (m_render_thread) {
+        g_thread_join(m_render_thread); // finished flag already set by the worker
+        m_render_thread = NULL;
+    }
+    m_render_active = false;
+}
+
 void MainWindow::ShowTrackContext(int slot, BPoint screen_where)
 {
     JackDawTrack *t = NULL;
@@ -740,6 +1034,66 @@ void MainWindow::MessageReceived(BMessage *message)
             }
             break;
         }
+
+        // ---- Project save / load ----
+        case MSG_FILE_SAVE: {
+            const gchar *cur = jackdaw_project_get_file(m_project);
+            if (cur && *cur)
+                SaveProjectTo(cur);
+            else
+                ShowSaveAsPanel();
+            break;
+        }
+        case MSG_FILE_SAVE_AS:
+            ShowSaveAsPanel();
+            break;
+        case B_SAVE_REQUESTED: {
+            // Result of the "Save Project As" save panel: directory + name.
+            entry_ref dir;
+            const char *name = NULL;
+            if (message->FindRef("directory", &dir) == B_OK &&
+                message->FindString("name", &name) == B_OK && name && *name) {
+                BPath path(&dir);
+                path.Append(name);
+                SaveProjectTo(path.Path());
+            }
+            break;
+        }
+        case MSG_FILE_OPEN:
+            ShowOpenPanel();
+            break;
+        case MSG_OPEN_PROJECT_REFS: {
+            // Selection from the "Open Project" panel (a .jdaw file).
+            entry_ref ref;
+            if (message->FindRef("refs", 0, &ref) == B_OK) {
+                BEntry entry(&ref, true);
+                BPath path;
+                if (entry.GetPath(&path) == B_OK)
+                    OpenProject(path.Path());
+            }
+            break;
+        }
+        case MSG_FILE_NEW:
+            NewSession();
+            break;
+
+        case MSG_FILE_RENDER:
+            OpenRenderDialog(false);
+            break;
+        case MSG_FILE_RENDER_REGION:
+            OpenRenderDialog(true);
+            break;
+
+        case MSG_RENDER_START:
+            StartRenderFromMessage(message);
+            break;
+        case MSG_RENDER_CANCEL:
+            if (m_render_active)
+                g_atomic_int_set(&m_render_prog.cancel, 1);
+            break;
+        case MSG_RENDER_TICK:
+            RenderTick();
+            break;
 
         case MSG_EDIT_UNDO:
             // The section-selection pointers reference the pre-undo region list;
@@ -980,6 +1334,16 @@ void MainWindow::MessageReceived(BMessage *message)
 
 bool MainWindow::QuitRequested()
 {
+    // Persist the window frame for next launch.
+    {
+        BRect f = Frame();
+        settings_set_uint32("win_x", (guint32)(gint32)f.left);
+        settings_set_uint32("win_y", (guint32)(gint32)f.top);
+        settings_set_uint32("win_w", (guint32)f.Width());
+        settings_set_uint32("win_h", (guint32)f.Height());
+        settings_save();
+    }
+
     // Stop engine events reaching a window that is about to die. The engine
     // itself is torn down by main() after the app loop exits.
     jackdaw_engine_set_event_hook(NULL, NULL);
@@ -995,6 +1359,27 @@ bool MainWindow::QuitRequested()
         Unlock();
         snooze(1000);
         Lock();
+    }
+
+    // Cancel and drain any in-flight render (it holds the engine suspended /
+    // the transport running and a worker thread we must join before teardown).
+    if (m_render_active) {
+        g_atomic_int_set(&m_render_prog.cancel, 1);
+        for (int spin = 0; m_render_active && spin < 4000; spin++) {
+            if (m_render_method == RENDER_METHOD_REALTIME)
+                jackdaw_render_realtime_poll(&m_render_prog);
+            if (g_atomic_int_get(&m_render_prog.finished)) {
+                CleanupRender();
+                break;
+            }
+            snooze(1000);
+        }
+        CleanupRender();
+    }
+    // The render dialog hides rather than quits; force it closed like the mixer.
+    if (m_render_window && m_render_window->Lock()) {
+        m_render_window->Quit();
+        m_render_window = NULL;
     }
 
     // Force the detached mixer window closed first (its QuitRequested normally

@@ -8,8 +8,9 @@ NONPACKAGED = /boot/system/non-packaged
 VST3_SDK ?= $(HOME)/VST3-haiku/vst3sdk
 VST3_LIB ?= $(HOME)/VST3-haiku/build/lib/Release
 
-GLIB_CFLAGS := $(shell pkg-config --cflags glib-2.0 gobject-2.0)
-GLIB_LIBS   := $(shell pkg-config --libs glib-2.0 gobject-2.0)
+# gio-2.0: project save/load copies bundle audio via GFile (g_file_copy).
+GLIB_CFLAGS := $(shell pkg-config --cflags glib-2.0 gobject-2.0 gio-2.0)
+GLIB_LIBS   := $(shell pkg-config --libs glib-2.0 gobject-2.0 gio-2.0)
 # Audio file I/O (libsndfile) + sample-rate conversion (libsamplerate), used by
 # the clip peak tables and the playback feeder thread.
 AUDIO_CFLAGS := $(shell pkg-config --cflags sndfile samplerate)
@@ -30,14 +31,14 @@ C_SOURCES   = src/engine/glib_check.c src/engine/message.c src/engine/settings.c
               src/engine/track.c src/engine/project.c src/engine/jackdaw-engine.c \
               src/engine/tempomap.c src/engine/timeruler.c \
               src/engine/audio_clip.c src/engine/clipregion.c src/engine/undo.c \
-              src/engine/midiclip.c
+              src/engine/midiclip.c src/engine/render.c
 CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/TransportView.cpp src/ui/TimelineView.cpp src/ui/RulerView.cpp \
               src/ui/TrackAreaView.cpp src/ui/StepperControl.cpp \
               src/ui/MetronomeWindows.cpp src/ui/KnobView.cpp src/ui/FaderView.cpp \
               src/ui/VuView.cpp src/ui/TrackStripView.cpp src/ui/MixerStripView.cpp \
               src/ui/MixerView.cpp src/ui/MixerWindow.cpp src/ui/RegionGainWindow.cpp \
-              src/ui/MidiWindow.cpp src/ui/FxWindow.cpp
+              src/ui/MidiWindow.cpp src/ui/FxWindow.cpp src/ui/RenderWindow.cpp
 HOST_SOURCES = src/host/pluginhost.cpp
 
 # SDK sources compiled directly (they are not part of the SDK's static libs;
