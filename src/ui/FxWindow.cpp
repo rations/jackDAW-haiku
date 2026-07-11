@@ -37,7 +37,7 @@ enum {
 static const int32 kSliderSteps = 1000; // BSlider is integer; params are [0,1]
 
 FxWindow::FxWindow(JackDawTrack *track)
-    : BWindow(BRect(0, 0, 560, 420), "Effects", B_TITLED_WINDOW,
+    : BWindow(BRect(0, 0, 900, 460), "Effects", B_TITLED_WINDOW,
               B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE),
       m_track(track), m_file_panel(NULL), m_model_label(NULL), m_ir_label(NULL)
 {
@@ -265,6 +265,8 @@ void FxWindow::RebuildParamPanel()
         mod->AddInt32("param", (int32)i);
         slider->SetModificationMessage(mod);
         slider->SetValue((int32)(pluginhost_param_get(inst, i) * kSliderSteps));
+        // A usable throw length without manual window resizing.
+        slider->SetExplicitMinSize(BSize(320.0f, B_SIZE_UNSET));
 
         BStringView *value = new BStringView("value", "");
         value->SetExplicitMinSize(BSize(110.0f, B_SIZE_UNSET));
