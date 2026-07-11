@@ -398,7 +398,10 @@ void FxWindow::MessageReceived(BMessage *message)
                 break;
             if (!pluginhost_file_set(inst, (int)which, path.Path()))
                 g_warning("FxWindow: plugin refused file '%s'", path.Path());
-            UpdateFileLabels();
+            // Full rebuild rather than just the file labels: loading a model
+            // can retitle parameters (e.g. NAMku's "Slim (n/a)" capability
+            // reporting), and titles are only read at panel build time.
+            RebuildParamPanel();
             break;
         }
 

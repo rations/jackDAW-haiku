@@ -818,12 +818,16 @@ static void engine_post_event(int event)
 static guint8 eng_active_notes[JACKDAW_MAX_TRACKS][16][128];
 static volatile gint eng_midi_flush[JACKDAW_MAX_TRACKS]; /* 1 = release all held notes */
 
-/* One RT MIDI event: block-relative sample offset + up to 3 bytes. */
-typedef struct {
-    guint32 time;
-    guint8 size;
-    guint8 data[3];
-} EngMidiEv;
+/* One RT MIDI event: block-relative sample offset + up to 3 bytes. The
+ * engine uses the plugin host's event type directly so a gathered block can
+ * feed an instrument plugin and the midi_out port without conversion. */
+typedef PhMidiEvent EngMidiEv;
+
+/* Per-slot events gathered once per block in the track loop: consumed there
+ * by the instrument plugin (first FX) and again by the midi_out writer below
+ * — gathering twice would double-apply the flush/active-note bookkeeping. */
+static EngMidiEv eng_block_ev[JACKDAW_MAX_TRACKS][ENG_MIDI_MAX_EV];
+static int eng_block_nev[JACKDAW_MAX_TRACKS];
 
 /* Preview-note injection (main thread -> RT). The main thread queues short
  * messages tagged with a track slot; the RT thread drains the ring once per
@@ -1101,6 +1105,12 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
     off_t blk_start = engine.play_pos - (off_t)nframes;
 
+    /* Publish transport for plugins that query host time (tempo-synced
+     * delays/LFOs, instrument arps) via the VST3 ProcessContext. */
+    pluginhost_set_transport(engine.project ? engine.project->bpm : 120.0,
+                             (double)engine.sample_rate, (gint64)blk_start,
+                             (flags & ENGINE_PLAYING) != 0);
+
     gboolean any_soloed = FALSE;
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         JackDawTrack *t = engine.slots[i];
@@ -1112,6 +1122,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         JackDawTrack *t = engine.slots[i];
+        eng_block_nev[i] = 0;
         if (!t)
             continue;
 
@@ -1239,13 +1250,33 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             }
         }
 
+        /* Instrument tracks: gather this block's MIDI ONCE (stop/seek flush,
+         * sequenced snapshot, live thru, preview notes) into per-slot scratch.
+         * It feeds the instrument plugin below AND the midi_out writer after
+         * the track loop — gathering twice would double-apply the flush and
+         * active-note bookkeeping. */
+        gboolean instr = jackdaw_track_is_instrument(t);
+        if (instr)
+            eng_block_nev[i] = eng_gather_instrument_midi(
+                (int)i, t, blk_start, nframes, (flags & ENGINE_PLAYING) != 0,
+                (tflags & TRACK_ARMED) != 0, eng_block_ev[i], ENG_MIDI_MAX_EV);
+
         /* Per-track FX chain, in place on bL/bR (pre-fader, like the Linux
          * engine). The snapshot pointer is published atomically by the main
          * thread; instances it references are retired, never freed, while any
-         * chain that names them can still be read here. */
+         * chain that names them can still be read here. On an instrument
+         * track the FIRST plugin is the instrument: it receives the block's
+         * MIDI and renders audio into the (silent) track buffers; the rest of
+         * the chain processes that audio. */
         JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
         if (chain) {
-            for (int fi = 0; fi < chain->n; fi++)
+            int fi = 0;
+            if (instr && chain->n > 0) {
+                pluginhost_process_midi((PluginInstance *)chain->fx[0], eng_block_ev[i],
+                                        eng_block_nev[i], bL, bR, (int)nframes);
+                fi = 1;
+            }
+            for (; fi < chain->n; fi++)
                 pluginhost_process((PluginInstance *)chain->fx[fi], bL, bR, (int)nframes);
         }
 
@@ -1298,12 +1329,11 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         memcpy(port_buf, (i == 0) ? engine.master_L : engine.master_R, nframes * sizeof(float));
     }
 
-    /* Instrument-track MIDI output: clear every per-slot midi_out, then for each
-     * instrument track merge its scheduled/thru/preview events (time-ordered) and
-     * write them to its own port. Notes are heard through the port until the
-     * plugin phase gives instrument tracks a synth. */
+    /* Instrument-track MIDI output: clear every per-slot midi_out, then write
+     * each instrument track's merged events (gathered once in the track loop
+     * above, where they also fed the instrument plugin) to its own port, so
+     * external hardware keeps hearing the notes alongside any plugin synth. */
     if (engine.midi_out) {
-        gboolean playing = (flags & ENGINE_PLAYING) != 0;
         for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
             if (!engine.midi_out[i])
                 continue;
@@ -1312,12 +1342,9 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             JackDawTrack *t = engine.slots[i];
             if (!t || !jackdaw_track_is_instrument(t))
                 continue;
-            gint tflags = g_atomic_int_get(&t->state_flags);
-            EngMidiEv mev[ENG_MIDI_MAX_EV];
-            int nev = eng_gather_instrument_midi((int)i, t, blk_start, nframes, playing,
-                                                 (tflags & TRACK_ARMED) != 0, mev, ENG_MIDI_MAX_EV);
-            for (int e = 0; e < nev; e++)
-                jack_midi_event_write(obuf, mev[e].time, mev[e].data, mev[e].size);
+            for (int e = 0; e < eng_block_nev[i]; e++)
+                jack_midi_event_write(obuf, eng_block_ev[i][e].time, eng_block_ev[i][e].data,
+                                      eng_block_ev[i][e].size);
         }
     }
 

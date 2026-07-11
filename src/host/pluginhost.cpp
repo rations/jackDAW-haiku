@@ -15,6 +15,7 @@
 #include "pluginhost.h"
 
 #include "public.sdk/source/common/memorystream.h"
+#include "public.sdk/source/vst/hosting/eventlist.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
@@ -24,6 +25,7 @@
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 
 #include "inamfileloader.h"
@@ -111,6 +113,7 @@ struct Vst3Backend {
     ProcessContext ctx;
     ParameterChanges in_params;       /* RT-side, pre-allocated */
     ParameterChangeTransfer transfer; /* UI → RT lock-free ring */
+    EventList in_events{256};         /* MIDI for instruments, pre-allocated */
     int max_block = 0;
     std::vector<ParamID> param_ids;
 };
@@ -120,6 +123,7 @@ struct PluginInstance {
     char *name;
     char *key;
     char *category;
+    gboolean is_instrument;
     volatile gint active;  /* 1 = processing, 0 = bypassed */
     volatile gint mix_q15; /* wet/dry: 0 = fully dry .. 32768 = fully wet */
     double sample_rate;
@@ -165,7 +169,24 @@ static PluginInfo *ph_info_new(const char *key, const char *name, const char *ca
     pi->key = g_strdup(key);
     pi->name = g_strdup(name);
     pi->category = g_strdup(category);
+    /* VST3 subcategory strings mark synths as "Instrument|..." */
+    pi->is_instrument = category && strstr(category, "Instrument") != NULL;
     return pi;
+}
+
+/* ---- Transport (published by the RT thread, read by process_midi) ---- */
+
+static double ph_xport_bpm = 120.0;
+static double ph_xport_sr = 48000.0;
+static gint64 ph_xport_frame = 0;
+static gboolean ph_xport_playing = FALSE;
+
+extern "C" void pluginhost_set_transport(double bpm, double sr, gint64 frame, gboolean playing)
+{
+    ph_xport_bpm = bpm;
+    ph_xport_sr = sr;
+    ph_xport_frame = frame;
+    ph_xport_playing = playing;
 }
 
 static void ph_info_free(gpointer p)
@@ -368,6 +389,17 @@ extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
                 b->component->activateBus(kAudio, bd, i, true);
         }
     }
+    /* Instruments receive notes on an event INPUT bus, also inactive by
+     * default. Activate every default-active one so MIDI reaches the synth. */
+    {
+        int32 nb = b->component->getBusCount(kEvent, kInput);
+        for (int32 i = 0; i < nb; i++) {
+            BusInfo bi;
+            if (b->component->getBusInfo(kEvent, kInput, i, bi) == kResultOk &&
+                (bi.flags & BusInfo::kDefaultActive))
+                b->component->activateBus(kEvent, kInput, i, true);
+        }
+    }
 
     /* Buffer management by HostProcessData (prepared before activation). */
     if (!b->data.prepare(*b->component, ph_maxblock, kSample32)) {
@@ -413,6 +445,8 @@ extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
     pi->name = g_strdup(info->name);
     pi->key = g_strdup(info->key);
     pi->category = g_strdup(info->category);
+    pi->is_instrument =
+        info->is_instrument || (info->category && strstr(info->category, "Instrument"));
     pi->active = 1;
     pi->mix_q15 = 32768;
     pi->sample_rate = ph_sr;
@@ -556,6 +590,111 @@ extern "C" void pluginhost_process(PluginInstance *inst, float *L, float *R, int
             L[i] = inst->dry_L[i] * dry + L[i] * wet;
             R[i] = inst->dry_R[i] * dry + R[i] * wet;
         }
+    }
+}
+
+extern "C" gboolean pluginhost_is_instrument(PluginInstance *inst)
+{
+    return inst ? inst->is_instrument : FALSE;
+}
+
+extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev,
+                                        float *L, float *R, int nframes)
+{
+    if (!inst || !inst->b || !inst->b->processor)
+        return;
+    if (!g_atomic_int_get(&inst->active))
+        return; /* bypassed: leave the caller's (silent) buffers as-is */
+    Vst3Backend *b = inst->b;
+    if (nframes > b->max_block)
+        return;
+
+    rt_set_denormal_mode();
+    gint64 t0 = ph_diag_enabled() ? ph_now_us() : 0;
+
+    /* This block's MIDI as VST3 note events (pre-allocated event list). */
+    b->in_events.clear();
+    for (int i = 0; i < n_ev; i++) {
+        const guint8 *m = ev[i].data;
+        uint8 status = m[0] & 0xF0, ch = m[0] & 0x0F;
+        Event e{};
+        e.busIndex = 0;
+        e.sampleOffset = (int32)ev[i].time;
+        e.flags = Event::kIsLive;
+        if (status == 0x90 && m[2] > 0) {
+            e.type = Event::kNoteOnEvent;
+            e.noteOn.channel = ch;
+            e.noteOn.pitch = m[1];
+            e.noteOn.velocity = m[2] / 127.0f;
+            e.noteOn.noteId = -1;
+        } else if (status == 0x80 || (status == 0x90 && m[2] == 0)) {
+            e.type = Event::kNoteOffEvent;
+            e.noteOff.channel = ch;
+            e.noteOff.pitch = m[1];
+            e.noteOff.velocity = (status == 0x80) ? m[2] / 127.0f : 0.0f;
+            e.noteOff.noteId = -1;
+        } else {
+            continue; /* CC/other: not delivered yet (matches the Linux host) */
+        }
+        b->in_events.addEvent(e);
+    }
+    b->data.inputEvents = &b->in_events;
+
+    /* Transport/tempo for the plug-in's ProcessContext (arps, tempo-synced
+     * LFOs). Published by the engine at the top of this same RT cycle. */
+    b->ctx.state = ProcessContext::kTempoValid | ProcessContext::kProjectTimeMusicValid;
+    if (ph_xport_playing)
+        b->ctx.state |= ProcessContext::kPlaying;
+    b->ctx.sampleRate = ph_xport_sr;
+    b->ctx.tempo = ph_xport_bpm;
+    b->ctx.projectTimeSamples = (TSamples)ph_xport_frame;
+    double fpb = (ph_xport_bpm > 0.0) ? ph_xport_sr * 60.0 / ph_xport_bpm : 0.0;
+    b->ctx.projectTimeMusic = (fpb > 0.0) ? (double)ph_xport_frame / fpb : 0.0;
+
+    b->data.numSamples = nframes;
+    if (b->data.inputs && b->data.inputs[0].channelBuffers32) /* silence in */
+        for (int ch = 0; ch < b->data.inputs[0].numChannels; ch++)
+            memset(b->data.inputs[0].channelBuffers32[ch], 0, sizeof(float) * (size_t)nframes);
+    if (b->data.outputs && b->data.outputs[0].channelBuffers32)
+        for (int ch = 0; ch < b->data.outputs[0].numChannels; ch++)
+            memset(b->data.outputs[0].channelBuffers32[ch], 0, sizeof(float) * (size_t)nframes);
+
+    b->transfer.transferChangesTo(b->in_params);
+    b->processor->process(b->data);
+    b->in_params.clearQueue();
+    b->in_events.clear();
+    b->data.inputEvents = nullptr; /* reset for the effect (audio) path */
+
+    if (b->data.outputs && b->data.outputs[0].channelBuffers32) {
+        memcpy(L, b->data.outputs[0].channelBuffers32[0], sizeof(float) * (size_t)nframes);
+        int oc = b->data.outputs[0].numChannels;
+        memcpy(R, b->data.outputs[0].channelBuffers32[oc > 1 ? 1 : 0],
+               sizeof(float) * (size_t)nframes);
+    }
+
+    if (t0) {
+        gint64 d = ph_now_us() - t0;
+        if (d > inst->diag_max_us)
+            inst->diag_max_us = d;
+    }
+
+    /* Same speaker-safety net as pluginhost_process. */
+    for (int i = 0; i < nframes; i++) {
+        float a = L[i], c = R[i];
+        if (!std::isfinite(a))
+            a = 0.0f;
+        else if (a > 4.0f)
+            a = 4.0f;
+        else if (a < -4.0f)
+            a = -4.0f;
+        if (!std::isfinite(c))
+            c = 0.0f;
+        else if (c > 4.0f)
+            c = 4.0f;
+        else if (c < -4.0f)
+            c = -4.0f;
+        L[i] = a;
+        R[i] = c;
     }
 }
 
