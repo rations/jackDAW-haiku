@@ -1,0 +1,32 @@
+name			jackdaw
+version			0.1-1
+architecture	x86_64
+summary			"JackDAW - multitrack JACK DAW (native Haiku)"
+description		"A native Haiku multitrack digital audio workstation built on the
+Interface Kit: audio and MIDI tracks, a piano-roll editor, a mixer, VST3 effects and
+instruments, MIDI control-surface mapping, project save/load, and offline/realtime
+render. A JACK client - run the jack server first; VST3 plug-ins such as NAMku and
+DRUMku are picked up from the system and user add-ons/vst3 directories."
+packager		"rations <ehqcar@proton.me>"
+vendor			"rations"
+copyrights {
+	"2026 rations"
+	"2025 Steinberg Media Technologies GmbH"
+}
+licenses {
+	"MIT"
+}
+provides {
+	jackdaw = 0.1
+	app:JackDAW = 0.1
+}
+requires {
+	haiku
+	jack
+	glib2
+	libsndfile
+	libsamplerate
+}
+urls {
+	"https://github.com/rations/jackDAW-haiku"
+}

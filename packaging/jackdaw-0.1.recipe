@@ -1,0 +1,62 @@
+# HaikuPorts recipe for JackDAW (native Haiku multitrack JACK DAW).
+#
+# NOT YET VALIDATED with haikuporter. This is the most involved recipe: JackDAW builds
+# against BOTH libjack (from the jack package) and the VST3-haiku SDK static libs, so
+# BUILD() first builds the SDK libs from the second source, then JackDAW. On the target:
+#   1. Pin SOURCE_URI / SOURCE_URI_2 to tags/commits with checksums.
+#   2. Confirm the $sourceDir2 layout and the VST3_LIB path after the SDK build with
+#      `haikuporter -c jackdaw`.
+SUMMARY="JackDAW - multitrack JACK DAW (native Haiku)"
+DESCRIPTION="A native Haiku multitrack DAW: audio and MIDI tracks, piano-roll editor, \
+mixer, VST3 effects and instruments, MIDI control mapping, project save/load, and \
+offline/realtime render. A JACK client."
+HOMEPAGE="https://github.com/rations/jackDAW-haiku"
+COPYRIGHT="2026 rations; 2025 Steinberg Media Technologies GmbH"
+LICENSE="MIT"
+REVISION="1"
+SOURCE_URI="git+https://github.com/rations/jackDAW-haiku#master"
+SOURCE_DIR="jackDAW-haiku"
+# Second source: the VST3-haiku SDK JackDAW builds and links against.
+SOURCE_URI_2="git+https://github.com/rations/VST3-haiku#master"
+SOURCE_DIR_2="VST3-haiku"
+ARCHITECTURES="x86_64"
+
+PROVIDES="
+	jackdaw = 0.1
+	app:JackDAW = 0.1
+	"
+REQUIRES="
+	haiku
+	jack
+	glib2
+	libsndfile
+	libsamplerate
+	"
+BUILD_REQUIRES="
+	haiku_devel
+	jack
+	devel:libjack
+	devel:glib2
+	devel:libsndfile
+	devel:libsamplerate
+	cmd:cmake
+	cmd:ninja
+	cmd:pkg_config
+	"
+
+BUILD()
+{
+	# Build the VST3-haiku SDK static libs from the second source first.
+	cmake -B "$sourceDir2/build" -S "$sourceDir2" -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release -DNAMKU_DIR=/nonexistent
+	ninja -C "$sourceDir2/build"
+
+	make VST3_SDK="$sourceDir2/vst3sdk" VST3_LIB="$sourceDir2/build/lib/Release"
+}
+
+INSTALL()
+{
+	mkdir -p $appsDir
+	cp JackDAW $appsDir/JackDAW
+	addAppDeskbarSymlink $appsDir/JackDAW
+}
