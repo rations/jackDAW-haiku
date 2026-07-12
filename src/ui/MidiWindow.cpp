@@ -19,6 +19,7 @@
 #include "engine/timeruler.h"
 #include "MainWindow.h"
 #include "Messages.h"
+#include "StateButton.h"
 
 // Geometry (mirrors the Linux editor).
 static const float kKeyW = 42.0f;   // keyboard column width
@@ -372,8 +373,12 @@ MidiWindow::MidiWindow(JackDawTrack *track, JackDawProject *project, BWindow *ma
     BButton *btn_next = new BButton("mw_next", "▶|", new BMessage(MSG_MW_NEXT));
     m_btn_play = new BButton("mw_play", "▶", new BMessage(MSG_MW_PLAY));
     m_btn_play->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
-    m_btn_loop = new BButton("mw_loop", "⟳", new BMessage(MSG_MW_LOOP));
+    // Loop keeps "⟳" as a label for layout sizing only; the icon is vector-drawn
+    // (GLYPH_LOOP) so it never depends on a font carrying that glyph.
+    m_btn_loop = new StateButton("mw_loop", "⟳", new BMessage(MSG_MW_LOOP));
     m_btn_loop->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+    m_btn_loop->SetGlyph(StateButton::GLYPH_LOOP);
+    m_btn_loop->SetActiveColor((rgb_color){140, 230, 140, 255}, (rgb_color){16, 16, 16, 255});
     BButton *btn_pause = new BButton("mw_pause", "||", new BMessage(MSG_MW_PAUSE));
     BButton *btn_stop = new BButton("mw_stop", "■", new BMessage(MSG_MW_STOP));
     m_time_label = new BStringView("mw_time", "00:00.0");

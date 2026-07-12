@@ -1,5 +1,7 @@
 #include "TrackStripView.h"
 
+#include "StateButton.h"
+
 #include <Button.h>
 #include <LayoutBuilder.h>
 #include <MenuField.h>
@@ -15,7 +17,6 @@
 #include <string.h>
 
 #include "engine/jackdaw-engine.h"
-#include "FxWindow.h"
 #include "KnobView.h"
 #include "Messages.h"
 #include "TimelineView.h"  // kTimelineTrackHeight (row geometry for the reorder drag)
@@ -62,17 +63,25 @@ TrackStripView::TrackStripView(JackDawProject *project, JackDawTrack *track, con
     m_name =
         new BTextControl("name", NULL, jackdaw_track_get_name(track), new BMessage(MSG_S_NAME));
 
-    m_arm = new BButton("A", "A", new BMessage(MSG_S_ARM));
-    m_mute = new BButton("M", "M", new BMessage(MSG_S_MUTE));
-    m_solo = new BButton("S", "S", new BMessage(MSG_S_SOLO));
+    m_arm = new StateButton("A", "A", new BMessage(MSG_S_ARM));
+    m_mute = new StateButton("M", "M", new BMessage(MSG_S_MUTE));
+    m_solo = new StateButton("S", "S", new BMessage(MSG_S_SOLO));
     m_stereo = new BButton("Mo", "Mo", new BMessage(MSG_S_STEREO));
-    m_fx = new BButton("Fx", "Fx", new BMessage(MSG_S_FX));
+    m_fx = new StateButton("Fx", "Fx", new BMessage(MSG_S_FX));
     m_arm->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_mute->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_solo->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_stereo->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_fx->SetToolTip("Effects (VST3 chain)");
-    for (BButton *b : {m_arm, m_mute, m_solo, m_stereo, m_fx}) {
+    // Active-state colours: Arm red, Mute orange, Solo yellow (dark text), Fx
+    // blue whenever the track carries an effect chain (set in SyncFromTrack).
+    m_arm->SetActiveColor((rgb_color){192, 57, 43, 255}, (rgb_color){255, 255, 255, 255});
+    m_mute->SetActiveColor((rgb_color){230, 126, 34, 255}, (rgb_color){255, 255, 255, 255});
+    m_solo->SetActiveColor((rgb_color){255, 224, 0, 255}, (rgb_color){16, 16, 16, 255});
+    m_fx->SetActiveColor((rgb_color){41, 128, 185, 255}, (rgb_color){255, 255, 255, 255});
+    m_fx->SetActiveIgnoresValue(true); // momentary: blue tracks fx_count, not the click
+    for (BButton *b :
+         {(BButton *)m_arm, (BButton *)m_mute, (BButton *)m_solo, m_stereo, (BButton *)m_fx}) {
         b->SetExplicitMinSize(BSize(24.0f, 20.0f));
         b->SetExplicitMaxSize(BSize(30.0f, 20.0f));
     }
@@ -196,6 +205,9 @@ void TrackStripView::SyncFromTrack()
     m_arm->SetValue(jackdaw_track_is_armed(m_track) ? B_CONTROL_ON : B_CONTROL_OFF);
     m_mute->SetValue(jackdaw_track_is_muted(m_track) ? B_CONTROL_ON : B_CONTROL_OFF);
     m_solo->SetValue(jackdaw_track_is_soloed(m_track) ? B_CONTROL_ON : B_CONTROL_OFF);
+    // Fx is a momentary button (opens the Fx window); tint it blue whenever the
+    // track carries an effect chain.
+    m_fx->SetForcedActive(jackdaw_track_fx_count(m_track) > 0);
     bool instrument = jackdaw_track_is_instrument(m_track);
     bool stereo = jackdaw_track_is_stereo(m_track);
     m_stereo->SetValue(stereo ? B_CONTROL_ON : B_CONTROL_OFF);
@@ -387,15 +399,11 @@ void TrackStripView::MessageReceived(BMessage *message)
             break;
         }
         case MSG_S_FX: {
-            // One FX window per track: raise it if it is still open (the
-            // messenger goes invalid when the window quits), else create it.
-            if (m_fx_window.IsValid()) {
-                m_fx_window.SendMessage('fxrs');
-            } else {
-                FxWindow *win = new FxWindow(m_track);
-                m_fx_window = BMessenger(win);
-                win->Show();
-            }
+            // FX windows are owned by the main window (one per track, shared with
+            // the mixer's Fx button); ask it to open/raise this track's window.
+            BMessage m(MSG_OPEN_FX);
+            m.AddPointer("track", m_track);
+            m_main.SendMessage(&m);
             break;
         }
         case MSG_S_INPUT: {

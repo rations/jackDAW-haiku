@@ -25,6 +25,7 @@
 #include "engine/settings.h"
 #include "host/pluginhost.h"
 #include "Messages.h"
+#include "FxWindow.h"
 #include "MetronomeWindows.h"
 #include "MidiWindow.h"
 #include "MixerView.h"
@@ -48,6 +49,10 @@ static void mainwin_tracks_reordered(gpointer, gpointer user)
 
 // UI refresh cadence (playhead readout, ruler/lane playhead redraws).
 static const bigtime_t kTickIntervalUsec = 33000; // ~30 Hz
+
+// Fixed height of the docked mixer pane. Showing it grows the window by this
+// much so the mixer docks under the timeline without shrinking it.
+static const float kDockedMixerH = 250.0f;
 
 // Target for engine events. Written only from the creating thread while the
 // engine hook is unset (constructor / QuitRequested), read by JACK
@@ -211,10 +216,10 @@ MainWindow::MainWindow(JackDawProject *project)
     : BWindow(BRect(100, 100, 1100, 700), "JackDAW", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
       m_project(project), m_transport(NULL), m_timeline(NULL), m_tick_runner(NULL),
       m_metro_volume_window(NULL), m_countin_window(NULL), m_mixer(NULL), m_mixer_item(NULL),
-      m_mixer_window(NULL), m_mixer_visible(false), m_load_panel(NULL), m_save_panel(NULL),
-      m_open_panel(NULL), m_render_window(NULL), m_render_thread(NULL), m_render_tick(NULL),
-      m_render_method(RENDER_METHOD_OFFLINE), m_render_active(false), m_track_added_h(0),
-      m_track_removed_h(0), m_tracks_reordered_h(0)
+      m_mixer_window(NULL), m_mixer_visible(false), m_dock_h_applied(0.0f), m_load_panel(NULL),
+      m_save_panel(NULL), m_open_panel(NULL), m_render_window(NULL), m_render_thread(NULL),
+      m_render_tick(NULL), m_render_method(RENDER_METHOD_OFFLINE), m_render_active(false),
+      m_track_added_h(0), m_track_removed_h(0), m_tracks_reordered_h(0)
 {
     memset(&m_render_prog, 0, sizeof(m_render_prog));
     // Restore the saved window frame (defaults match the BWindow rect above).
@@ -232,8 +237,11 @@ MainWindow::MainWindow(JackDawProject *project)
     m_transport = new TransportView(project);
     m_timeline = new TimelineView(project);
     m_mixer = new MixerView(project, BMessenger(this));
-    m_mixer->SetExplicitMinSize(BSize(B_SIZE_UNSET, 250.0f));
-    m_mixer->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, 320.0f));
+    // The docked mixer is a fixed-height pane: showing it grows the window by
+    // exactly this height (docking under the timeline without shrinking it),
+    // hiding it shrinks the window back. See ApplyMixerState.
+    m_mixer->SetExplicitMinSize(BSize(B_SIZE_UNSET, kDockedMixerH));
+    m_mixer->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, kDockedMixerH));
 
     // No JACK status bar: server health/xrun monitoring is the patchbay's job
     // (JackGraph), matching the Linux JackDAW main window.
@@ -284,8 +292,19 @@ void MainWindow::ApplyMixerState()
     bool want_dock = m_mixer_visible && !in_window;
     bool want_win = m_mixer_visible && in_window;
 
-    if (m_mixer_item)
+    if (m_mixer_item) {
         m_mixer_item->SetVisible(want_dock);
+        // Dock the fixed-height mixer *under* the timeline without shrinking it:
+        // grow the window by the pane height when showing, shrink it back when
+        // hiding. Tracked so repeated ApplyMixerState calls (e.g. dock<->window
+        // switches) never double-count the delta.
+        float target = want_dock ? kDockedMixerH : 0.0f;
+        float delta = target - m_dock_h_applied;
+        if (delta != 0.0f) {
+            ResizeBy(0.0f, delta);
+            m_dock_h_applied = target;
+        }
+    }
 
     if (want_win) {
         if (m_mixer_window == NULL)
@@ -500,6 +519,10 @@ void MainWindow::DeleteTrack(JackDawTrack *track)
     MidiWindow *mw = (MidiWindow *)g_object_get_data(G_OBJECT(track), "midi-window");
     if (mw)
         mw->PostMessage(B_QUIT_REQUESTED);
+    // Likewise close the track's FX window (it also holds its own GObject ref).
+    FxWindow *fw = (FxWindow *)g_object_get_data(G_OBJECT(track), "fx-window");
+    if (fw)
+        fw->PostMessage(B_QUIT_REQUESTED);
     // Clear the RT slot before dropping the last GObject ref.
     jackdaw_engine_remove_track(track);
     jackdaw_project_remove_track(m_project, track);
@@ -536,6 +559,45 @@ void MainWindow::UnregisterMidiEditor(MidiWindow *w)
             m_midi_editors.erase(m_midi_editors.begin() + i);
             return;
         }
+    }
+}
+
+// One FX window per track (like the MIDI editors): raise it if already open,
+// else create it. Both the track strip and the mixer strip route here so a
+// track never ends up with two FX windows.
+void MainWindow::OpenFxEditor(JackDawTrack *track)
+{
+    if (!track)
+        return;
+    FxWindow *w = (FxWindow *)g_object_get_data(G_OBJECT(track), "fx-window");
+    if (w) {
+        w->PostMessage('fxrs'); // MSG_FX_RAISE: re-activate the existing window
+        return;
+    }
+    w = new FxWindow(track, this);
+    g_object_set_data(G_OBJECT(track), "fx-window", w);
+    m_fx_windows.push_back(w);
+    w->Show();
+}
+
+void MainWindow::UnregisterFxWindow(FxWindow *w)
+{
+    for (size_t i = 0; i < m_fx_windows.size(); i++) {
+        if (m_fx_windows[i] == w) {
+            m_fx_windows.erase(m_fx_windows.begin() + i);
+            return;
+        }
+    }
+}
+
+void MainWindow::CloseAllFxWindows()
+{
+    for (size_t i = 0; i < m_fx_windows.size(); i++)
+        m_fx_windows[i]->PostMessage(B_QUIT_REQUESTED);
+    for (int spin = 0; !m_fx_windows.empty() && spin < 2000; spin++) {
+        Unlock();
+        snooze(1000);
+        Lock();
     }
 }
 
@@ -669,6 +731,7 @@ void MainWindow::OpenProject(const char *path)
     jackdaw_engine_stop_playback();
     jackdaw_engine_locate(0);
     CloseAllMidiEditors();
+    CloseAllFxWindows();
     if (m_timeline && m_timeline->TrackArea())
         m_timeline->TrackArea()->ClearSectionSelection();
     jackdaw_project_clear_selection(m_project);
@@ -694,6 +757,7 @@ void MainWindow::NewSession()
     jackdaw_engine_stop_playback();
     jackdaw_engine_locate(0);
     CloseAllMidiEditors();
+    CloseAllFxWindows();
     if (m_timeline && m_timeline->TrackArea())
         m_timeline->TrackArea()->ClearSectionSelection();
     jackdaw_project_clear_selection(m_project);
@@ -985,6 +1049,10 @@ void MainWindow::MessageReceived(BMessage *message)
             break;
         case MSG_TRANSPORT_RTZ:
             jackdaw_engine_locate(0);
+            // Return the view to the start with the playhead (mirrors the MIDI
+            // window's LocateStart, which resets its horizontal origin too).
+            if (m_timeline)
+                m_timeline->SetViewStart(0);
             break;
         case MSG_TRANSPORT_STEP_BACK:
             StepCursor(-1);
@@ -1286,6 +1354,32 @@ void MainWindow::MessageReceived(BMessage *message)
             break;
         }
 
+        case MSG_OPEN_FX: {
+            JackDawTrack *t = NULL;
+            if (message->FindPointer("track", (void **)&t) == B_OK && t && TrackInProject(t))
+                OpenFxEditor(t);
+            break;
+        }
+
+        case MSG_MIX_FX: {
+            int32 slot = -1;
+            message->FindInt32("slot", &slot);
+            if (JackDawTrack *t = TrackForSlot(slot))
+                OpenFxEditor(t);
+            break;
+        }
+
+        case MSG_FX_CHAIN_CHANGED: {
+            // An FX window added/removed a plug-in: refresh the owning track's
+            // strip (via its state-changed signal, handled on this looper) and
+            // the mixer strips (Fx tint follows fx_count).
+            JackDawTrack *t = NULL;
+            if (message->FindPointer("track", (void **)&t) == B_OK && t && TrackInProject(t))
+                g_signal_emit_by_name(t, "state-changed");
+            SyncMixers();
+            break;
+        }
+
         case MSG_MIDI_LOCATE: {
             // Seek requested from a piano-roll ruler (engine mutation runs here,
             // the single-mutator looper).
@@ -1337,10 +1431,13 @@ bool MainWindow::QuitRequested()
     // Persist the window frame for next launch.
     {
         BRect f = Frame();
+        // The mixer always launches hidden, so persist the height *without* any
+        // currently-docked mixer pane; otherwise the docked height would
+        // accumulate into the saved frame across sessions.
         settings_set_uint32("win_x", (guint32)(gint32)f.left);
         settings_set_uint32("win_y", (guint32)(gint32)f.top);
         settings_set_uint32("win_w", (guint32)f.Width());
-        settings_set_uint32("win_h", (guint32)f.Height());
+        settings_set_uint32("win_h", (guint32)(f.Height() - m_dock_h_applied));
         settings_save();
     }
 

@@ -8,6 +8,7 @@ class BButton;
 class BCheckBox;
 class BStringView;
 class ContextButton;
+class StateButton;
 class StepperControl;
 
 // Transport bar (two rows, fixed metrics so it never re-flows on state change):
@@ -42,8 +43,8 @@ private:
     BButton *m_step_back;
     BButton *m_step_fwd;
     BButton *m_next_button;
-    BButton *m_play_button;
-    BButton *m_loop_button;
+    StateButton *m_play_button;
+    StateButton *m_loop_button;
     BButton *m_pause_button;
     BButton *m_stop_button;
     ContextButton *m_record_button;

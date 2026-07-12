@@ -13,6 +13,7 @@ class BMenuBar;
 class BMessageRunner;
 class BPoint;
 class CountInWindow;
+class FxWindow;
 class MetroVolumeWindow;
 class MidiWindow;
 class MixerView;
@@ -39,6 +40,7 @@ public:
     // back is async PostMessage only. Unregister runs on the editor's thread
     // (its destructor) while holding this window's lock.
     void UnregisterMidiEditor(MidiWindow *w);
+    void UnregisterFxWindow(FxWindow *w);
 
 private:
     BMenuBar *BuildMenuBar();
@@ -59,13 +61,15 @@ private:
     void LoadFileAsTrack(const char *path);
 
     // Project save/load (single-mutator: all engine/project edits run here).
-    void SaveProjectTo(const char *path); // write bundle, update title + last-project
-    void ShowSaveAsPanel();               // save panel seeded with the current name
-    void ShowOpenPanel();                 // open panel in the projects dir
-    void OpenProject(const char *path);   // stop, tear down, load, rebuild UI
-    void NewSession();                    // clear all tracks; reset to defaults
-    void UpdateTitle();                   // window title from the project file name
-    void CloseAllMidiEditors();           // async-quit every piano-roll + drain
+    void SaveProjectTo(const char *path);   // write bundle, update title + last-project
+    void ShowSaveAsPanel();                 // save panel seeded with the current name
+    void ShowOpenPanel();                   // open panel in the projects dir
+    void OpenProject(const char *path);     // stop, tear down, load, rebuild UI
+    void NewSession();                      // clear all tracks; reset to defaults
+    void UpdateTitle();                     // window title from the project file name
+    void CloseAllMidiEditors();             // async-quit every piano-roll + drain
+    void OpenFxEditor(JackDawTrack *track); // one FX window per track (raise if open)
+    void CloseAllFxWindows();               // async-quit every FX window + drain
 
     // Render/export dialog (P11); region=TRUE renders the loop-tab selection.
     void OpenRenderDialog(bool region);
@@ -105,6 +109,7 @@ private:
     BLayoutItem *m_mixer_item;   // its layout slot (for collapse)
     MixerWindow *m_mixer_window; // detached window (NULL until first detach)
     bool m_mixer_visible;        // user toggled the mixer on
+    float m_dock_h_applied;      // window height added for the docked mixer (0 = none)
 
     BFilePanel *m_load_panel; // "Load File as New Track" open panel (lazy)
     BFilePanel *m_save_panel; // "Save Project As" save panel (lazy)
@@ -121,6 +126,7 @@ private:
 
     // Open piano-roll editors (guarded by this window's looper lock).
     std::vector<MidiWindow *> m_midi_editors;
+    std::vector<FxWindow *> m_fx_windows;
 
     gulong m_track_added_h;
     gulong m_track_removed_h;

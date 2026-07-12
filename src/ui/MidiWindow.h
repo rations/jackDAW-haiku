@@ -13,6 +13,7 @@ class BButton;
 class BMessageRunner;
 class BScrollBar;
 class BStringView;
+class StateButton;
 class MidiRollView;
 class MidiKeysView;
 class MidiVelView;
@@ -150,7 +151,7 @@ private:
     BScrollBar *m_hscroll;
     BScrollBar *m_vscroll;
     BButton *m_btn_play;
-    BButton *m_btn_loop;
+    StateButton *m_btn_loop;
     BButton *m_btn_snap;
     BStringView *m_time_label;
     BMessageRunner *m_runner;

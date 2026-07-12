@@ -17,6 +17,7 @@
 #include "engine/tempomap.h"
 #include "engine/timeruler.h"
 #include "Messages.h"
+#include "StateButton.h"
 #include "StepperControl.h"
 
 // Timecode formats cycled by clicking the position readout (time-ruler mode).
@@ -25,14 +26,15 @@ static const int32 kTimeModes[] = {TIMEMODE_REALLONG, TIMEMODE_REAL,  TIMEMODE_S
                                    TIMEMODE_30FPS};
 static const int kNumTimeModes = (int)(sizeof(kTimeModes) / sizeof(kTimeModes[0]));
 
-// A BButton that, on a right-click, posts a context-menu trigger (with the
+// A StateButton that, on a right-click, posts a context-menu trigger (with the
 // screen point) to its window instead of invoking/toggling. Used for the
-// Record, Metro and Mixer buttons.
-class ContextButton : public BButton
+// Record, Metro and Mixer buttons. Deriving from StateButton lets Record carry
+// the red active tint + ring/bullseye glyph while keeping the right-click menu.
+class ContextButton : public StateButton
 {
 public:
     ContextButton(const char *name, const char *label, BMessage *invoke, uint32 context_what)
-        : BButton(name, label, invoke), m_context_what(context_what)
+        : StateButton(name, label, invoke), m_context_what(context_what)
     {
     }
 
@@ -93,8 +95,11 @@ TransportView::TransportView(JackDawProject *project)
     m_step_back = new BButton("|<<", new BMessage(MSG_TRANSPORT_STEP_BACK));
     m_step_fwd = new BButton(">>|", new BMessage(MSG_TRANSPORT_STEP_FWD));
     m_next_button = new BButton("▶|", new BMessage(MSG_TRANSPORT_NEXT_BOUNDARY));
-    m_play_button = new BButton("▶", new BMessage(MSG_TRANSPORT_PLAY));
-    m_loop_button = new BButton("⟳", new BMessage(MSG_TRANSPORT_LOOP));
+    // Loop and Record keep their glyph as a label for layout sizing only; the
+    // glyph itself is vector-drawn (StateButton::GLYPH_*), so the label text is
+    // never painted (the "⟳" tofu the default font renders never appears).
+    m_play_button = new StateButton("play", "▶", new BMessage(MSG_TRANSPORT_PLAY));
+    m_loop_button = new StateButton("loop", "⟳", new BMessage(MSG_TRANSPORT_LOOP));
     m_pause_button = new BButton("||", new BMessage(MSG_TRANSPORT_PAUSE));
     m_stop_button = new BButton("■", new BMessage(MSG_TRANSPORT_STOP));
     m_record_button =
@@ -103,6 +108,15 @@ TransportView::TransportView(JackDawProject *project)
     m_play_button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_loop_button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
     m_record_button->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+
+    // State colours (match the original: Play green, Loop light-green with a
+    // drawn loop arrow so it never depends on a font glyph, Record red with a
+    // ring/bullseye glyph that differs between normal and punch modes).
+    m_play_button->SetActiveColor((rgb_color){46, 139, 87, 255}, (rgb_color){255, 255, 255, 255});
+    m_loop_button->SetGlyph(StateButton::GLYPH_LOOP);
+    m_loop_button->SetActiveColor((rgb_color){140, 230, 140, 255}, (rgb_color){16, 16, 16, 255});
+    m_record_button->SetGlyph(StateButton::GLYPH_RECORD);
+    m_record_button->SetActiveColor((rgb_color){192, 57, 43, 255}, (rgb_color){255, 255, 255, 255});
 
     ClickableStringView *readout =
         new ClickableStringView("readout", "00:00.000", MSG_CYCLE_TIMEMODE);
@@ -251,6 +265,8 @@ void TransportView::UpdateReadout()
     // menu, count-in hand-off or loop, not only the buttons themselves).
     m_play_button->SetValue((playing || counting) ? B_CONTROL_ON : B_CONTROL_OFF);
     m_record_button->SetValue(recording ? B_CONTROL_ON : B_CONTROL_OFF);
+    m_record_button->SetRecordState(recording,
+                                    jackdaw_engine_get_record_mode() == RECORD_MODE_PUNCH);
     m_loop_button->SetValue(jackdaw_engine_get_loop_enabled() ? B_CONTROL_ON : B_CONTROL_OFF);
 }
 

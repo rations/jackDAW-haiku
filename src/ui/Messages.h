@@ -96,6 +96,13 @@ enum {
     MSG_MIX_SET_PAN = 'mxpn',     // float "pan"
     MSG_MIX_TOGGLE_MUTE = 'mxmu', // bool  "on"
     MSG_MIX_TOGGLE_SOLO = 'mxso', // bool  "on"
+    MSG_MIX_FX = 'mxfx',          // open/raise the FX window for int32 "slot"
+
+    // FX window ownership lives in MainWindow (one per track, like the MIDI
+    // editors): a track strip / mixer strip asks it to open, and the FX window
+    // reports chain edits back so the strips can refresh their blue Fx state.
+    MSG_OPEN_FX = 'opfx',          // pointer "track": open/raise that track's FX window
+    MSG_FX_CHAIN_CHANGED = 'fxcc', // pointer "track": chain add/remove happened
 
     // Menu bar — Options.
     MSG_OPT_IO = 'oint',

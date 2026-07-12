@@ -87,6 +87,17 @@ TrackAreaView::TrackAreaView(TimelineView *timeline)
 {
     m_clipboard = clip_region_list_new();
     m_midi_clipboard = midi_region_list_new();
+
+    // Report a small, content-independent minimum. A custom BView that overrides
+    // no size hook falls back to BView::GetPreferredSize, which returns the view's
+    // *current* bounds — so its reported minimum ratchets upward with the window
+    // and grows the main window taller as tracks are added instead of letting the
+    // area scroll. Pin the minimum to a single row and leave the maximum
+    // unlimited: the area still expands to fill the available height and scrolls
+    // its stacked strips internally beyond that (the vertical scrollbar's range
+    // comes from ContentHeight vs. the visible height).
+    SetExplicitMinSize(BSize(kTimelineHeaderWidth + 60.0f, kTimelineTrackHeight));
+    SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
 }
 
 TrackAreaView::~TrackAreaView()

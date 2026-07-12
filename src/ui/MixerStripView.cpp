@@ -9,6 +9,7 @@
 #include "FaderView.h"
 #include "KnobView.h"
 #include "Messages.h"
+#include "StateButton.h"
 #include "VuView.h"
 
 enum {
@@ -16,11 +17,12 @@ enum {
     MSG_M_SOLO = 'msol',
     MSG_M_PAN = 'mpan',
     MSG_M_FADER = 'mfad',
+    MSG_M_FX = 'mmfx',
 };
 
 MixerStripView::MixerStripView(JackDawProject *project, JackDawTrack *track, const BMessenger &main)
     : BView("mixer_strip", B_WILL_DRAW), m_project(project), m_track(track), m_main(main),
-      m_name(NULL), m_mute(NULL), m_solo(NULL), m_pan(NULL), m_fader(NULL), m_vu(NULL)
+      m_name(NULL), m_mute(NULL), m_solo(NULL), m_fx(NULL), m_pan(NULL), m_fader(NULL), m_vu(NULL)
 {
     const char *label = track ? jackdaw_track_get_name(track) : "Master";
     m_name = new BStringView("name", label);
@@ -56,16 +58,32 @@ MixerStripView::MixerStripView(JackDawProject *project, JackDawTrack *track, con
     // track concept only (soloing the master would be a no-op against the solo
     // bus), matching the Linux mixer strip.
     BSize btn(26.0f, 22.0f); // fix min+max so the buttons never widen the strip
-    m_mute = new BButton("M", "M", new BMessage(MSG_M_MUTE));
+    m_mute = new StateButton("M", "M", new BMessage(MSG_M_MUTE));
     m_mute->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+    m_mute->SetActiveColor((rgb_color){230, 126, 34, 255}, (rgb_color){255, 255, 255, 255});
     m_mute->SetExplicitMinSize(btn);
     m_mute->SetExplicitMaxSize(btn);
     if (track) {
-        m_solo = new BButton("S", "S", new BMessage(MSG_M_SOLO));
+        m_solo = new StateButton("S", "S", new BMessage(MSG_M_SOLO));
         m_solo->SetBehavior(BButton::B_TOGGLE_BEHAVIOR);
+        m_solo->SetActiveColor((rgb_color){255, 224, 0, 255}, (rgb_color){16, 16, 16, 255});
         m_solo->SetExplicitMinSize(btn);
         m_solo->SetExplicitMaxSize(btn);
-        col.AddGroup(B_HORIZONTAL, 3.0f).AddGlue().Add(m_mute).Add(m_solo).AddGlue().End();
+        // Fx: opens this track's FX window (via MainWindow, shared with the track
+        // strip); tinted blue whenever the track carries an effect chain.
+        m_fx = new StateButton("Fx", "Fx", new BMessage(MSG_M_FX));
+        m_fx->SetActiveColor((rgb_color){41, 128, 185, 255}, (rgb_color){255, 255, 255, 255});
+        m_fx->SetActiveIgnoresValue(true); // momentary: blue tracks fx_count, not the click
+        m_fx->SetToolTip("Effects (VST3 chain)");
+        m_fx->SetExplicitMinSize(btn);
+        m_fx->SetExplicitMaxSize(btn);
+        col.AddGroup(B_HORIZONTAL, 3.0f)
+            .AddGlue()
+            .Add(m_mute)
+            .Add(m_solo)
+            .Add(m_fx)
+            .AddGlue()
+            .End();
     } else {
         col.AddGroup(B_HORIZONTAL, 3.0f).AddGlue().Add(m_mute).AddGlue().End();
     }
@@ -86,6 +104,8 @@ void MixerStripView::AttachedToWindow()
         m_mute->SetTarget(this);
     if (m_solo)
         m_solo->SetTarget(this);
+    if (m_fx)
+        m_fx->SetTarget(this);
     if (m_pan)
         m_pan->SetTarget(this);
     Sync();
@@ -110,6 +130,8 @@ void MixerStripView::Sync()
             m_solo->SetValue(jackdaw_track_is_soloed(m_track) ? B_CONTROL_ON : B_CONTROL_OFF);
         if (m_pan)
             m_pan->SetValue((double)jackdaw_track_get_pan(m_track));
+        if (m_fx)
+            m_fx->SetForcedActive(jackdaw_track_fx_count(m_track) > 0);
         m_fader->SetGain(jackdaw_track_get_fader(m_track));
     } else {
         m_fader->SetGain(jackdaw_project_get_master_volume(m_project));
@@ -161,6 +183,14 @@ void MixerStripView::MessageReceived(BMessage *message)
             BMessage m(MSG_MIX_TOGGLE_SOLO);
             m.AddInt32("slot", Slot());
             m.AddBool("on", m_solo->Value() == B_CONTROL_ON);
+            m_main.SendMessage(&m);
+            break;
+        }
+        case MSG_M_FX: {
+            // Ask MainWindow (the FX-window owner) to open/raise this track's
+            // window, keyed by slot so it can resolve the track on its looper.
+            BMessage m(MSG_MIX_FX);
+            m.AddInt32("slot", Slot());
             m_main.SendMessage(&m);
             break;
         }

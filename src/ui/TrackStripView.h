@@ -11,6 +11,7 @@ class BMenuField;
 class BPopUpMenu;
 class BTextControl;
 class KnobView;
+class StateButton;
 class VuView;
 
 // One track's header strip (the 235 px column left of its timeline lane): name
@@ -49,11 +50,11 @@ private:
     BMessenger m_main;
 
     BTextControl *m_name;
-    BButton *m_arm;
-    BButton *m_mute;
-    BButton *m_solo;
+    StateButton *m_arm;
+    StateButton *m_mute;
+    StateButton *m_solo;
     BButton *m_stereo; // Mo <-> St
-    BButton *m_fx;     // opens this track's FxWindow
+    StateButton *m_fx; // opens this track's FxWindow (blue when it carries a chain)
     KnobView *m_vol;   // trim (V)
     KnobView *m_pan;   // pan (P)
     BMenuField *m_input_field;
@@ -62,9 +63,6 @@ private:
 
     gulong m_state_handler;   // track "state-changed" -> SyncFromTrack
     gulong m_routing_handler; // track "routing-changed" -> SyncFromTrack
-
-    // This track's FX chain window; invalid once the user closes it.
-    BMessenger m_fx_window;
 
     // Drag-to-reorder gesture state (a Haiku-port addition; the Linux UI has no
     // track-reorder drag). A left-press primes a drag; once the pointer moves

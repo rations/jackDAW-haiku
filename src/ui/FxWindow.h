@@ -17,6 +17,7 @@ class BMessageRunner;
 class BPopUpMenu;
 class BSlider;
 class BStringView;
+class MainWindow;
 
 typedef struct PluginInstance PluginInstance;
 
@@ -34,13 +35,16 @@ typedef struct PluginInstance PluginInstance;
 class FxWindow : public BWindow
 {
 public:
-    FxWindow(JackDawTrack *track);
+    FxWindow(JackDawTrack *track, MainWindow *main);
     virtual ~FxWindow();
 
     virtual void MessageReceived(BMessage *message);
 
 private:
     void BuildAddMenu();
+    // Tell the main window the chain gained/lost a plug-in so the track + mixer
+    // strips can refresh their blue Fx state.
+    void NotifyChainChanged();
     void RebuildChainList(int select);
     void RebuildParamPanel();
     void BuildDrumRack(PluginInstance *inst);
@@ -51,6 +55,7 @@ private:
     PluginInstance *Selected();
 
     JackDawTrack *m_track;
+    MainWindow *m_main; // owner; borrowed (posts chain-changed, unregisters on close)
 
     BMenuField *m_add_field;
     BPopUpMenu *m_add_menu;

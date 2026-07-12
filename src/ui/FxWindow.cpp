@@ -23,6 +23,8 @@
 #include <string.h>
 
 #include "host/pluginhost.h"
+#include "MainWindow.h"
+#include "Messages.h"
 
 // ---------------------------------------------------------------------------
 // Scrollable parameter panel. The parameter list varies wildly between
@@ -139,10 +141,10 @@ enum {
 
 static const int32 kSliderSteps = 1000; // BSlider is integer; params are [0,1]
 
-FxWindow::FxWindow(JackDawTrack *track)
+FxWindow::FxWindow(JackDawTrack *track, MainWindow *main)
     : BWindow(BRect(0, 0, 900, 460), "Effects", B_TITLED_WINDOW,
               B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE),
-      m_track(track), m_file_panel(NULL), m_save_panel(NULL), m_preset_save(NULL),
+      m_track(track), m_main(main), m_file_panel(NULL), m_save_panel(NULL), m_preset_save(NULL),
       m_preset_load(NULL), m_model_label(NULL), m_ir_label(NULL), m_learn_slot(-1),
       m_learn_poll(NULL)
 {
@@ -217,7 +219,24 @@ FxWindow::~FxWindow()
     delete m_learn_poll;
     delete m_file_panel;
     delete m_save_panel;
+    // Deregister from the track + main window under the main lock (idempotent:
+    // only if this window is still the registered FX window). Runs on whichever
+    // thread called Quit(); the main window's shutdown path drops its own lock
+    // while waiting for this rather than locking FX windows (mirrors the piano-
+    // roll editor handshake).
+    m_main->Lock();
+    if (g_object_get_data(G_OBJECT(m_track), "fx-window") == this)
+        g_object_set_data(G_OBJECT(m_track), "fx-window", NULL);
+    m_main->UnregisterFxWindow(this);
+    m_main->Unlock();
     g_object_unref(m_track);
+}
+
+void FxWindow::NotifyChainChanged()
+{
+    BMessage m(MSG_FX_CHAIN_CHANGED);
+    m.AddPointer("track", m_track);
+    BMessenger(m_main).SendMessage(&m);
 }
 
 PluginInstance *FxWindow::Selected()
@@ -545,6 +564,7 @@ void FxWindow::MessageReceived(BMessage *message)
             }
             jackdaw_track_fx_add(m_track, inst);
             RebuildChainList((int)jackdaw_track_fx_count(m_track) - 1);
+            NotifyChainChanged();
             break;
         }
 
@@ -559,6 +579,7 @@ void FxWindow::MessageReceived(BMessage *message)
             jackdaw_track_fx_remove(m_track, (guint)sel);
             guint n = jackdaw_track_fx_count(m_track);
             RebuildChainList(n > 0 ? MIN((int)n - 1, (int)sel) : -1);
+            NotifyChainChanged();
             break;
         }
 
