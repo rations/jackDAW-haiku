@@ -26,6 +26,7 @@
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 
 #include "idrumloader.h"
@@ -119,6 +120,14 @@ struct Vst3Backend {
     int max_block = 0;
     std::vector<ParamID> param_ids;
     char class_uid[16] = {0}; /* VST3 class CID, for preset-file identity guard */
+
+    /* MIDI CC / pitch-bend delivery (IMidiMapping). Built at load (non-RT):
+     * midi_map is the queried interface; cc_param[ch*kCountCtrlNumber + cn] is
+     * the ParamID a given channel + controller number maps to, valid when the
+     * matching cc_valid byte is set. Read-only on the RT thread. */
+    IPtr<IMidiMapping> midi_map;
+    std::vector<ParamID> cc_param;
+    std::vector<uint8> cc_valid;
 };
 
 struct PluginInstance {
@@ -453,6 +462,28 @@ extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
         DRUMku::IDrumLoader *dl = nullptr;
         if (b->controller->queryInterface(DRUMku::IDrumLoader_iid, (void **)&dl) == kResultOk && dl)
             b->drum_loader = owned(dl);
+
+        /* MIDI CC / pitch-bend routing: if the controller implements
+         * IMidiMapping, pre-build the (channel, controller#) -> ParamID table so
+         * the RT MIDI path can turn CC/bend into input parameter changes without
+         * querying (getMidiControllerAssignment is UI-thread only) or allocating.
+         * Plug-ins without the interface are unaffected (no table, CC ignored). */
+        IMidiMapping *mm = nullptr;
+        if (b->controller->queryInterface(IMidiMapping::iid, (void **)&mm) == kResultOk && mm) {
+            b->midi_map = owned(mm);
+            b->cc_param.assign((size_t)16 * kCountCtrlNumber, 0);
+            b->cc_valid.assign((size_t)16 * kCountCtrlNumber, 0);
+            for (int16 ch = 0; ch < 16; ch++) {
+                for (int cn = 0; cn < kCountCtrlNumber; cn++) {
+                    ParamID id = 0;
+                    if (mm->getMidiControllerAssignment(0, ch, (CtrlNumber)cn, id) == kResultOk) {
+                        size_t idx = (size_t)ch * kCountCtrlNumber + cn;
+                        b->cc_param[idx] = id;
+                        b->cc_valid[idx] = 1;
+                    }
+                }
+            }
+        }
     }
 
     PluginInstance *pi = g_new0(PluginInstance, 1);
@@ -482,6 +513,7 @@ extern "C" void pluginhost_free(PluginInstance *inst)
     if (b) {
         b->file_loader = nullptr; /* before the controller goes away */
         b->drum_loader = nullptr;
+        b->midi_map = nullptr;
         if (b->processor)
             b->processor->setProcessing(false);
         if (b->component)
@@ -616,6 +648,28 @@ extern "C" gboolean pluginhost_is_instrument(PluginInstance *inst)
     return inst ? inst->is_instrument : FALSE;
 }
 
+/* RT: turn one MIDI controller (CC#, pitch-bend, channel pressure) into an input
+ * parameter change for this block, using the IMidiMapping table built at load.
+ * No allocation: in_params was pre-sized to the parameter count (setMaxParameters)
+ * and CC targets are real controller parameters, so addParameterData reuses a
+ * pre-created queue. norm is the already-normalized [0,1] value. */
+static inline void ph_deliver_controller(Vst3Backend *b, int channel, int ctrl_num, double norm,
+                                         int32 offset)
+{
+    if (b->cc_valid.empty() || channel < 0 || channel > 15 || ctrl_num < 0 ||
+        ctrl_num >= kCountCtrlNumber)
+        return;
+    size_t idx = (size_t)channel * kCountCtrlNumber + ctrl_num;
+    if (!b->cc_valid[idx])
+        return;
+    int32 qi = 0;
+    IParamValueQueue *q = b->in_params.addParameterData(b->cc_param[idx], qi);
+    if (q) {
+        int32 pi = 0;
+        q->addPoint(offset, norm, pi);
+    }
+}
+
 extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev,
                                         float *L, float *R, int nframes)
 {
@@ -656,8 +710,21 @@ extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent 
             e.noteOff.pitch = m[1];
             e.noteOff.velocity = (status == 0x80) ? m[2] / 127.0f : 0.0f;
             e.noteOff.noteId = -1;
+        } else if (status == 0xB0) {
+            /* Control change: controller number == raw CC number (0..127). */
+            ph_deliver_controller(b, ch, (int)m[1], (double)m[2] / 127.0, (int32)ev[i].time);
+            continue;
+        } else if (status == 0xE0) {
+            /* Pitch bend: 14-bit little-endian (LSB, MSB) -> normalized 0..1. */
+            int bend = (int)(m[1] & 0x7F) | ((int)(m[2] & 0x7F) << 7);
+            ph_deliver_controller(b, ch, kPitchBend, (double)bend / 16383.0, (int32)ev[i].time);
+            continue;
+        } else if (status == 0xD0) {
+            /* Channel pressure -> kAfterTouch (single data byte). */
+            ph_deliver_controller(b, ch, kAfterTouch, (double)m[1] / 127.0, (int32)ev[i].time);
+            continue;
         } else {
-            continue; /* CC/other: not delivered yet (matches the Linux host) */
+            continue; /* system/other: not mapped */
         }
         b->in_events.addEvent(e);
     }
@@ -896,8 +963,7 @@ extern "C" gboolean pluginhost_preset_load(PluginInstance *inst, const char *pat
         } else if (memcmp(p + PH_PRESET_MAGIC_LEN + 4, inst->b->class_uid, 16) != 0) {
             g_warning("pluginhost: preset is for a different plugin");
         } else {
-            ok = pluginhost_state_load(inst, p + PH_PRESET_HDR_LEN,
-                                       len - PH_PRESET_HDR_LEN);
+            ok = pluginhost_state_load(inst, p + PH_PRESET_HDR_LEN, len - PH_PRESET_HDR_LEN);
         }
     }
 

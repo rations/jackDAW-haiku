@@ -22,12 +22,14 @@
 #include <stdlib.h>
 
 #include "engine/jackdaw-engine.h"
+#include "engine/midicontrol.h"
 #include "engine/settings.h"
 #include "host/pluginhost.h"
 #include "Messages.h"
 #include "FxWindow.h"
 #include "IoWindow.h"
 #include "MetronomeWindows.h"
+#include "MidiControlWindow.h"
 #include "MidiWindow.h"
 #include "MixerView.h"
 #include "MixerWindow.h"
@@ -50,6 +52,21 @@ static void mainwin_tracks_reordered(gpointer, gpointer user)
 
 // UI refresh cadence (playhead readout, ruler/lane playhead redraws).
 static const bigtime_t kTickIntervalUsec = 33000; // ~30 Hz
+
+// Control-surface poll cadence: drains control_in and dispatches mappings. Kept
+// snappy so a footswitch feels responsive; the work is tiny (a ring drain).
+static const bigtime_t kMidiCtlPollUsec = 20000; // ~50 Hz
+
+// midicontrol transport/changed hooks run on the MainWindow looper (the poll
+// tick calls dispatch there), so they can touch this window directly.
+static void midictl_transport_cb(int which, void *user)
+{
+    static_cast<MainWindow *>(user)->MidiCtlTransport(which);
+}
+static void midictl_changed_cb(void *user)
+{
+    static_cast<MainWindow *>(user)->SendMidiCtlSnapshot();
+}
 
 // Fixed height of the docked mixer pane. Showing it grows the window by this
 // much so the mixer docks under the timeline without shrinking it.
@@ -216,11 +233,12 @@ static BMenuItem *AddItem(BMenu *menu, const char *label, uint32 what, char shor
 MainWindow::MainWindow(JackDawProject *project)
     : BWindow(BRect(100, 100, 1100, 700), "JackDAW", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
       m_project(project), m_transport(NULL), m_timeline(NULL), m_tick_runner(NULL),
-      m_metro_volume_window(NULL), m_countin_window(NULL), m_io_window(NULL), m_mixer(NULL),
-      m_mixer_item(NULL), m_mixer_window(NULL), m_mixer_visible(false), m_dock_h_applied(0.0f),
-      m_load_panel(NULL), m_save_panel(NULL), m_open_panel(NULL), m_render_window(NULL),
-      m_render_thread(NULL), m_render_tick(NULL), m_render_method(RENDER_METHOD_OFFLINE),
-      m_render_active(false), m_track_added_h(0), m_track_removed_h(0), m_tracks_reordered_h(0)
+      m_metro_volume_window(NULL), m_countin_window(NULL), m_io_window(NULL),
+      m_midictl_window(NULL), m_midictl_tick(NULL), m_mixer(NULL), m_mixer_item(NULL),
+      m_mixer_window(NULL), m_mixer_visible(false), m_dock_h_applied(0.0f), m_load_panel(NULL),
+      m_save_panel(NULL), m_open_panel(NULL), m_render_window(NULL), m_render_thread(NULL),
+      m_render_tick(NULL), m_render_method(RENDER_METHOD_OFFLINE), m_render_active(false),
+      m_track_added_h(0), m_track_removed_h(0), m_tracks_reordered_h(0)
 {
     memset(&m_render_prog, 0, sizeof(m_render_prog));
     // Restore the saved window frame (defaults match the BWindow rect above).
@@ -271,6 +289,14 @@ MainWindow::MainWindow(JackDawProject *project)
     // missed (both happen on the creating thread, pre-Show).
     g_engine_messenger = BMessenger(this);
     jackdaw_engine_set_event_hook(engine_event_hook, NULL);
+
+    // MIDI control surface: the mapping table lives here (single mutator). Route
+    // transport actions through this window and refresh the dialog after a learn.
+    midicontrol_init();
+    midicontrol_set_transport_cb(midictl_transport_cb, this);
+    midicontrol_set_changed_cb(midictl_changed_cb, this);
+    m_midictl_tick =
+        new BMessageRunner(BMessenger(this), BMessage(MSG_MIDICTL_POLL), kMidiCtlPollUsec);
 }
 
 MainWindow::~MainWindow()
@@ -282,6 +308,8 @@ MainWindow::~MainWindow()
     if (m_tracks_reordered_h)
         g_signal_handler_disconnect(m_project, m_tracks_reordered_h);
     delete m_tick_runner;
+    delete m_midictl_tick;
+    midicontrol_shutdown();
     delete m_load_panel;
     delete m_save_panel;
     delete m_open_panel;
@@ -422,7 +450,7 @@ BMenuBar *MainWindow::BuildMenuBar()
     BMenu *options = new BMenu("Options");
     AddItem(options, "Inputs/Outputs…", MSG_OPT_IO);
     AddItem(options, "Rescan Plugins", MSG_OPT_PLUGINS);
-    AddItem(options, "MIDI Control…", MSG_OPT_MIDI_CONTROL, 0, 0, false);
+    AddItem(options, "MIDI Control…", MSG_OPT_MIDI_CONTROL);
     bar->AddItem(options);
 
     return bar;
@@ -749,6 +777,7 @@ void MainWindow::OpenProject(const char *path)
     if (m_timeline)
         m_timeline->InvalidateAll();
     UpdateTitle();
+    SendMidiCtlSnapshot(); // the load replaced the mapping table
     settings_set_string("last_project", path);
     settings_save();
 }
@@ -775,6 +804,9 @@ void MainWindow::NewSession()
         jackdaw_project_remove_track(m_project, t);
     }
     jackdaw_engine_set_suspended(FALSE);
+
+    midicontrol_clear(); // mappings reference the tracks just removed
+    SendMidiCtlSnapshot();
 
     jackdaw_project_set_master_volume(m_project, 1.0f);
     jackdaw_project_set_master_muted(m_project, FALSE);
@@ -1028,6 +1060,76 @@ void MainWindow::OpenIoWindow()
             m_io_window->Show();
         m_io_window->Activate();
         m_io_window->UnlockLooper();
+    }
+}
+
+void MainWindow::OpenMidiControlWindow()
+{
+    if (m_midictl_window == NULL)
+        m_midictl_window = new MidiControlWindow(BMessenger(this));
+    if (m_midictl_window->LockLooper()) {
+        if (m_midictl_window->IsHidden())
+            m_midictl_window->Show();
+        m_midictl_window->Activate();
+        m_midictl_window->UnlockLooper();
+    }
+    SendMidiCtlSnapshot(); // populate/refresh the dialog's local view
+}
+
+void MainWindow::SendMidiCtlSnapshot()
+{
+    if (m_midictl_window == NULL)
+        return;
+
+    BMessage snap(MSG_MIDICTL_SNAPSHOT);
+    guint n = midicontrol_count();
+    for (guint i = 0; i < n; i++) {
+        MidiCtlMapping *m = midicontrol_get(i);
+        if (m)
+            snap.AddData("map", B_RAW_TYPE, m, sizeof(*m));
+    }
+    guint tc = jackdaw_project_track_count(m_project);
+    for (guint t = 0; t < tc; t++) {
+        JackDawTrack *tr = jackdaw_project_get_track(m_project, t);
+        snap.AddString("track", tr ? jackdaw_track_get_name(tr) : "");
+    }
+    const char **ports = jackdaw_engine_list_midi_ports();
+    if (ports) {
+        for (int p = 0; ports[p]; p++)
+            snap.AddString("port", ports[p]);
+        jackdaw_engine_free_ports(ports);
+    }
+    const gchar *src = jackdaw_engine_get_control_source();
+    snap.AddString("cursource", src ? src : "");
+    snap.AddInt32("learn", midicontrol_get_learn());
+
+    BMessenger(m_midictl_window).SendMessage(&snap);
+}
+
+void MainWindow::MidiControlPoll()
+{
+    // Drain every buffered control event and dispatch it against the mappings.
+    // Bounded by the ring's finite fill; dispatch touches pluginhost/track/
+    // transport, all of which are this looper's to call.
+    JackDawCtlEvent ev;
+    while (jackdaw_engine_control_poll(&ev))
+        midicontrol_dispatch_event(m_project, ev.data, ev.size);
+}
+
+void MainWindow::MidiCtlTransport(int which)
+{
+    switch (which) {
+        case ACT_TRANSPORT_PLAY:
+            TransportToggle();
+            break;
+        case ACT_TRANSPORT_STOP:
+            TransportStop();
+            break;
+        case ACT_TRANSPORT_REC:
+            TransportRecord();
+            break;
+        default:
+            break;
     }
 }
 
@@ -1293,6 +1395,71 @@ void MainWindow::MessageReceived(BMessage *message)
             break;
         }
 
+        case MSG_OPT_MIDI_CONTROL:
+            OpenMidiControlWindow();
+            break;
+
+        // Control-surface poll tick: drain control_in and dispatch mappings.
+        case MSG_MIDICTL_POLL:
+            MidiControlPoll();
+            break;
+
+        // Dialog -> here (single mutator for the mapping table + engine). Each
+        // applies the edit, then pushes a fresh snapshot back to the dialog.
+        case MSG_MIDICTL_ADD:
+            midicontrol_add(NULL);
+            SendMidiCtlSnapshot();
+            break;
+        case MSG_MIDICTL_REMOVE: {
+            int32 index = -1;
+            message->FindInt32("index", &index);
+            if (index >= 0)
+                midicontrol_remove((guint)index);
+            SendMidiCtlSnapshot();
+            break;
+        }
+        case MSG_MIDICTL_LEARN: {
+            int32 index = -1;
+            message->FindInt32("index", &index);
+            midicontrol_set_learn(index);
+            SendMidiCtlSnapshot();
+            break;
+        }
+        case MSG_MIDICTL_UPDATE: {
+            int32 index = -1;
+            message->FindInt32("index", &index);
+            MidiCtlMapping *m = index >= 0 ? midicontrol_get((guint)index) : NULL;
+            if (m) {
+                int32 v;
+                if (message->FindInt32("msg_type", &v) == B_OK)
+                    m->msg_type = (guint8)v;
+                if (message->FindInt32("channel", &v) == B_OK)
+                    m->channel = (gint8)v;
+                if (message->FindInt32("number", &v) == B_OK)
+                    m->number = (guint8)v;
+                if (message->FindInt32("action", &v) == B_OK)
+                    m->action = (guint8)CLAMP(v, 0, ACT_NACTIONS - 1);
+                if (message->FindInt32("track", &v) == B_OK)
+                    m->track_index = v;
+                if (message->FindInt32("fx", &v) == B_OK)
+                    m->fx_index = v;
+                if (message->FindInt32("param", &v) == B_OK)
+                    m->param_index = v;
+                if (message->FindInt32("group", &v) == B_OK)
+                    m->switch_group = v;
+            }
+            // No snapshot: the dialog already reflects these edits locally, and
+            // echoing back would fight the user's in-flight menu/stepper focus.
+            break;
+        }
+        case MSG_MIDICTL_SOURCE: {
+            const char *port = NULL;
+            message->FindString("port", &port);
+            jackdaw_engine_set_control_source(port && *port ? port : NULL);
+            SendMidiCtlSnapshot();
+            break;
+        }
+
         case MSG_OPT_PLUGINS: {
             // Drop the catalog; the next FX-window "Add effect" menu rebuild
             // rescans the VST3 add-on directories out-of-process.
@@ -1541,6 +1708,10 @@ bool MainWindow::QuitRequested()
     if (m_io_window && m_io_window->Lock()) {
         m_io_window->Quit();
         m_io_window = NULL;
+    }
+    if (m_midictl_window && m_midictl_window->Lock()) {
+        m_midictl_window->Quit();
+        m_midictl_window = NULL;
     }
     be_app->PostMessage(B_QUIT_REQUESTED);
     return true;

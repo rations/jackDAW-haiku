@@ -9,6 +9,7 @@
 #include "jackdaw-engine.h"
 #include "host/pluginhost.h"
 #include "midiclip.h"
+#include "midicontrol.h"
 #include "project.h"
 #include "settings.h"
 #include "tempomap.h"
@@ -988,6 +989,9 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
         project_save_fx(kf, t, grp);
     }
 
+    /* Control-surface mappings (reference the track/FX indices saved above). */
+    midicontrol_save_keyfile(kf);
+
     /* Roll the previous save into a single backup, overwritten on each save.
      * Copy (not rename) so the live .jdaw survives if the write below fails. */
     if (g_file_test(jdaw_path, G_FILE_TEST_EXISTS)) {
@@ -1199,6 +1203,9 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
         /* fx chain (incl. the instrument at index 0) */
         project_load_fx(kf, t, grp);
     }
+
+    /* Control-surface mappings (indices validated against the loaded tracks). */
+    midicontrol_load_keyfile(kf);
 
     g_key_file_free(kf);
     g_free(projdir);

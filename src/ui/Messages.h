@@ -110,6 +110,18 @@ enum {
     MSG_OPT_PLUGINS = 'oplg',
     MSG_OPT_MIDI_CONTROL = 'omid',
 
+    // MIDI control surface (Options -> MIDI Control). The mapping table + engine
+    // control_in live on the MainWindow looper (single mutator); the dialog runs
+    // its own looper and only edits a local snapshot, posting mutations here and
+    // receiving a fresh snapshot back. MainWindow polls control_in on a timer.
+    MSG_MIDICTL_POLL = 'mcpl',     // main's own tick: drain control_in + dispatch
+    MSG_MIDICTL_SNAPSHOT = 'mcsn', // main -> dialog: full table + ports + track names
+    MSG_MIDICTL_ADD = 'mcad',      // dialog -> main: append a blank mapping
+    MSG_MIDICTL_REMOVE = 'mcrm',   // dialog -> main: int32 "index"
+    MSG_MIDICTL_LEARN = 'mcln',    // dialog -> main: arm learn for int32 "index" (-1 off)
+    MSG_MIDICTL_UPDATE = 'mcup',   // dialog -> main: int32 "index" + the 8 mapping fields
+    MSG_MIDICTL_SOURCE = 'mcsr',   // dialog -> main: string "port" for control_in ("" = none)
+
     // Engine event hook -> window (posted from JACK notification threads via
     // BMessenger; handlers re-read engine state, payloads carry no pointers).
     MSG_ENGINE_PORTS_CHANGED = 'eprt',

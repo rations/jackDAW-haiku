@@ -86,6 +86,24 @@ const char **jackdaw_engine_list_capture_ports(void);
 const char **jackdaw_engine_list_midi_ports(void);
 void jackdaw_engine_free_ports(const char **ports);
 
+/* --- MIDI control surface input (main thread only) ---
+ * The engine registers a dedicated MIDI input port "control_in", separate from
+ * per-track recording/instrument routing. A footswitch / CC device connects
+ * here; the process callback copies its events into a lock-free ring that the
+ * main thread drains (see midicontrol.c). */
+typedef struct {
+    guint8 size;
+    guint8 data[3];
+} JackDawCtlEvent;
+/* Dequeue one buffered control event. Returns FALSE when none are pending. */
+gboolean jackdaw_engine_control_poll(JackDawCtlEvent *out);
+/* Connect (port_name) or disconnect (NULL/empty) an external MIDI source to
+ * control_in. port_name comes only from jackdaw_engine_list_midi_ports().
+ * Returns FALSE on success, TRUE on failure. */
+gboolean jackdaw_engine_set_control_source(const gchar *port_name);
+/* The currently connected control source port name, or NULL. Borrowed. */
+const gchar *jackdaw_engine_get_control_source(void);
+
 /* --- Audio port-count management (main thread only) ---
  * Grow/shrink the pool of JACK capture (in_N) and master output (out_N) ports,
  * clamped to [1, JACKDAW_MAX_TRACKS] and persisted for the next session. The

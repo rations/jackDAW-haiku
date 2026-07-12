@@ -31,7 +31,7 @@ C_SOURCES   = src/engine/glib_check.c src/engine/message.c src/engine/settings.c
               src/engine/track.c src/engine/project.c src/engine/jackdaw-engine.c \
               src/engine/tempomap.c src/engine/timeruler.c \
               src/engine/audio_clip.c src/engine/clipregion.c src/engine/undo.c \
-              src/engine/midiclip.c src/engine/render.c
+              src/engine/midiclip.c src/engine/render.c src/engine/midicontrol.c
 CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/TransportView.cpp src/ui/TimelineView.cpp src/ui/RulerView.cpp \
               src/ui/TrackAreaView.cpp src/ui/StepperControl.cpp \
@@ -39,7 +39,7 @@ CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/VuView.cpp src/ui/StateButton.cpp src/ui/TrackStripView.cpp src/ui/MixerStripView.cpp \
               src/ui/MixerView.cpp src/ui/MixerWindow.cpp src/ui/RegionGainWindow.cpp \
               src/ui/MidiWindow.cpp src/ui/FxWindow.cpp src/ui/RenderWindow.cpp \
-              src/ui/IoWindow.cpp
+              src/ui/IoWindow.cpp src/ui/MidiControlWindow.cpp
 HOST_SOURCES = src/host/pluginhost.cpp
 
 # SDK sources compiled directly (they are not part of the SDK's static libs;

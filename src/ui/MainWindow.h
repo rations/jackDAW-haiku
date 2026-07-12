@@ -16,6 +16,7 @@ class CountInWindow;
 class FxWindow;
 class IoWindow;
 class MetroVolumeWindow;
+class MidiControlWindow;
 class MidiWindow;
 class MixerView;
 class MixerWindow;
@@ -42,6 +43,11 @@ public:
     // (its destructor) while holding this window's lock.
     void UnregisterMidiEditor(MidiWindow *w);
     void UnregisterFxWindow(FxWindow *w);
+
+    // Invoked by the midicontrol dispatch hooks (which run on this looper via the
+    // control-poll tick): a mapped transport action, and the post-learn refresh.
+    void MidiCtlTransport(int which);
+    void SendMidiCtlSnapshot();
 
 private:
     BMenuBar *BuildMenuBar();
@@ -91,6 +97,15 @@ private:
     // Options -> Inputs/Outputs (lazy singleton; re-synced to live port counts).
     void OpenIoWindow();
 
+    // Options -> MIDI Control surface. The mapping table + engine control_in are
+    // owned here (single mutator); the dialog is a separate-looper view that
+    // posts edits and receives snapshots. The poll tick drains control_in and
+    // dispatches mappings regardless of whether the dialog is open.
+    void OpenMidiControlWindow();
+    void MidiControlPoll(); // drain control_in -> midicontrol_dispatch_event
+    // (MidiCtlTransport / SendMidiCtlSnapshot are public: called from the
+    //  file-static midicontrol callback trampolines.)
+
     // Piano-roll MIDI editor (per-instrument-track window; presents if open).
     void OpenMidiEditor(JackDawTrack *track);
     bool TrackInProject(JackDawTrack *track) const;
@@ -109,6 +124,8 @@ private:
     MetroVolumeWindow *m_metro_volume_window; // NULL until first opened
     CountInWindow *m_countin_window;          // NULL until first opened
     IoWindow *m_io_window;                    // NULL until first opened
+    MidiControlWindow *m_midictl_window;      // NULL until first opened
+    BMessageRunner *m_midictl_tick;           // control_in poll timer
 
     MixerView *m_mixer;          // docked pane
     BLayoutItem *m_mixer_item;   // its layout slot (for collapse)
