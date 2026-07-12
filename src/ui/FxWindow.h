@@ -13,6 +13,7 @@ class BFilePanel;
 class BGroupView;
 class BListView;
 class BMenuField;
+class BMessageRunner;
 class BPopUpMenu;
 class BSlider;
 class BStringView;
@@ -42,6 +43,7 @@ private:
     void BuildAddMenu();
     void RebuildChainList(int select);
     void RebuildParamPanel();
+    void BuildDrumRack(PluginInstance *inst);
     void ClearParamPanel();
     void SyncControlsRow();
     void UpdateValueLabel(guint param);
@@ -60,11 +62,22 @@ private:
     BSlider *m_mix;
     BGroupView *m_param_group;
     BFilePanel *m_file_panel;
+    BFilePanel *m_save_panel; // B_SAVE_PANEL for writing preset files
+    BButton *m_preset_save;
+    BButton *m_preset_load;
 
     std::vector<BSlider *> m_sliders;
     std::vector<BStringView *> m_value_labels;
     BStringView *m_model_label;
     BStringView *m_ir_label;
+
+    // Drum-rack rows (parallel, indexed by slot), plus MIDI-learn state.
+    std::vector<BStringView *> m_drum_file;
+    std::vector<BSlider *> m_drum_vol;
+    std::vector<BCheckBox *> m_drum_learn;
+    std::vector<BStringView *> m_drum_note;
+    int m_learn_slot;             // slot whose Learn is armed, or -1
+    BMessageRunner *m_learn_poll; // polls the RT-captured learn note
 };
 
 #endif // FX_WINDOW_H

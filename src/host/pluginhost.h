@@ -86,6 +86,12 @@ void pluginhost_reset(PluginInstance *inst);
 gboolean pluginhost_state_save(PluginInstance *inst, void **out, gsize *out_len);
 gboolean pluginhost_state_load(PluginInstance *inst, const void *data, gsize len);
 
+/* Presets: write/read this plugin's full state to a .jdpreset file (state blob
+ * wrapped with magic + version + the plugin's VST3 class UID). Load rejects a
+ * file whose UID doesn't match this plugin. Main-thread only. */
+gboolean pluginhost_preset_save(PluginInstance *inst, const char *path);
+gboolean pluginhost_preset_load(PluginInstance *inst, const char *path);
+
 /* Bypass (atomic; read in the RT thread). */
 void pluginhost_set_active(PluginInstance *inst, gboolean on);
 gboolean pluginhost_is_active(PluginInstance *inst);
@@ -120,6 +126,28 @@ enum { PH_FILE_MODEL = 0, PH_FILE_IR = 1 };
 gboolean pluginhost_has_file_loader(PluginInstance *inst);
 gboolean pluginhost_file_get(PluginInstance *inst, int which, char *buf, int buflen);
 gboolean pluginhost_file_set(PluginInstance *inst, int which, const char *path);
+
+/* Drum rack (the IDrumLoader host extension, discovered via queryInterface —
+ * DRUMku implements it). A rack is N slots; each slot loads one .wav sample,
+ * has a volume, and is bound to a MIDI note. The FX window renders a per-slot
+ * row (Load / volume / learn) instead of the generic slider list. All calls are
+ * window-thread only, except the RT-safe learn capture. */
+gboolean ph_drum_is_rack(PluginInstance *inst);
+gint ph_drum_max_slots(void);
+gint ph_drum_slot_count(PluginInstance *inst);           /* visible rows: 1..max */
+void ph_drum_add_slot(PluginInstance *inst);             /* +1 row (capped) */
+gboolean ph_drum_file_get(PluginInstance *inst, int slot, char *buf, int buflen);
+gboolean ph_drum_file_set(PluginInstance *inst, int slot, const char *path);
+float ph_drum_volume_get(PluginInstance *inst, int slot); /* 0..1 */
+void ph_drum_volume_set(PluginInstance *inst, int slot, float v);
+gint ph_drum_note_get(PluginInstance *inst, int slot);    /* MIDI note, or -1 */
+void ph_drum_note_set(PluginInstance *inst, int slot, gint note);
+
+/* MIDI learn: arm capture, then poll for the note the user hit. arm(TRUE)
+ * clears any prior capture; take_note() returns the captured pitch (or -1) and
+ * resets it. The RT MIDI path records the first note-on seen while armed. */
+void ph_drum_learn_arm(PluginInstance *inst, gboolean on);
+gint ph_drum_learn_take_note(PluginInstance *inst);
 
 /* --- Diagnostics (JACKDAW_DIAG) --- */
 /* Mark the calling thread as inside/outside the JACK process callback so the

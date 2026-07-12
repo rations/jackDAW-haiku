@@ -28,6 +28,7 @@
 #include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 
+#include "idrumloader.h"
 #include "inamfileloader.h"
 
 #include "engine/rt_denormal.h"
@@ -109,6 +110,7 @@ struct Vst3Backend {
     IPtr<IEditController> controller;
     IPtr<IAudioProcessor> processor;
     IPtr<NAMku::INamFileLoader> file_loader; /* NULL unless the plug-in has one */
+    IPtr<DRUMku::IDrumLoader> drum_loader;   /* NULL unless the plug-in is a drum rack */
     HostProcessData data;
     ProcessContext ctx;
     ParameterChanges in_params;       /* RT-side, pre-allocated */
@@ -116,6 +118,7 @@ struct Vst3Backend {
     EventList in_events{256};         /* MIDI for instruments, pre-allocated */
     int max_block = 0;
     std::vector<ParamID> param_ids;
+    char class_uid[16] = {0}; /* VST3 class CID, for preset-file identity guard */
 };
 
 struct PluginInstance {
@@ -135,6 +138,12 @@ struct PluginInstance {
 
     /* Worst-case µs in process() this period (RT writes, diag reader resets). */
     volatile gint64 diag_max_us;
+
+    /* Drum-rack MIDI learn: the UI arms capture (learn_arm=1) then the RT MIDI
+     * path records the first note-on pitch it sees into learn_note; the UI polls
+     * ph_drum_learn_take_note() to read and reset it. */
+    volatile gint learn_arm;  /* 1 = capturing the next note-on */
+    volatile gint learn_note; /* captured pitch, or -1 = none yet */
 };
 
 /* ---- Small helpers ---- */
@@ -345,6 +354,7 @@ extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
 
     Vst3Backend *b = new Vst3Backend();
     b->module = module;
+    memcpy(b->class_uid, found->ID().data(), 16);
     b->max_block = ph_maxblock;
     b->provider = owned(new PlugProvider(factory, *found, true));
     if (!b->provider->initialize()) {
@@ -438,6 +448,11 @@ extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
         if (b->controller->queryInterface(NAMku::INamFileLoader_iid, (void **)&fl) == kResultOk &&
             fl)
             b->file_loader = owned(fl);
+
+        /* Optional drum-rack extension (DRUMku): per-slot .wav loading. */
+        DRUMku::IDrumLoader *dl = nullptr;
+        if (b->controller->queryInterface(DRUMku::IDrumLoader_iid, (void **)&dl) == kResultOk && dl)
+            b->drum_loader = owned(dl);
     }
 
     PluginInstance *pi = g_new0(PluginInstance, 1);
@@ -453,6 +468,8 @@ extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
     pi->max_block = ph_maxblock;
     pi->dry_L = g_new0(float, ph_maxblock);
     pi->dry_R = g_new0(float, ph_maxblock);
+    pi->learn_arm = 0;
+    pi->learn_note = -1;
     pi->b = b;
     return pi;
 }
@@ -464,6 +481,7 @@ extern "C" void pluginhost_free(PluginInstance *inst)
     Vst3Backend *b = inst->b;
     if (b) {
         b->file_loader = nullptr; /* before the controller goes away */
+        b->drum_loader = nullptr;
         if (b->processor)
             b->processor->setProcessing(false);
         if (b->component)
@@ -627,6 +645,11 @@ extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent 
             e.noteOn.pitch = m[1];
             e.noteOn.velocity = m[2] / 127.0f;
             e.noteOn.noteId = -1;
+            /* Drum-rack MIDI learn: record the first note-on while armed so the
+             * UI can bind it to the slot the user is assigning. Runs only on
+             * this RT thread, so a plain get-then-set keeps the first note. */
+            if (g_atomic_int_get(&inst->learn_arm) && g_atomic_int_get(&inst->learn_note) < 0)
+                g_atomic_int_set(&inst->learn_note, (gint)m[1]);
         } else if (status == 0x80 || (status == 0x90 && m[2] == 0)) {
             e.type = Event::kNoteOffEvent;
             e.noteOff.channel = ch;
@@ -796,6 +819,92 @@ extern "C" gboolean pluginhost_state_load(PluginInstance *inst, const void *data
     return TRUE;
 }
 
+/* ---- Presets ----
+ *
+ * A preset file is the same component+controller state blob jackDAW persists per
+ * project (pluginhost_state_save), wrapped so it can be reloaded into a fresh
+ * instance of the SAME plugin in ANY project. Layout:
+ *   [0]  8  magic "JDPRESET"
+ *   [8]  4  uint32 LE version (1)
+ *   [12] 16 VST3 class CID (must match the target plugin)
+ *   [28] .. state blob from pluginhost_state_save
+ * Generic to every hosted plugin; for DRUMku the blob is the whole kit (slot count
+ * + per-slot path/note/volume), and load re-reads the .wav files via setState. */
+
+#define PH_PRESET_MAGIC "JDPRESET"
+#define PH_PRESET_MAGIC_LEN 8
+#define PH_PRESET_VERSION 1u
+#define PH_PRESET_HDR_LEN (PH_PRESET_MAGIC_LEN + 4 + 16) /* 28 */
+
+extern "C" gboolean pluginhost_preset_save(PluginInstance *inst, const char *path)
+{
+    if (!inst || !inst->b || !path || !path[0])
+        return FALSE;
+
+    void *blob = NULL;
+    gsize blen = 0;
+    if (!pluginhost_state_save(inst, &blob, &blen) || !blob)
+        return FALSE;
+
+    gsize total = PH_PRESET_HDR_LEN + blen;
+    guint8 *buf = (guint8 *)g_malloc(total);
+    memcpy(buf, PH_PRESET_MAGIC, PH_PRESET_MAGIC_LEN);
+    guint32 ver = GUINT32_TO_LE(PH_PRESET_VERSION);
+    memcpy(buf + PH_PRESET_MAGIC_LEN, &ver, 4);
+    memcpy(buf + PH_PRESET_MAGIC_LEN + 4, inst->b->class_uid, 16);
+    memcpy(buf + PH_PRESET_HDR_LEN, blob, blen);
+    g_free(blob);
+
+    GError *err = NULL;
+    gboolean ok = g_file_set_contents(path, (const gchar *)buf, (gssize)total, &err);
+    g_free(buf);
+    if (!ok) {
+        g_warning("pluginhost: preset save failed: %s", err ? err->message : "?");
+        if (err)
+            g_error_free(err);
+    }
+    return ok;
+}
+
+extern "C" gboolean pluginhost_preset_load(PluginInstance *inst, const char *path)
+{
+    if (!inst || !inst->b || !path || !path[0])
+        return FALSE;
+
+    gchar *data = NULL;
+    gsize len = 0;
+    GError *err = NULL;
+    if (!g_file_get_contents(path, &data, &len, &err)) {
+        g_warning("pluginhost: preset read failed: %s", err ? err->message : "?");
+        if (err)
+            g_error_free(err);
+        return FALSE;
+    }
+
+    gboolean ok = FALSE;
+    const guint8 *p = (const guint8 *)data;
+    if (len < PH_PRESET_HDR_LEN) {
+        g_warning("pluginhost: preset too small");
+    } else if (memcmp(p, PH_PRESET_MAGIC, PH_PRESET_MAGIC_LEN) != 0) {
+        g_warning("pluginhost: not a jackDAW preset");
+    } else {
+        guint32 ver;
+        memcpy(&ver, p + PH_PRESET_MAGIC_LEN, 4);
+        ver = GUINT32_FROM_LE(ver);
+        if (ver != PH_PRESET_VERSION) {
+            g_warning("pluginhost: unsupported preset version %u", ver);
+        } else if (memcmp(p + PH_PRESET_MAGIC_LEN + 4, inst->b->class_uid, 16) != 0) {
+            g_warning("pluginhost: preset is for a different plugin");
+        } else {
+            ok = pluginhost_state_load(inst, p + PH_PRESET_HDR_LEN,
+                                       len - PH_PRESET_HDR_LEN);
+        }
+    }
+
+    g_free(data);
+    return ok;
+}
+
 /* ---- Flags / identity ---- */
 
 extern "C" void pluginhost_set_active(PluginInstance *inst, gboolean on)
@@ -952,4 +1061,131 @@ extern "C" gboolean pluginhost_file_set(PluginInstance *inst, int which, const c
     tresult r = (which == PH_FILE_MODEL) ? fl->setModelFile(path ? path : "")
                                          : fl->setIrFile(path ? path : "");
     return r == kResultOk;
+}
+
+/* ---- Drum rack (IDrumLoader) ---- */
+
+/* Set/get a parameter by ID (not list index), mirroring pluginhost_param_set:
+ * keep the controller's view in sync, then hand the change to the RT thread
+ * through the lock-free ring. Values are VST3-normalized [0,1]. */
+static void ph_set_param_id(PluginInstance *inst, ParamID id, double norm)
+{
+    Vst3Backend *b = inst ? inst->b : nullptr;
+    if (!b || !b->controller)
+        return;
+    if (norm < 0.0)
+        norm = 0.0;
+    if (norm > 1.0)
+        norm = 1.0;
+    b->controller->setParamNormalized(id, norm);
+    b->transfer.addChange(id, norm, 0);
+}
+
+static double ph_get_param_id(PluginInstance *inst, ParamID id)
+{
+    Vst3Backend *b = inst ? inst->b : nullptr;
+    if (!b || !b->controller)
+        return 0.0;
+    return b->controller->getParamNormalized(id);
+}
+
+extern "C" gboolean ph_drum_is_rack(PluginInstance *inst)
+{
+    return inst && inst->b && inst->b->drum_loader;
+}
+
+extern "C" gint ph_drum_max_slots(void)
+{
+    return (gint)DRUMku::kMaxSlots;
+}
+
+extern "C" gint ph_drum_slot_count(PluginInstance *inst)
+{
+    if (!ph_drum_is_rack(inst))
+        return 0;
+    double norm = ph_get_param_id(inst, (ParamID)DRUMku::kSlotCountId);
+    gint plain = (gint)(1.0 + norm * (double)(DRUMku::kMaxSlots - 1) + 0.5);
+    if (plain < 1)
+        plain = 1;
+    if (plain > DRUMku::kMaxSlots)
+        plain = DRUMku::kMaxSlots;
+    return plain;
+}
+
+extern "C" void ph_drum_add_slot(PluginInstance *inst)
+{
+    if (!ph_drum_is_rack(inst))
+        return;
+    gint plain = ph_drum_slot_count(inst) + 1;
+    if (plain > DRUMku::kMaxSlots)
+        plain = DRUMku::kMaxSlots;
+    double norm = (double)(plain - 1) / (double)(DRUMku::kMaxSlots - 1);
+    ph_set_param_id(inst, (ParamID)DRUMku::kSlotCountId, norm);
+}
+
+extern "C" gboolean ph_drum_file_get(PluginInstance *inst, int slot, char *buf, int buflen)
+{
+    if (!buf || buflen <= 0)
+        return FALSE;
+    buf[0] = 0;
+    if (!ph_drum_is_rack(inst))
+        return FALSE;
+    return inst->b->drum_loader->getSampleFile(slot, buf, buflen) == kResultOk;
+}
+
+extern "C" gboolean ph_drum_file_set(PluginInstance *inst, int slot, const char *path)
+{
+    if (!ph_drum_is_rack(inst))
+        return FALSE;
+    return inst->b->drum_loader->setSampleFile(slot, path ? path : "") == kResultOk;
+}
+
+extern "C" float ph_drum_volume_get(PluginInstance *inst, int slot)
+{
+    if (!ph_drum_is_rack(inst) || slot < 0 || slot >= DRUMku::kMaxSlots)
+        return 0.0f;
+    return (float)ph_get_param_id(inst, (ParamID)(DRUMku::kSlotVolumeBase + slot));
+}
+
+extern "C" void ph_drum_volume_set(PluginInstance *inst, int slot, float v)
+{
+    if (!ph_drum_is_rack(inst) || slot < 0 || slot >= DRUMku::kMaxSlots)
+        return;
+    ph_set_param_id(inst, (ParamID)(DRUMku::kSlotVolumeBase + slot), v);
+}
+
+extern "C" gint ph_drum_note_get(PluginInstance *inst, int slot)
+{
+    if (!ph_drum_is_rack(inst) || slot < 0 || slot >= DRUMku::kMaxSlots)
+        return -1;
+    double norm = ph_get_param_id(inst, (ParamID)(DRUMku::kSlotNoteBase + slot));
+    gint plain = (gint)(norm * (double)DRUMku::kNoteUnassigned + 0.5);
+    return plain >= DRUMku::kNoteUnassigned ? -1 : plain;
+}
+
+extern "C" void ph_drum_note_set(PluginInstance *inst, int slot, gint note)
+{
+    if (!ph_drum_is_rack(inst) || slot < 0 || slot >= DRUMku::kMaxSlots)
+        return;
+    gint plain = (note < 0 || note > 127) ? (gint)DRUMku::kNoteUnassigned : note;
+    double norm = (double)plain / (double)DRUMku::kNoteUnassigned;
+    ph_set_param_id(inst, (ParamID)(DRUMku::kSlotNoteBase + slot), norm);
+}
+
+extern "C" void ph_drum_learn_arm(PluginInstance *inst, gboolean on)
+{
+    if (!inst)
+        return;
+    g_atomic_int_set(&inst->learn_note, -1);
+    g_atomic_int_set(&inst->learn_arm, on ? 1 : 0);
+}
+
+extern "C" gint ph_drum_learn_take_note(PluginInstance *inst)
+{
+    if (!inst)
+        return -1;
+    gint note = g_atomic_int_get(&inst->learn_note);
+    if (note >= 0)
+        g_atomic_int_set(&inst->learn_note, -1);
+    return note;
 }

@@ -3,12 +3,14 @@
 #include <Button.h>
 #include <CheckBox.h>
 #include <ControlLook.h>
+#include <Entry.h>
 #include <FilePanel.h>
 #include <GroupView.h>
 #include <LayoutBuilder.h>
 #include <ListView.h>
 #include <MenuField.h>
 #include <MenuItem.h>
+#include <MessageRunner.h>
 #include <Path.h>
 #include <PopUpMenu.h>
 #include <ScrollBar.h>
@@ -119,6 +121,20 @@ enum {
     MSG_FX_LOAD_IR = 'fxli',
     MSG_FX_FILE_REFS = 'fxrf', // BFilePanel result; int32 "which" from the template
     MSG_FX_RAISE = 'fxrs',     // re-activate an already-open window
+
+    // Drum rack (DRUMku). All carry int32 "slot" except Add and Poll.
+    MSG_DRUM_LOAD = 'dkld',      // open a file panel for a slot
+    MSG_DRUM_FILE_REFS = 'dkrf', // BFilePanel result; int32 "slot" from the template
+    MSG_DRUM_VOL = 'dkvl',       // a slot's volume slider moved
+    MSG_DRUM_LEARN = 'dklr',     // a slot's Learn checkbox toggled
+    MSG_DRUM_ADD = 'dkad',       // +Add slot
+    MSG_DRUM_POLL = 'dkpl',      // periodic poll for the captured learn note
+
+    // Presets (generic to every plugin): full state ⇄ a .jdpreset file.
+    MSG_PRESET_SAVE = 'psav',      // "Save preset…" clicked → show B_SAVE_PANEL
+    MSG_PRESET_LOAD = 'plod',      // "Load preset…" clicked → show B_OPEN_PANEL
+    MSG_PRESET_SAVE_REFS = 'psrf', // save panel result: entry_ref "directory" + "name"
+    MSG_PRESET_LOAD_REFS = 'plrf', // open panel result: entry_ref "refs"
 };
 
 static const int32 kSliderSteps = 1000; // BSlider is integer; params are [0,1]
@@ -126,7 +142,9 @@ static const int32 kSliderSteps = 1000; // BSlider is integer; params are [0,1]
 FxWindow::FxWindow(JackDawTrack *track)
     : BWindow(BRect(0, 0, 900, 460), "Effects", B_TITLED_WINDOW,
               B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE),
-      m_track(track), m_file_panel(NULL), m_model_label(NULL), m_ir_label(NULL)
+      m_track(track), m_file_panel(NULL), m_save_panel(NULL), m_preset_save(NULL),
+      m_preset_load(NULL), m_model_label(NULL), m_ir_label(NULL), m_learn_slot(-1),
+      m_learn_poll(NULL)
 {
     g_object_ref(m_track);
 
@@ -154,6 +172,9 @@ FxWindow::FxWindow(JackDawTrack *track)
     m_mix->SetModificationMessage(new BMessage(MSG_FX_MIX));
     m_mix->SetValue(kSliderSteps);
 
+    m_preset_save = new BButton("preset-save", "Save preset…", new BMessage(MSG_PRESET_SAVE));
+    m_preset_load = new BButton("preset-load", "Load preset…", new BMessage(MSG_PRESET_LOAD));
+
     m_param_group = new ParamGroupView();
     BScrollView *param_scroll = new ParamScrollView("param-scroll", m_param_group);
 
@@ -175,6 +196,11 @@ FxWindow::FxWindow(JackDawTrack *track)
                 .End()
                 .Add(m_bypass)
                 .Add(m_mix)
+                .AddGroup(B_HORIZONTAL, 4.0f)
+                    .Add(m_preset_save)
+                    .Add(m_preset_load)
+                    .AddGlue()
+                .End()
                 .AddGlue()
             .End()
             .Add(param_scroll)
@@ -188,7 +214,9 @@ FxWindow::FxWindow(JackDawTrack *track)
 
 FxWindow::~FxWindow()
 {
+    delete m_learn_poll;
     delete m_file_panel;
+    delete m_save_panel;
     g_object_unref(m_track);
 }
 
@@ -255,6 +283,8 @@ void FxWindow::SyncControlsRow()
     m_remove->SetEnabled(inst != NULL);
     m_up->SetEnabled(inst != NULL);
     m_down->SetEnabled(inst != NULL);
+    m_preset_save->SetEnabled(inst != NULL);
+    m_preset_load->SetEnabled(inst != NULL);
     if (inst) {
         m_bypass->SetValue(pluginhost_is_active(inst) ? B_CONTROL_OFF : B_CONTROL_ON);
         m_mix->SetValue((int32)(pluginhost_get_mix(inst) * kSliderSteps));
@@ -304,6 +334,16 @@ void FxWindow::ClearParamPanel()
     m_model_label = NULL;
     m_ir_label = NULL;
 
+    // Drop any armed MIDI-learn state (the checkbox views are about to go away).
+    // The plug-in's own learn flag is reset when a rack is (re)built.
+    delete m_learn_poll;
+    m_learn_poll = NULL;
+    m_learn_slot = -1;
+    m_drum_file.clear();
+    m_drum_vol.clear();
+    m_drum_learn.clear();
+    m_drum_note.clear();
+
     BView *child;
     while ((child = m_param_group->ChildAt(0)) != NULL) {
         m_param_group->RemoveChild(child);
@@ -320,6 +360,13 @@ void FxWindow::RebuildParamPanel()
 
     PluginInstance *inst = Selected();
     SyncControlsRow();
+
+    // A drum rack gets a purpose-built per-slot panel instead of the generic
+    // slider list.
+    if (inst && ph_drum_is_rack(inst)) {
+        BuildDrumRack(inst);
+        return;
+    }
 
     BLayoutBuilder::Group<> builder(m_param_group->GroupLayout());
     if (!inst) {
@@ -387,6 +434,88 @@ void FxWindow::RebuildParamPanel()
     }
     // Trailing glue keeps the parameters packed at the top; the scroll view
     // handles any overflow, so the window frame never has to change.
+    builder.AddGlue();
+}
+
+// A drum rack: one row per visible slot — [ Load… | file | Volume | Learn |
+// Note ] — plus a +Add slot button. Slot volume/note are ordinary VST3
+// parameters (reached by slot index through the ph_drum_* API); the sample path
+// travels over the IDrumLoader extension; Learn is captured host-side.
+void FxWindow::BuildDrumRack(PluginInstance *inst)
+{
+    // Fresh, consistent learn state whenever the rack is (re)built.
+    ph_drum_learn_arm(inst, false);
+
+    int maxSlots = (int)ph_drum_max_slots();
+    int count = (int)ph_drum_slot_count(inst);
+    if (count < 1)
+        count = 1;
+    if (count > maxSlots)
+        count = maxSlots;
+
+    BLayoutBuilder::Group<> builder(m_param_group->GroupLayout());
+
+    for (int i = 0; i < count; i++) {
+        BMessage *loadMsg = new BMessage(MSG_DRUM_LOAD);
+        loadMsg->AddInt32("slot", i);
+        BButton *load = new BButton("load", "Load…", loadMsg);
+
+        char path[1024], label[1100];
+        ph_drum_file_get(inst, i, path, sizeof(path));
+        if (path[0])
+            fx_basename(path, "", label, sizeof(label));
+        else
+            snprintf(label, sizeof(label), "(empty)");
+        BStringView *file = new BStringView("file", label);
+        file->SetExplicitMinSize(BSize(150.0f, B_SIZE_UNSET));
+
+        BMessage *volMsg = new BMessage(MSG_DRUM_VOL);
+        volMsg->AddInt32("slot", i);
+        BSlider *vol = new BSlider("vol", NULL, volMsg, 0, kSliderSteps, B_HORIZONTAL);
+        BMessage *volMod = new BMessage(MSG_DRUM_VOL);
+        volMod->AddInt32("slot", i);
+        vol->SetModificationMessage(volMod);
+        vol->SetValue((int32)(ph_drum_volume_get(inst, i) * kSliderSteps));
+        vol->SetExplicitMinSize(BSize(160.0f, B_SIZE_UNSET));
+
+        BMessage *learnMsg = new BMessage(MSG_DRUM_LEARN);
+        learnMsg->AddInt32("slot", i);
+        BCheckBox *learn = new BCheckBox("learn", "Learn", learnMsg);
+
+        gint note = ph_drum_note_get(inst, i);
+        char noteLabel[32];
+        if (note < 0)
+            snprintf(noteLabel, sizeof(noteLabel), "Note: —");
+        else
+            snprintf(noteLabel, sizeof(noteLabel), "Note: %d", (int)note);
+        BStringView *noteView = new BStringView("note", noteLabel);
+        noteView->SetExplicitMinSize(BSize(80.0f, B_SIZE_UNSET));
+
+        // clang-format off
+        builder
+            .AddGroup(B_HORIZONTAL, 6.0f)
+                .Add(load)
+                .Add(file)
+                .Add(vol)
+                .Add(learn)
+                .Add(noteView)
+            .End();
+        // clang-format on
+
+        m_drum_file.push_back(file);
+        m_drum_vol.push_back(vol);
+        m_drum_learn.push_back(learn);
+        m_drum_note.push_back(noteView);
+    }
+
+    BButton *add = new BButton("add-slot", "+ Add slot", new BMessage(MSG_DRUM_ADD));
+    // clang-format off
+    builder
+        .AddGroup(B_HORIZONTAL, 6.0f)
+            .Add(add)
+            .AddGlue()
+        .End();
+    // clang-format on
     builder.AddGlue();
 }
 
@@ -505,6 +634,181 @@ void FxWindow::MessageReceived(BMessage *message)
             // Full rebuild rather than just the file labels: loading a model
             // can retitle parameters (e.g. NAMku's "Slim (n/a)" capability
             // reporting), and titles are only read at panel build time.
+            RebuildParamPanel();
+            break;
+        }
+
+        case MSG_DRUM_LOAD: {
+            int32 slot = -1;
+            if (message->FindInt32("slot", &slot) != B_OK)
+                break;
+            if (!m_file_panel)
+                m_file_panel = new BFilePanel(B_OPEN_PANEL);
+            BMessage tmpl(MSG_DRUM_FILE_REFS);
+            tmpl.AddInt32("slot", slot);
+            m_file_panel->SetTarget(BMessenger(this));
+            m_file_panel->SetMessage(&tmpl);
+            m_file_panel->Window()->SetTitle("Load drum sample (.wav)");
+            m_file_panel->Show();
+            break;
+        }
+
+        case MSG_DRUM_FILE_REFS: {
+            PluginInstance *inst = Selected();
+            entry_ref ref;
+            int32 slot = -1;
+            message->FindInt32("slot", &slot);
+            if (!inst || slot < 0 || message->FindRef("refs", &ref) != B_OK)
+                break;
+            BPath path(&ref);
+            if (path.InitCheck() != B_OK)
+                break;
+            if (!ph_drum_file_set(inst, (int)slot, path.Path()))
+                g_warning("FxWindow: drum plugin refused '%s'", path.Path());
+            if (slot < (int32)m_drum_file.size()) {
+                char label[1100];
+                fx_basename(path.Path(), "", label, sizeof(label));
+                m_drum_file[slot]->SetText(label);
+            }
+            break;
+        }
+
+        case MSG_DRUM_VOL: {
+            PluginInstance *inst = Selected();
+            int32 slot = -1;
+            if (!inst || message->FindInt32("slot", &slot) != B_OK)
+                break;
+            if (slot < 0 || (size_t)slot >= m_drum_vol.size())
+                break;
+            float v = (float)m_drum_vol[slot]->Value() / kSliderSteps;
+            ph_drum_volume_set(inst, (int)slot, v);
+            break;
+        }
+
+        case MSG_DRUM_LEARN: {
+            PluginInstance *inst = Selected();
+            int32 slot = -1;
+            if (!inst || message->FindInt32("slot", &slot) != B_OK)
+                break;
+            if (slot < 0 || (size_t)slot >= m_drum_learn.size())
+                break;
+            bool on = m_drum_learn[slot]->Value() == B_CONTROL_ON;
+            if (on) {
+                // Only one slot can be armed at a time.
+                for (size_t k = 0; k < m_drum_learn.size(); k++)
+                    if ((int32)k != slot)
+                        m_drum_learn[k]->SetValue(B_CONTROL_OFF);
+                m_learn_slot = slot;
+                ph_drum_learn_arm(inst, true);
+                if (!m_learn_poll) {
+                    BMessage poll(MSG_DRUM_POLL);
+                    m_learn_poll = new BMessageRunner(BMessenger(this), &poll, 80000);
+                }
+            } else if (m_learn_slot == slot) {
+                ph_drum_learn_arm(inst, false);
+                m_learn_slot = -1;
+                delete m_learn_poll;
+                m_learn_poll = NULL;
+            }
+            break;
+        }
+
+        case MSG_DRUM_ADD: {
+            PluginInstance *inst = Selected();
+            if (!inst)
+                break;
+            ph_drum_add_slot(inst);
+            RebuildParamPanel();
+            break;
+        }
+
+        case MSG_DRUM_POLL: {
+            PluginInstance *inst = Selected();
+            if (!inst || m_learn_slot < 0) {
+                delete m_learn_poll;
+                m_learn_poll = NULL;
+                break;
+            }
+            gint note = ph_drum_learn_take_note(inst);
+            if (note >= 0) {
+                int slot = m_learn_slot;
+                ph_drum_note_set(inst, slot, note);
+                if (slot < (int)m_drum_note.size()) {
+                    char noteLabel[32];
+                    snprintf(noteLabel, sizeof(noteLabel), "Note: %d", (int)note);
+                    m_drum_note[slot]->SetText(noteLabel);
+                }
+                if (slot < (int)m_drum_learn.size())
+                    m_drum_learn[slot]->SetValue(B_CONTROL_OFF);
+                ph_drum_learn_arm(inst, false);
+                m_learn_slot = -1;
+                delete m_learn_poll;
+                m_learn_poll = NULL;
+            }
+            break;
+        }
+
+        case MSG_PRESET_SAVE: {
+            PluginInstance *inst = Selected();
+            if (!inst)
+                break;
+            if (!m_save_panel)
+                m_save_panel = new BFilePanel(B_SAVE_PANEL);
+            BMessage tmpl(MSG_PRESET_SAVE_REFS);
+            m_save_panel->SetTarget(BMessenger(this));
+            m_save_panel->SetMessage(&tmpl);
+            char def[256];
+            snprintf(def, sizeof(def), "%s.jdpreset", pluginhost_name(inst));
+            m_save_panel->SetSaveText(def);
+            m_save_panel->Window()->SetTitle("Save preset (.jdpreset)");
+            m_save_panel->Show();
+            break;
+        }
+
+        case MSG_PRESET_LOAD: {
+            PluginInstance *inst = Selected();
+            if (!inst)
+                break;
+            if (!m_file_panel)
+                m_file_panel = new BFilePanel(B_OPEN_PANEL);
+            BMessage tmpl(MSG_PRESET_LOAD_REFS);
+            m_file_panel->SetTarget(BMessenger(this));
+            m_file_panel->SetMessage(&tmpl);
+            m_file_panel->Window()->SetTitle("Load preset (.jdpreset)");
+            m_file_panel->Show();
+            break;
+        }
+
+        case MSG_PRESET_SAVE_REFS: {
+            PluginInstance *inst = Selected();
+            entry_ref dir;
+            const char *name = NULL;
+            if (!inst || message->FindRef("directory", &dir) != B_OK ||
+                message->FindString("name", &name) != B_OK || !name)
+                break;
+            BPath path(&dir);
+            if (path.InitCheck() != B_OK || path.Append(name) != B_OK)
+                break;
+            if (!pluginhost_preset_save(inst, path.Path()))
+                g_warning("FxWindow: preset save failed for '%s'", path.Path());
+            break;
+        }
+
+        case MSG_PRESET_LOAD_REFS: {
+            PluginInstance *inst = Selected();
+            entry_ref ref;
+            if (!inst || message->FindRef("refs", &ref) != B_OK)
+                break;
+            BPath path(&ref);
+            if (path.InitCheck() != B_OK)
+                break;
+            if (!pluginhost_preset_load(inst, path.Path())) {
+                g_warning("FxWindow: preset load failed for '%s'", path.Path());
+                break;
+            }
+            // Restored state can change slot count, sample names, notes, volumes,
+            // and (for other plugins) parameter titles — all read only at panel
+            // build time, so rebuild the whole panel to reflect the loaded kit.
             RebuildParamPanel();
             break;
         }
