@@ -215,6 +215,12 @@ void TrackAreaView::UpdateMeters()
     }
 }
 
+void TrackAreaView::RefreshInputMenus()
+{
+    for (TrackStripView *s : m_strips)
+        s->RefreshInputs();
+}
+
 void TrackAreaView::SetDropGap(int gap)
 {
     if (gap == m_drop_gap)

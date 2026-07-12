@@ -195,6 +195,14 @@ void TrackStripView::BuildInputMenu()
     }
 }
 
+void TrackStripView::RefreshInputs()
+{
+    // The connectable-source list (physical JACK ports) or our own capture-port
+    // pool changed: rebuild the menu, then re-mark the current selection.
+    BuildInputMenu();
+    SyncFromTrack();
+}
+
 void TrackStripView::SyncFromTrack()
 {
     // Setting control values programmatically here does not re-invoke their

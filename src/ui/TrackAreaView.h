@@ -45,6 +45,9 @@ public:
     }
     // Push fresh peak values into each strip's VU (called on the UI tick).
     void UpdateMeters();
+    // Rebuild every strip's input menu after a JACK port change (ports added or
+    // removed, or the capture-port pool resized via Options -> Inputs/Outputs).
+    void RefreshInputMenus();
 
     // ---- Region editing (audio + instrument tracks) ----
     // A "section" is a ClipRegion* on an audio track or a MidiRegion* on an

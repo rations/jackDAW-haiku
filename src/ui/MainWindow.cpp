@@ -26,6 +26,7 @@
 #include "host/pluginhost.h"
 #include "Messages.h"
 #include "FxWindow.h"
+#include "IoWindow.h"
 #include "MetronomeWindows.h"
 #include "MidiWindow.h"
 #include "MixerView.h"
@@ -215,11 +216,11 @@ static BMenuItem *AddItem(BMenu *menu, const char *label, uint32 what, char shor
 MainWindow::MainWindow(JackDawProject *project)
     : BWindow(BRect(100, 100, 1100, 700), "JackDAW", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
       m_project(project), m_transport(NULL), m_timeline(NULL), m_tick_runner(NULL),
-      m_metro_volume_window(NULL), m_countin_window(NULL), m_mixer(NULL), m_mixer_item(NULL),
-      m_mixer_window(NULL), m_mixer_visible(false), m_dock_h_applied(0.0f), m_load_panel(NULL),
-      m_save_panel(NULL), m_open_panel(NULL), m_render_window(NULL), m_render_thread(NULL),
-      m_render_tick(NULL), m_render_method(RENDER_METHOD_OFFLINE), m_render_active(false),
-      m_track_added_h(0), m_track_removed_h(0), m_tracks_reordered_h(0)
+      m_metro_volume_window(NULL), m_countin_window(NULL), m_io_window(NULL), m_mixer(NULL),
+      m_mixer_item(NULL), m_mixer_window(NULL), m_mixer_visible(false), m_dock_h_applied(0.0f),
+      m_load_panel(NULL), m_save_panel(NULL), m_open_panel(NULL), m_render_window(NULL),
+      m_render_thread(NULL), m_render_tick(NULL), m_render_method(RENDER_METHOD_OFFLINE),
+      m_render_active(false), m_track_added_h(0), m_track_removed_h(0), m_tracks_reordered_h(0)
 {
     memset(&m_render_prog, 0, sizeof(m_render_prog));
     // Restore the saved window frame (defaults match the BWindow rect above).
@@ -419,7 +420,7 @@ BMenuBar *MainWindow::BuildMenuBar()
 
     // Options — I/O routing, plugins (excluded on Haiku), MIDI control surface.
     BMenu *options = new BMenu("Options");
-    AddItem(options, "Inputs/Outputs…", MSG_OPT_IO, 0, 0, false);
+    AddItem(options, "Inputs/Outputs…", MSG_OPT_IO);
     AddItem(options, "Rescan Plugins", MSG_OPT_PLUGINS);
     AddItem(options, "MIDI Control…", MSG_OPT_MIDI_CONTROL, 0, 0, false);
     bar->AddItem(options);
@@ -1016,6 +1017,20 @@ void MainWindow::OpenCountInWindow()
     }
 }
 
+void MainWindow::OpenIoWindow()
+{
+    if (m_io_window == NULL)
+        m_io_window = new IoWindow(BMessenger(this));
+    if (m_io_window->LockLooper()) {
+        m_io_window->SyncCounts((int)jackdaw_engine_get_audio_in_count(),
+                                (int)jackdaw_engine_get_audio_out_count());
+        if (m_io_window->IsHidden())
+            m_io_window->Show();
+        m_io_window->Activate();
+        m_io_window->UnlockLooper();
+    }
+}
+
 void MainWindow::MessageReceived(BMessage *message)
 {
     switch (message->what) {
@@ -1257,6 +1272,27 @@ void MainWindow::MessageReceived(BMessage *message)
             break;
         }
 
+        case MSG_OPT_IO:
+            OpenIoWindow();
+            break;
+
+        // Applied on this looper (posted by IoWindow): resize the JACK capture
+        // (in_N) and master output (out_N) port pools. The engine's port-
+        // registration callback then posts MSG_ENGINE_PORTS_CHANGED, which
+        // refreshes the strips; do it here too so the update is immediate.
+        case MSG_OPT_IO_APPLY: {
+            int32 inputs = 0, outputs = 0;
+            message->FindInt32("inputs", &inputs);
+            message->FindInt32("outputs", &outputs);
+            if (inputs > 0)
+                jackdaw_engine_set_audio_in_count((guint)inputs);
+            if (outputs > 0)
+                jackdaw_engine_set_audio_out_count((guint)outputs);
+            if (m_timeline && m_timeline->TrackArea())
+                m_timeline->TrackArea()->RefreshInputMenus();
+            break;
+        }
+
         case MSG_OPT_PLUGINS: {
             // Drop the catalog; the next FX-window "Add effect" menu rebuild
             // rescans the VST3 add-on directories out-of-process.
@@ -1329,9 +1365,15 @@ void MainWindow::MessageReceived(BMessage *message)
 
         case MSG_ENGINE_PORTS_CHANGED:
         case MSG_ENGINE_CONNECTIONS_CHANGED:
+            // JACK ports appeared/disappeared (device change, or our own capture
+            // pool resized via Options -> Inputs/Outputs) or a connection changed:
+            // rebuild every strip's input selector and re-mark the live source.
+            if (m_timeline && m_timeline->TrackArea())
+                m_timeline->TrackArea()->RefreshInputMenus();
+            break;
+
         case MSG_ENGINE_SHUTDOWN:
-            // Port selectors refresh here once track strips exist; a server
-            // shutdown alert can hang off MSG_ENGINE_SHUTDOWN later.
+            // A server shutdown alert can hang off this later.
             break;
 
         case MSG_ENGINE_TAKE_READY:
@@ -1495,6 +1537,10 @@ bool MainWindow::QuitRequested()
     if (m_countin_window && m_countin_window->Lock()) {
         m_countin_window->Quit();
         m_countin_window = NULL;
+    }
+    if (m_io_window && m_io_window->Lock()) {
+        m_io_window->Quit();
+        m_io_window = NULL;
     }
     be_app->PostMessage(B_QUIT_REQUESTED);
     return true;

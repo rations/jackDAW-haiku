@@ -14,6 +14,7 @@ class BMessageRunner;
 class BPoint;
 class CountInWindow;
 class FxWindow;
+class IoWindow;
 class MetroVolumeWindow;
 class MidiWindow;
 class MixerView;
@@ -87,6 +88,9 @@ private:
     void OpenMetroVolumeWindow();
     void OpenCountInWindow();
 
+    // Options -> Inputs/Outputs (lazy singleton; re-synced to live port counts).
+    void OpenIoWindow();
+
     // Piano-roll MIDI editor (per-instrument-track window; presents if open).
     void OpenMidiEditor(JackDawTrack *track);
     bool TrackInProject(JackDawTrack *track) const;
@@ -104,6 +108,7 @@ private:
 
     MetroVolumeWindow *m_metro_volume_window; // NULL until first opened
     CountInWindow *m_countin_window;          // NULL until first opened
+    IoWindow *m_io_window;                    // NULL until first opened
 
     MixerView *m_mixer;          // docked pane
     BLayoutItem *m_mixer_item;   // its layout slot (for collapse)

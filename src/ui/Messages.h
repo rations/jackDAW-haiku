@@ -106,6 +106,7 @@ enum {
 
     // Menu bar — Options.
     MSG_OPT_IO = 'oint',
+    MSG_OPT_IO_APPLY = 'ioap', // from IoWindow: int32 "inputs"/"outputs" port counts
     MSG_OPT_PLUGINS = 'oplg',
     MSG_OPT_MIDI_CONTROL = 'omid',
 

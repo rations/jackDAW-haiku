@@ -86,6 +86,19 @@ const char **jackdaw_engine_list_capture_ports(void);
 const char **jackdaw_engine_list_midi_ports(void);
 void jackdaw_engine_free_ports(const char **ports);
 
+/* --- Audio port-count management (main thread only) ---
+ * Grow/shrink the pool of JACK capture (in_N) and master output (out_N) ports,
+ * clamped to [1, JACKDAW_MAX_TRACKS] and persisted for the next session. The
+ * count change is RT-safe (no reallocation; ordered publish) — see the .c. A
+ * track added afterwards at a slot within the input pool gains a capture port.
+ * MIDI ports are not managed here: instrument tracks register their own MIDI
+ * in/out ports on demand, so there is no fixed MIDI pool to resize. Return
+ * FALSE on success, TRUE on failure. */
+guint jackdaw_engine_get_audio_in_count(void);
+guint jackdaw_engine_get_audio_out_count(void);
+gboolean jackdaw_engine_set_audio_in_count(guint n);
+gboolean jackdaw_engine_set_audio_out_count(guint n);
+
 /* --- Transport --- */
 void jackdaw_engine_start_playback(void);
 void jackdaw_engine_stop_playback(void);

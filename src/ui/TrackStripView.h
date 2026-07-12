@@ -39,6 +39,7 @@ public:
     }
     void SetPeaks(float l, float r); // called on the UI tick
     void SyncFromTrack();            // refresh controls from track/engine state
+    void RefreshInputs();            // rebuild the input menu + re-mark (ports changed)
 
 private:
     void BuildInputMenu();

@@ -1584,10 +1584,14 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     memset(&engine, 0, sizeof(engine));
     engine.project = project;
 
-    /* Phase 1: fixed stereo master. The Linux original auto-detects port
-     * counts from the physical JACK ports / settings; that returns in phase 2
-     * together with the capture and MIDI ports. */
-    engine.audio_out_count = 2;
+    /* Master output ports: honour a user-set count from a previous session
+     * (Options -> Inputs/Outputs, persisted below), else a stereo master. The
+     * master mix still only writes out_1/out_2; extra outs are silent until the
+     * user routes to them in the patchbay. */
+    {
+        guint out_n = settings_get_uint32("jackAudioOutCount", 0);
+        engine.audio_out_count = out_n ? CLAMP(out_n, 1u, (guint)JACKDAW_MAX_TRACKS) : 2u;
+    }
 
     /* JackNoStartServer: connect only to the server the user already started
      * (e.g. from jack-graph's settings), never spawn or reconfigure one of our
@@ -1632,8 +1636,11 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     jack_set_port_registration_callback(engine.client, engine_port_reg_cb, NULL);
     jack_set_port_connect_callback(engine.client, engine_port_connect_cb, NULL);
 
-    /* Register audio output ports: out_1 .. out_N */
-    engine.audio_out = g_new0(jack_port_t *, engine.audio_out_count);
+    /* Register audio output ports: out_1 .. out_N. The array is sized to the
+     * hard track ceiling (not the live count) so growing/shrinking the pool at
+     * runtime never reallocates memory the RT callback is reading — see
+     * jackdaw_engine_set_audio_out_count. */
+    engine.audio_out = g_new0(jack_port_t *, JACKDAW_MAX_TRACKS);
     for (i = 0; i < engine.audio_out_count; i++) {
         g_snprintf(name, sizeof(name), "out_%u", i + 1);
         engine.audio_out[i] =
@@ -1653,11 +1660,18 @@ gboolean jackdaw_engine_init(JackDawProject *project)
      * the number of physical capture channels the server exposes (clamped) so
      * every hardware input can be routed to a track. Right ports are registered
      * lazily by set_track_stereo. A track at slot i reads in_(i+1). */
-    engine.audio_in_count =
-        CLAMP(count_physical_ports(engine.client, JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput), 1,
-              JACKDAW_MAX_TRACKS);
-    engine.audio_in = g_new0(jack_port_t *, engine.audio_in_count);
-    engine.audio_in_r = g_new0(jack_port_t *, engine.audio_in_count);
+    {
+        guint in_n = settings_get_uint32("jackAudioInCount", 0);
+        engine.audio_in_count =
+            in_n ? CLAMP(in_n, 1u, (guint)JACKDAW_MAX_TRACKS)
+                 : CLAMP(count_physical_ports(engine.client, JACK_DEFAULT_AUDIO_TYPE,
+                                              JackPortIsOutput),
+                         1, JACKDAW_MAX_TRACKS);
+    }
+    /* Sized to the track ceiling (see the output-port note above) so the
+     * runtime count setter only (un)registers ports, never reallocates. */
+    engine.audio_in = g_new0(jack_port_t *, JACKDAW_MAX_TRACKS);
+    engine.audio_in_r = g_new0(jack_port_t *, JACKDAW_MAX_TRACKS);
     for (i = 0; i < engine.audio_in_count; i++) {
         g_snprintf(name, sizeof(name), "in_%u", i + 1);
         engine.audio_in[i] =
@@ -2146,6 +2160,110 @@ void jackdaw_engine_free_ports(const char **ports)
 {
     if (ports)
         jack_free((void *)ports);
+}
+
+/* ---- Audio port-count management (main thread only) ----
+ * Grow or shrink the pool of JACK capture (in_N) and master output (out_N)
+ * ports. The backing arrays are pre-allocated at the track ceiling, so a count
+ * change never reallocates memory the RT process callback is reading; we only
+ * (un)register ports and publish the new count. Ordering against the RT thread:
+ *   grow   - fill the new slots, then raise the count last (release store), so
+ *            the callback reads a new slot only after it is fully wired;
+ *   shrink - lower the count first, then unregister the now-idle ports, so the
+ *            callback stops touching a slot before its port disappears.
+ * Persisted immediately so the pool size survives a relaunch. Return FALSE on
+ * success, TRUE on failure. */
+guint jackdaw_engine_get_audio_in_count(void)
+{
+    return engine.audio_in_count;
+}
+
+guint jackdaw_engine_get_audio_out_count(void)
+{
+    return engine.audio_out_count;
+}
+
+gboolean jackdaw_engine_set_audio_in_count(guint n)
+{
+    guint i, old;
+    char name[64];
+
+    n = CLAMP(n, 1u, (guint)JACKDAW_MAX_TRACKS);
+    if (!engine.active || !engine.client) {
+        engine.audio_in_count = n;
+        settings_set_uint32("jackAudioInCount", n);
+        settings_save();
+        return FALSE;
+    }
+    old = engine.audio_in_count;
+    if (n == old)
+        return FALSE;
+
+    if (n > old) {
+        for (i = old; i < n; i++) {
+            engine.audio_in_r[i] = NULL; /* right port stays lazy (set_track_stereo) */
+            g_snprintf(name, sizeof(name), "in_%u", i + 1);
+            engine.audio_in[i] = jack_port_register(engine.client, name, JACK_DEFAULT_AUDIO_TYPE,
+                                                    JackPortIsInput, 0);
+            if (!engine.audio_in[i])
+                return TRUE;
+        }
+        g_atomic_int_set((gint *)&engine.audio_in_count, (gint)n);
+    } else {
+        g_atomic_int_set((gint *)&engine.audio_in_count, (gint)n);
+        for (i = n; i < old; i++) {
+            if (engine.audio_in[i]) {
+                jack_port_unregister(engine.client, engine.audio_in[i]);
+                engine.audio_in[i] = NULL;
+            }
+            if (engine.audio_in_r[i]) {
+                jack_port_unregister(engine.client, engine.audio_in_r[i]);
+                engine.audio_in_r[i] = NULL;
+            }
+        }
+    }
+    settings_set_uint32("jackAudioInCount", n);
+    settings_save();
+    return FALSE;
+}
+
+gboolean jackdaw_engine_set_audio_out_count(guint n)
+{
+    guint i, old;
+    char name[64];
+
+    n = CLAMP(n, 1u, (guint)JACKDAW_MAX_TRACKS);
+    if (!engine.active || !engine.client) {
+        engine.audio_out_count = n;
+        settings_set_uint32("jackAudioOutCount", n);
+        settings_save();
+        return FALSE;
+    }
+    old = engine.audio_out_count;
+    if (n == old)
+        return FALSE;
+
+    if (n > old) {
+        for (i = old; i < n; i++) {
+            g_snprintf(name, sizeof(name), "out_%u", i + 1);
+            engine.audio_out[i] = jack_port_register(engine.client, name, JACK_DEFAULT_AUDIO_TYPE,
+                                                     JackPortIsOutput, 0);
+            if (!engine.audio_out[i])
+                return TRUE;
+        }
+        g_atomic_int_set((gint *)&engine.audio_out_count, (gint)n);
+    } else {
+        g_atomic_int_set((gint *)&engine.audio_out_count, (gint)n);
+        for (i = n; i < old; i++) {
+            if (engine.audio_out[i]) {
+                jack_port_unregister(engine.client, engine.audio_out[i]);
+                engine.audio_out[i] = NULL;
+            }
+        }
+    }
+    settings_set_uint32("jackAudioOutCount", n);
+    settings_save();
+    return FALSE;
 }
 
 /* -----------------------------------------------------------------------
