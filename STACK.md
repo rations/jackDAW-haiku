@@ -38,11 +38,28 @@ compatible Haiku.
 | `drumku` | DRUMku | MIDI drum-sampler VST3 | MIT |
 | `jackdaw` | jackDAW-haiku | the DAW | MIT |
 
+## Getting the sources
+
+A stock Haiku nightly ships without `git`. Install it first, then clone the repos you need
+(the machine must be online — `pkgman` also pulls each package's runtime deps on install):
+
+```sh
+pkgman install -y git
+```
+
+Prebuilt `.hpkg`s are attached to each project's GitHub release (and all seven to the
+[jackDAW-haiku full-stack release](https://github.com/rations/jackDAW-haiku/releases)), so
+for the packaged install you only need to clone what you build from source. The USB-audio
+driver is always built locally and additionally needs the Haiku source on the
+`usb-audio-uac2` branch — its clone commands are in `haiku-kernel-usb/dist/INSTALL.md`
+(section 0).
+
 ## Install order (prebuilt packages)
 
 1. **USB-audio driver** (only if using a USB interface) — build + install per
-   `haiku-kernel-usb/dist/INSTALL.md`, then reboot. Verify: the interface enumerates and
-   a node appears under `/dev/audio/hmulti/`.
+   `haiku-kernel-usb/dist/INSTALL.md` (which starts by installing `git` and cloning the
+   `usb-audio-uac2` Haiku source), then reboot. Verify: the interface enumerates and a node
+   appears under `/dev/audio/hmulti/`.
 2. **Everything else** — build each `.hpkg` on the nightly with its
    `packaging/make-hpkg.sh` (build order: jack → tools/graph/vst3_haiku → namku/drumku →
    jackdaw), then install the lot; `pkgman` pulls external deps (glib2, libsndfile,
