@@ -16,6 +16,10 @@ JACK for audio and MIDI. It is the top of a stack of native Haiku audio projects
 ## Requirements
 
 - A running **JACK server** (the `jack` package / jack-port-haiku). Start it, e.g.:
+
+Jack Graph > Jack Settings (adjust the capture device path to your interface)
+
+- Or from the terminal
   ```
   jackd -X haikumidi -d hmulti -d /dev/audio/hmulti/usb/1 -r 48000 -p 128 -n 3
   ```

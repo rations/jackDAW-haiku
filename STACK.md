@@ -40,7 +40,7 @@ compatible Haiku.
 
 ## Getting the sources
 
-A stock Haiku nightly ships without `git`. Install it first, then clone the repos you need
+If git is not installed, install it first, then clone the repos you need
 (the machine must be online — `pkgman` also pulls each package's runtime deps on install):
 
 ```sh
@@ -85,15 +85,16 @@ jackDAW-haiku        # needs jack + the VST3-haiku SDK
 ```
 
 ## Run
+Launch **JackGraph** (to wire ports / manage the server) and **JackDAW** from Deskbar
+(Applications). NAMku/DRUMku appear in JackDAW's VST3 plug-in list automatically
 
-Start the JACK server (adjust the capture device path to your interface):
+Start the JACK server in Jack Graph > Jack Settings (adjust the capture device path to your interface):
+
+or start Jack with the terminal
 
 ```
 jackd -X haikumidi -d hmulti -d /dev/audio/hmulti/usb/1 -r 48000 -p 128 -n 3
 ```
-
-Then launch **JackGraph** (to wire ports / manage the server) and **JackDAW** from Deskbar
-(Applications). NAMku/DRUMku appear in JackDAW's VST3 plug-in list automatically.
 
 ## Notes
 
