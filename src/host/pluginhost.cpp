@@ -1,9 +1,12 @@
-/* pluginhost.cpp — VST3 plugin host for jackDAW-haiku.
+/* pluginhost.cpp — VST3 backend + format dispatch for the jackDAW plugin host.
  *
  * Port of the Linux JackDAW host (pluginhost.c + pluginhost_vst3.cpp) reduced
  * to the VST3 backend, with every X11/GDK editor path removed: on Haiku no
- * plug-in ships a compatible IPlugView yet, so hosting is parameter-based and
- * the FX window builds its own native controls from the IEditController.
+ * VST3 plug-in ships a compatible IPlugView, so VST3 hosting is
+ * parameter-based and the FX window builds its own native controls from the
+ * IEditController. This TU also owns the public entry points, dispatching
+ * PH_LV2 instances to the LV2 backend (pluginhost_lv2.cpp) — the Steinberg
+ * SDK headers here and lilv there never meet in one TU.
  *
  * Threading: instantiate/free/params/state run on the owning FX window's
  * looper thread; pluginhost_process() runs on the JACK RT thread. UI → RT
@@ -13,6 +16,7 @@
  */
 
 #include "pluginhost.h"
+#include "pluginhost_internal.h"
 
 #include "public.sdk/source/common/memorystream.h"
 #include "public.sdk/source/vst/hosting/eventlist.h"
@@ -130,30 +134,8 @@ struct Vst3Backend {
     std::vector<uint8> cc_valid;
 };
 
-struct PluginInstance {
-    PluginFormat format;
-    char *name;
-    char *key;
-    char *category;
-    gboolean is_instrument;
-    volatile gint active;  /* 1 = processing, 0 = bypassed */
-    volatile gint mix_q15; /* wet/dry: 0 = fully dry .. 32768 = fully wet */
-    double sample_rate;
-    int max_block;
-    Vst3Backend *b;
-
-    /* Dry-signal scratch for the wet/dry mix (allocated to max_block). */
-    float *dry_L, *dry_R;
-
-    /* Worst-case µs in process() this period (RT writes, diag reader resets). */
-    volatile gint64 diag_max_us;
-
-    /* Drum-rack MIDI learn: the UI arms capture (learn_arm=1) then the RT MIDI
-     * path records the first note-on pitch it sees into learn_note; the UI polls
-     * ph_drum_learn_take_note() to read and reset it. */
-    volatile gint learn_arm;  /* 1 = capturing the next note-on */
-    volatile gint learn_note; /* captured pitch, or -1 = none yet */
-};
+/* PluginInstance itself lives in pluginhost_internal.h (shared with the LV2
+ * backend TU). */
 
 /* ---- Small helpers ---- */
 
@@ -289,6 +271,9 @@ static void ph_do_scan(void)
      * BUNDLE paths themselves, ready to describe. */
     for (auto &module_path : VST3::Hosting::Module::getModulePaths())
         ph_scan_bundle(module_path.c_str(), &ph_cat);
+    /* LV2 discovery is pure Turtle parsing via lilv (no plugin code runs), so
+     * it happens in-process — the crash-isolating helper is VST3-only. */
+    ph_lv2_scan(&ph_cat);
     ph_cat = g_list_reverse(ph_cat);
     ph_scanned = TRUE;
 }
@@ -314,6 +299,7 @@ extern "C" void pluginhost_init(double sample_rate, int max_block)
     ph_sr = sample_rate;
     ph_maxblock = MAX(max_block, 64);
     ph_ensure_context();
+    ph_lv2_init(ph_sr, ph_maxblock);
 }
 
 extern "C" void pluginhost_shutdown(void)
@@ -321,13 +307,18 @@ extern "C" void pluginhost_shutdown(void)
     g_list_free_full(ph_cat, ph_info_free);
     ph_cat = NULL;
     ph_scanned = FALSE;
+    ph_lv2_shutdown();
 }
 
 /* ---- Instantiate / free ---- */
 
 extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
 {
-    if (!info || info->format != PH_VST3 || !info->key)
+    if (!info || !info->key)
+        return NULL;
+    if (info->format == PH_LV2)
+        return ph_lv2_instantiate(info);
+    if (info->format != PH_VST3)
         return NULL;
     ph_ensure_context();
 
@@ -509,6 +500,10 @@ extern "C" void pluginhost_free(PluginInstance *inst)
 {
     if (!inst)
         return;
+    if (inst->format == PH_LV2) {
+        ph_lv2_free(inst);
+        return;
+    }
     Vst3Backend *b = inst->b;
     if (b) {
         b->file_loader = nullptr; /* before the controller goes away */
@@ -536,21 +531,6 @@ extern "C" void pluginhost_free(PluginInstance *inst)
 
 /* ---- RT processing ---- */
 
-static gboolean ph_diag_enabled(void)
-{
-    static int e = -1;
-    if (e < 0)
-        e = (g_getenv("JACKDAW_DIAG") != NULL) ? 1 : 0;
-    return e;
-}
-
-static inline gint64 ph_now_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (gint64)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
 extern "C" gint64 pluginhost_diag_take_max_us(PluginInstance *inst)
 {
     if (!inst)
@@ -562,7 +542,13 @@ extern "C" gint64 pluginhost_diag_take_max_us(PluginInstance *inst)
 
 extern "C" void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes)
 {
-    if (!inst || !inst->b || !inst->b->processor)
+    if (!inst)
+        return;
+    if (inst->format == PH_LV2) {
+        ph_lv2_process(inst, L, R, nframes);
+        return;
+    }
+    if (!inst->b || !inst->b->processor)
         return;
     if (!g_atomic_int_get(&inst->active))
         return; /* bypassed: leave L/R as-is */
@@ -580,7 +566,7 @@ extern "C" void pluginhost_process(PluginInstance *inst, float *L, float *R, int
     /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared
      * MXCSR, which would let denormals stall this plugin's process(). */
     rt_set_denormal_mode();
-    gint64 t0 = ph_diag_enabled() ? ph_now_us() : 0;
+    gint64 t0 = ph_diag_enabled_i() ? ph_now_us_i() : 0;
 
     b->data.numSamples = nframes;
     if (b->data.inputs && b->data.inputs[0].channelBuffers32) {
@@ -608,30 +594,14 @@ extern "C" void pluginhost_process(PluginInstance *inst, float *L, float *R, int
     }
 
     if (t0) {
-        gint64 d = ph_now_us() - t0;
+        gint64 d = ph_now_us_i() - t0;
         if (d > inst->diag_max_us)
             inst->diag_max_us = d;
     }
 
-    /* Safety net: a misbehaving plugin must never send NaN/inf or a runaway
-     * level to the speakers. Replace non-finite samples, clamp magnitude. */
-    for (int i = 0; i < nframes; i++) {
-        float a = L[i], c = R[i];
-        if (!std::isfinite(a))
-            a = 0.0f;
-        else if (a > 4.0f)
-            a = 4.0f;
-        else if (a < -4.0f)
-            a = -4.0f;
-        if (!std::isfinite(c))
-            c = 0.0f;
-        else if (c > 4.0f)
-            c = 4.0f;
-        else if (c < -4.0f)
-            c = -4.0f;
-        L[i] = a;
-        R[i] = c;
-    }
+    /* Safety net: replace NaN/inf, clamp runaway magnitude (shared helper —
+     * every backend's process path must end with it). */
+    ph_safety_clamp(L, R, nframes);
 
     if (blend) { /* wet/dry crossfade */
         float wet = mq * (1.0f / 32768.0f);
@@ -673,7 +643,9 @@ static inline void ph_deliver_controller(Vst3Backend *b, int channel, int ctrl_n
 extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev,
                                         float *L, float *R, int nframes)
 {
-    if (!inst || !inst->b || !inst->b->processor)
+    /* LV2 instruments are not hosted yet (no MIDI→atom forge; they are
+     * excluded from the catalog) — leave the caller's silent buffers as-is. */
+    if (!inst || inst->format != PH_VST3 || !inst->b || !inst->b->processor)
         return;
     if (!g_atomic_int_get(&inst->active))
         return; /* bypassed: leave the caller's (silent) buffers as-is */
@@ -682,7 +654,7 @@ extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent 
         return;
 
     rt_set_denormal_mode();
-    gint64 t0 = ph_diag_enabled() ? ph_now_us() : 0;
+    gint64 t0 = ph_diag_enabled_i() ? ph_now_us_i() : 0;
 
     /* This block's MIDI as VST3 note events (pre-allocated event list). */
     b->in_events.clear();
@@ -763,36 +735,26 @@ extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent 
     }
 
     if (t0) {
-        gint64 d = ph_now_us() - t0;
+        gint64 d = ph_now_us_i() - t0;
         if (d > inst->diag_max_us)
             inst->diag_max_us = d;
     }
 
     /* Same speaker-safety net as pluginhost_process. */
-    for (int i = 0; i < nframes; i++) {
-        float a = L[i], c = R[i];
-        if (!std::isfinite(a))
-            a = 0.0f;
-        else if (a > 4.0f)
-            a = 4.0f;
-        else if (a < -4.0f)
-            a = -4.0f;
-        if (!std::isfinite(c))
-            c = 0.0f;
-        else if (c > 4.0f)
-            c = 4.0f;
-        else if (c < -4.0f)
-            c = -4.0f;
-        L[i] = a;
-        R[i] = c;
-    }
+    ph_safety_clamp(L, R, nframes);
 }
 
 /* ---- Reset / state ---- */
 
 extern "C" void pluginhost_reset(PluginInstance *inst)
 {
-    if (!inst || !inst->b)
+    if (!inst)
+        return;
+    if (inst->format == PH_LV2) {
+        ph_lv2_reset(inst);
+        return;
+    }
+    if (!inst->b)
         return;
     Vst3Backend *b = inst->b;
     /* Inactive→active cycle resets the processor's internal state. */
@@ -816,7 +778,11 @@ extern "C" gboolean pluginhost_state_save(PluginInstance *inst, void **out, gsiz
         *out = NULL;
     if (out_len)
         *out_len = 0;
-    if (!inst || !inst->b || !inst->b->component || !out || !out_len)
+    if (!inst || !out || !out_len)
+        return FALSE;
+    if (inst->format == PH_LV2)
+        return ph_lv2_state_save(inst, out, out_len);
+    if (!inst->b || !inst->b->component)
         return FALSE;
     Vst3Backend *b = inst->b;
 
@@ -847,7 +813,11 @@ extern "C" gboolean pluginhost_state_save(PluginInstance *inst, void **out, gsiz
 
 extern "C" gboolean pluginhost_state_load(PluginInstance *inst, const void *data, gsize len)
 {
-    if (!inst || !inst->b || !inst->b->component || !data || len < 8)
+    if (!inst || !data)
+        return FALSE;
+    if (inst->format == PH_LV2)
+        return ph_lv2_state_load(inst, data, len);
+    if (!inst->b || !inst->b->component || len < 8)
         return FALSE;
     Vst3Backend *b = inst->b;
 
@@ -903,9 +873,26 @@ extern "C" gboolean pluginhost_state_load(PluginInstance *inst, const void *data
 #define PH_PRESET_VERSION 1u
 #define PH_PRESET_HDR_LEN (PH_PRESET_MAGIC_LEN + 4 + 16) /* 28 */
 
+/* 16-byte plugin identity for the preset header: the VST3 class CID, or for
+ * LV2 the MD5 digest of the identity key (the plugin URI) — same width, same
+ * "wrong plugin" rejection semantics. */
+static void ph_preset_guard(PluginInstance *inst, guint8 out[16])
+{
+    memset(out, 0, 16);
+    if (inst->format == PH_VST3 && inst->b) {
+        memcpy(out, inst->b->class_uid, 16);
+        return;
+    }
+    GChecksum *ck = g_checksum_new(G_CHECKSUM_MD5);
+    g_checksum_update(ck, (const guchar *)(inst->key ? inst->key : ""), -1);
+    gsize len = 16;
+    g_checksum_get_digest(ck, out, &len);
+    g_checksum_free(ck);
+}
+
 extern "C" gboolean pluginhost_preset_save(PluginInstance *inst, const char *path)
 {
-    if (!inst || !inst->b || !path || !path[0])
+    if (!inst || !path || !path[0])
         return FALSE;
 
     void *blob = NULL;
@@ -918,7 +905,9 @@ extern "C" gboolean pluginhost_preset_save(PluginInstance *inst, const char *pat
     memcpy(buf, PH_PRESET_MAGIC, PH_PRESET_MAGIC_LEN);
     guint32 ver = GUINT32_TO_LE(PH_PRESET_VERSION);
     memcpy(buf + PH_PRESET_MAGIC_LEN, &ver, 4);
-    memcpy(buf + PH_PRESET_MAGIC_LEN + 4, inst->b->class_uid, 16);
+    guint8 guard[16];
+    ph_preset_guard(inst, guard);
+    memcpy(buf + PH_PRESET_MAGIC_LEN + 4, guard, 16);
     memcpy(buf + PH_PRESET_HDR_LEN, blob, blen);
     g_free(blob);
 
@@ -935,7 +924,7 @@ extern "C" gboolean pluginhost_preset_save(PluginInstance *inst, const char *pat
 
 extern "C" gboolean pluginhost_preset_load(PluginInstance *inst, const char *path)
 {
-    if (!inst || !inst->b || !path || !path[0])
+    if (!inst || !path || !path[0])
         return FALSE;
 
     gchar *data = NULL;
@@ -958,9 +947,11 @@ extern "C" gboolean pluginhost_preset_load(PluginInstance *inst, const char *pat
         guint32 ver;
         memcpy(&ver, p + PH_PRESET_MAGIC_LEN, 4);
         ver = GUINT32_FROM_LE(ver);
+        guint8 guard[16];
+        ph_preset_guard(inst, guard);
         if (ver != PH_PRESET_VERSION) {
             g_warning("pluginhost: unsupported preset version %u", ver);
-        } else if (memcmp(p + PH_PRESET_MAGIC_LEN + 4, inst->b->class_uid, 16) != 0) {
+        } else if (memcmp(p + PH_PRESET_MAGIC_LEN + 4, guard, 16) != 0) {
             g_warning("pluginhost: preset is for a different plugin");
         } else {
             ok = pluginhost_state_load(inst, p + PH_PRESET_HDR_LEN, len - PH_PRESET_HDR_LEN);
@@ -1024,6 +1015,8 @@ extern "C" const char *pluginhost_category(PluginInstance *inst)
 
 extern "C" guint pluginhost_param_count(PluginInstance *inst)
 {
+    if (inst && inst->format == PH_LV2)
+        return ph_lv2_param_count(inst);
     return (inst && inst->b && inst->b->controller) ? (guint)inst->b->param_ids.size() : 0;
 }
 
@@ -1032,6 +1025,10 @@ extern "C" void pluginhost_param_name(PluginInstance *inst, guint i, char *buf, 
     if (!buf || buflen <= 0)
         return;
     buf[0] = 0;
+    if (inst && inst->format == PH_LV2) {
+        ph_lv2_param_name(inst, i, buf, buflen);
+        return;
+    }
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
         return;
     ParameterInfo info;
@@ -1041,6 +1038,8 @@ extern "C" void pluginhost_param_name(PluginInstance *inst, guint i, char *buf, 
 
 extern "C" float pluginhost_param_get(PluginInstance *inst, guint i)
 {
+    if (inst && inst->format == PH_LV2)
+        return ph_lv2_param_get(inst, i);
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
         return 0.0f;
     return (float)inst->b->controller->getParamNormalized(inst->b->param_ids[i]);
@@ -1048,6 +1047,10 @@ extern "C" float pluginhost_param_get(PluginInstance *inst, guint i)
 
 extern "C" void pluginhost_param_set(PluginInstance *inst, guint i, float v)
 {
+    if (inst && inst->format == PH_LV2) {
+        ph_lv2_param_set(inst, i, v);
+        return;
+    }
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
         return;
     if (v < 0.0f)
@@ -1066,6 +1069,10 @@ extern "C" void pluginhost_param_display(PluginInstance *inst, guint i, char *bu
     if (!buf || buflen <= 0)
         return;
     buf[0] = 0;
+    if (inst && inst->format == PH_LV2) {
+        ph_lv2_param_display(inst, i, buf, buflen);
+        return;
+    }
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
         return;
     Vst3Backend *b = inst->b;
@@ -1087,6 +1094,8 @@ extern "C" gboolean pluginhost_param_is_stepped(PluginInstance *inst, guint i, g
 {
     if (steps)
         *steps = 1;
+    if (inst && inst->format == PH_LV2)
+        return ph_lv2_param_is_stepped(inst, i, steps);
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
         return FALSE;
     ParameterInfo info;
@@ -1097,6 +1106,25 @@ extern "C" gboolean pluginhost_param_is_stepped(PluginInstance *inst, guint i, g
     if (steps)
         *steps = info.stepCount;
     return TRUE;
+}
+
+/* ---- Native plugin editor (dispatch; only the LV2 backend has one) ---- */
+
+extern "C" void *pluginhost_ui_create(PluginInstance *inst)
+{
+    return (inst && inst->format == PH_LV2) ? ph_lv2_ui_create(inst) : NULL;
+}
+
+extern "C" void pluginhost_ui_poll(PluginInstance *inst)
+{
+    if (inst && inst->format == PH_LV2)
+        ph_lv2_ui_poll(inst);
+}
+
+extern "C" void pluginhost_ui_destroy(PluginInstance *inst)
+{
+    if (inst && inst->format == PH_LV2)
+        ph_lv2_ui_destroy(inst);
 }
 
 /* ---- File loading (INamFileLoader) ---- */

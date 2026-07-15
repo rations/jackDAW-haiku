@@ -6,18 +6,21 @@
 G_BEGIN_DECLS
 
 /*
- * Plugin host — VST3-only port of the Linux JackDAW unified host API subset.
- * Discovery and instantiation happen on a UI thread; pluginhost_process() is
- * RT-safe (no malloc, no locks). Parameter changes travel UI → RT through the
- * SDK's lock-free ParameterChangeTransfer ring, never by touching RT state
- * from the UI thread. The implementation (pluginhost.cpp, C++17) builds on
- * the Haiku-native VST3 SDK port from the sibling VST3-haiku project.
+ * Plugin host — port of the Linux JackDAW unified host API subset with two
+ * backends: VST3 (pluginhost.cpp, built on the Haiku-native VST3 SDK port
+ * from the sibling VST3-haiku project) and LV2 (pluginhost_lv2.cpp, built on
+ * lilv from the sibling LV2-haiku project). Discovery and instantiation
+ * happen on a UI thread; pluginhost_process() is RT-safe (no malloc, no
+ * locks). Parameter changes travel UI → RT through a lock-free ring (the
+ * SDK's ParameterChangeTransfer for VST3, a zix ring for LV2), never by
+ * touching RT state from the UI thread.
  */
 
-typedef enum { PH_VST3 = 0, PH_NFORMATS } PluginFormat;
+typedef enum { PH_VST3 = 0, PH_LV2, PH_NFORMATS } PluginFormat;
 
-/* A catalog entry produced by scanning. key = "<bundle path>\n<class name>"
- * (one .vst3 module can contain many effect classes, e.g. mda-vst3). */
+/* A catalog entry produced by scanning. VST3: key = "<bundle path>\n<class
+ * name>" (one .vst3 module can contain many effect classes, e.g. mda-vst3).
+ * LV2: key = the plugin URI. */
 typedef struct {
     PluginFormat format;
     char *key;
@@ -118,6 +121,20 @@ void pluginhost_param_display(PluginInstance *inst, guint i, char *buf, int bufl
  * cycling control rather than a slider. *steps = number of steps (>= 1). */
 gboolean pluginhost_param_is_stepped(PluginInstance *inst, guint i, gint *steps);
 
+/* Native plugin editor. If the plugin ships an editor the host can embed (an
+ * LV2 HaikuUI — its LV2UI_Widget is a BView*; VST3 has no Haiku IPlugView
+ * platform type yet), ui_create returns that BView* as a void* for the FX
+ * window to AddChild() in place of the generic slider panel; otherwise NULL.
+ * Created once per instance (repeat calls return the same view). The view
+ * runs on the caller's window looper from then on; call ui_poll ~30 Hz and
+ * ui_destroy from that looper with it locked. ui_destroy detaches and deletes
+ * the view (the UI's cleanup() owns it) — never delete the view yourself —
+ * and must run before pluginhost_free. All three are no-ops / NULL when the
+ * plugin has no embeddable editor. */
+void *pluginhost_ui_create(PluginInstance *inst);
+void pluginhost_ui_poll(PluginInstance *inst);
+void pluginhost_ui_destroy(PluginInstance *inst);
+
 /* File loading without a plugin GUI (the INamFileLoader host extension,
  * discovered via queryInterface — NAMku implements it; plug-ins that don't
  * simply report no loader and get no file buttons). which: 0 = model (.nam),
@@ -134,13 +151,13 @@ gboolean pluginhost_file_set(PluginInstance *inst, int which, const char *path);
  * window-thread only, except the RT-safe learn capture. */
 gboolean ph_drum_is_rack(PluginInstance *inst);
 gint ph_drum_max_slots(void);
-gint ph_drum_slot_count(PluginInstance *inst);           /* visible rows: 1..max */
-void ph_drum_add_slot(PluginInstance *inst);             /* +1 row (capped) */
+gint ph_drum_slot_count(PluginInstance *inst); /* visible rows: 1..max */
+void ph_drum_add_slot(PluginInstance *inst);   /* +1 row (capped) */
 gboolean ph_drum_file_get(PluginInstance *inst, int slot, char *buf, int buflen);
 gboolean ph_drum_file_set(PluginInstance *inst, int slot, const char *path);
 float ph_drum_volume_get(PluginInstance *inst, int slot); /* 0..1 */
 void ph_drum_volume_set(PluginInstance *inst, int slot, float v);
-gint ph_drum_note_get(PluginInstance *inst, int slot);    /* MIDI note, or -1 */
+gint ph_drum_note_get(PluginInstance *inst, int slot); /* MIDI note, or -1 */
 void ph_drum_note_set(PluginInstance *inst, int slot, gint note);
 
 /* MIDI learn: arm capture, then poll for the note the user hit. arm(TRUE)

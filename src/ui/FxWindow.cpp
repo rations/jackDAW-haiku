@@ -1,5 +1,6 @@
 #include "FxWindow.h"
 
+#include <Alert.h>
 #include <Button.h>
 #include <CheckBox.h>
 #include <ControlLook.h>
@@ -137,6 +138,8 @@ enum {
     MSG_PRESET_LOAD = 'plod',      // "Load preset…" clicked → show B_OPEN_PANEL
     MSG_PRESET_SAVE_REFS = 'psrf', // save panel result: entry_ref "directory" + "name"
     MSG_PRESET_LOAD_REFS = 'plrf', // open panel result: entry_ref "refs"
+
+    MSG_FXUI_TICK = 'uitk', // ~30 Hz host→UI feedback for an embedded editor
 };
 
 static const int32 kSliderSteps = 1000; // BSlider is integer; params are [0,1]
@@ -146,7 +149,7 @@ FxWindow::FxWindow(JackDawTrack *track, MainWindow *main)
               B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE),
       m_track(track), m_main(main), m_file_panel(NULL), m_save_panel(NULL), m_preset_save(NULL),
       m_preset_load(NULL), m_model_label(NULL), m_ir_label(NULL), m_learn_slot(-1),
-      m_learn_poll(NULL)
+      m_learn_poll(NULL), m_embedded_ui(NULL), m_embedded_inst(NULL), m_ui_poll(NULL)
 {
     g_object_ref(m_track);
 
@@ -216,6 +219,15 @@ FxWindow::FxWindow(JackDawTrack *track, MainWindow *main)
 
 FxWindow::~FxWindow()
 {
+    // Tear every native editor down BEFORE ~BWindow deletes child views: the
+    // UI's cleanup() removes and deletes its own view, so a view left
+    // attached here would be deleted twice. (Same discipline as the Linux
+    // FX window freeing its suil editors before the GTK window dies.)
+    DetachEmbeddedUi(false);
+    guint n = jackdaw_track_fx_count(m_track);
+    for (guint i = 0; i < n; i++)
+        pluginhost_ui_destroy((PluginInstance *)jackdaw_track_fx_get(m_track, i));
+    delete m_ui_poll;
     delete m_learn_poll;
     delete m_file_panel;
     delete m_save_panel;
@@ -264,6 +276,7 @@ void FxWindow::BuildAddMenu()
     for (const GList *l = cat; l; l = l->next) {
         const PluginInfo *pi = (const PluginInfo *)l->data;
         BMessage *msg = new BMessage(MSG_FX_ADD);
+        msg->AddInt32("format", (int32)pi->format);
         msg->AddString("key", pi->key);
         msg->AddString("name", pi->name);
         msg->AddString("category", pi->category);
@@ -346,8 +359,26 @@ void FxWindow::UpdateFileLabels()
 // BGroupLayouts of each row and the trailing glue are BLayoutItems, not views,
 // so they accumulate on every rebuild and inflate the panel's reported size.
 // Clear both: delete the child views, then any layout items left behind.
+// Detach (and optionally destroy) the embedded native editor. Detaching must
+// happen before the generic delete loop below ever runs: the view belongs to
+// the plugin UI, which deletes it itself in cleanup().
+void FxWindow::DetachEmbeddedUi(bool destroy)
+{
+    delete m_ui_poll;
+    m_ui_poll = NULL;
+    if (m_embedded_ui) {
+        m_param_group->RemoveChild(m_embedded_ui);
+        m_embedded_ui = NULL;
+    }
+    if (destroy && m_embedded_inst)
+        pluginhost_ui_destroy(m_embedded_inst);
+    m_embedded_inst = NULL;
+}
+
 void FxWindow::ClearParamPanel()
 {
+    DetachEmbeddedUi(false);
+
     m_sliders.clear();
     m_value_labels.clear();
     m_model_label = NULL;
@@ -385,6 +416,24 @@ void FxWindow::RebuildParamPanel()
     if (inst && ph_drum_is_rack(inst)) {
         BuildDrumRack(inst);
         return;
+    }
+
+    // A plugin that ships a native editor (LV2 HaikuUI) shows it in place of
+    // the generic sliders — same behavior as the Linux FX window embedding
+    // suil editors. The view is created once per instance and re-attached on
+    // every selection; a ~30 Hz runner delivers host→UI port_event feedback.
+    if (inst) {
+        BView *ui = (BView *)pluginhost_ui_create(inst);
+        if (ui) {
+            BLayoutBuilder::Group<> uiBuilder(m_param_group->GroupLayout());
+            uiBuilder.Add(ui);
+            uiBuilder.AddGlue();
+            m_embedded_ui = ui;
+            m_embedded_inst = inst;
+            BMessage tick(MSG_FXUI_TICK);
+            m_ui_poll = new BMessageRunner(BMessenger(this), &tick, 33000);
+            return;
+        }
     }
 
     BLayoutBuilder::Group<> builder(m_param_group->GroupLayout());
@@ -547,19 +596,27 @@ void FxWindow::MessageReceived(BMessage *message)
 
         case MSG_FX_ADD: {
             const char *key = NULL, *name = NULL, *category = NULL;
+            int32 format = PH_VST3;
             message->FindString("key", &key);
             message->FindString("name", &name);
             message->FindString("category", &category);
-            if (!key || !name)
+            message->FindInt32("format", &format);
+            if (!key || !name || format < 0 || format >= PH_NFORMATS)
                 break;
             PluginInfo info;
-            info.format = PH_VST3;
+            info.format = (PluginFormat)format;
             info.key = (char *)key;
             info.name = (char *)name;
             info.category = (char *)(category ? category : "");
+            info.is_instrument = FALSE; /* derived from the category on load */
             PluginInstance *inst = pluginhost_instantiate(&info);
             if (!inst) {
                 g_warning("FxWindow: could not instantiate '%s'", name);
+                char text[256];
+                snprintf(text, sizeof(text), "Could not load the plugin \"%s\".", name);
+                (new BAlert("fx-load-failed", text, "OK", NULL, NULL, B_WIDTH_AS_USUAL,
+                            B_WARNING_ALERT))
+                    ->Go(NULL);
                 break;
             }
             jackdaw_track_fx_add(m_track, inst);
@@ -572,10 +629,24 @@ void FxWindow::MessageReceived(BMessage *message)
             RebuildParamPanel();
             break;
 
+        case MSG_FXUI_TICK: {
+            // We are the looper thread (locked in MessageReceived), as the
+            // HaikuUI port_event contract requires.
+            if (m_embedded_inst)
+                pluginhost_ui_poll(m_embedded_inst);
+            break;
+        }
+
         case MSG_FX_REMOVE: {
             int32 sel = m_chain_list->CurrentSelection();
             if (sel < 0)
                 break;
+            // The editor must be torn down before its instance is retired.
+            PluginInstance *inst = (PluginInstance *)jackdaw_track_fx_get(m_track, (guint)sel);
+            if (inst && inst == m_embedded_inst)
+                DetachEmbeddedUi(true);
+            else if (inst)
+                pluginhost_ui_destroy(inst);
             jackdaw_track_fx_remove(m_track, (guint)sel);
             guint n = jackdaw_track_fx_count(m_track);
             RebuildChainList(n > 0 ? MIN((int)n - 1, (int)sel) : -1);

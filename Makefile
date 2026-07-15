@@ -1,12 +1,18 @@
 # Builds on Haiku only (uses the non-packaged JACK install and glib2 from pkgman).
 # Engine/model code is C (gnu99, glib2 — no GTK); UI code is C++ (Interface Kit).
 # VST3 hosting builds against the sibling VST3-haiku checkout (Haiku-patched
-# Steinberg SDK sources + its cmake-built static libs).
+# Steinberg SDK sources + its cmake-built static libs); LV2 hosting builds
+# against the sibling LV2-haiku checkout (lilv/zix/serd/sord/sratom built as
+# static libs into its build/stage prefix).
 CC  = gcc
 CXX = g++
 NONPACKAGED = /boot/system/non-packaged
 VST3_SDK ?= $(HOME)/VST3-haiku/vst3sdk
 VST3_LIB ?= $(HOME)/VST3-haiku/build/lib/Release
+LV2_STAGE ?= $(HOME)/LV2-haiku/build/stage
+LV2_PC     = PKG_CONFIG_PATH=$(LV2_STAGE)/lib/pkgconfig pkg-config
+LV2_CFLAGS := $(shell $(LV2_PC) --cflags lilv-0 zix-0 lv2)
+LV2_LIBS   := $(shell $(LV2_PC) --static --libs lilv-0 zix-0)
 
 # gio-2.0: project save/load copies bundle audio via GFile (g_file_copy).
 GLIB_CFLAGS := $(shell pkg-config --cflags glib-2.0 gobject-2.0 gio-2.0)
@@ -25,7 +31,7 @@ HOST_CXXFLAGS = $(CXXFLAGS) -I$(VST3_SDK) -DRELEASE=1
 # -ltracker: BFilePanel (open/save panels) lives in libtracker, not libbe.
 LDFLAGS  = -L$(NONPACKAGED)/lib -L$(VST3_LIB) -ljack -lbe -ltracker \
            -lsdk_hosting -lsdk_common -lbase -lpluginterfaces \
-           $(GLIB_LIBS) $(AUDIO_LIBS)
+           $(LV2_LIBS) $(GLIB_LIBS) $(AUDIO_LIBS)
 
 C_SOURCES   = src/engine/glib_check.c src/engine/message.c src/engine/settings.c \
               src/engine/track.c src/engine/project.c src/engine/jackdaw-engine.c \
@@ -40,7 +46,7 @@ CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/MixerView.cpp src/ui/MixerWindow.cpp src/ui/RegionGainWindow.cpp \
               src/ui/MidiWindow.cpp src/ui/FxWindow.cpp src/ui/RenderWindow.cpp \
               src/ui/IoWindow.cpp src/ui/MidiControlWindow.cpp
-HOST_SOURCES = src/host/pluginhost.cpp
+HOST_SOURCES = src/host/pluginhost.cpp src/host/pluginhost_lv2.cpp
 
 # SDK sources compiled directly (they are not part of the SDK's static libs;
 # same set the VST3-haiku hosts compile): the Haiku module loader, the
@@ -60,6 +66,11 @@ $(TARGET): $(OBJECTS)
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# The LV2 backend TU gets the lilv/zix include paths and never the VST3 SDK's
+# (explicit rule, so it wins over the src/host/%.o pattern below).
+src/host/pluginhost_lv2.o: src/host/pluginhost_lv2.cpp
+	$(CXX) $(CXXFLAGS) $(LV2_CFLAGS) -c $< -o $@
 
 src/host/%.o: src/host/%.cpp
 	$(CXX) $(HOST_CXXFLAGS) -c $< -o $@

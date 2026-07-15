@@ -21,11 +21,13 @@ class MainWindow;
 
 typedef struct PluginInstance PluginInstance;
 
-/* Per-track FX chain editor: add/remove/reorder plugins, a generic parameter
- * panel (one BSlider per VST3 parameter, values shown with the plug-in's own
- * display strings), bypass + wet/dry mix, and — for plug-ins implementing the
- * INamFileLoader host extension (NAMku) — "Load model…"/"Load IR…" buttons
- * backed by a BFilePanel.
+/* Per-track FX chain editor: add/remove/reorder plugins, bypass + wet/dry
+ * mix, and a parameter area that shows the plug-in's own native editor when
+ * it has one (an LV2 HaikuUI BView, embedded like the Linux JackDAW embeds
+ * suil editors) and otherwise a generic panel (one BSlider per parameter,
+ * values shown with the plug-in's own display strings). Plug-ins implementing
+ * the INamFileLoader host extension (NAMku) additionally get "Load model…"/
+ * "Load IR…" buttons backed by a BFilePanel.
  *
  * Threading: this window's looper thread is the ONLY mutator of its track's
  * FX chain and the only caller into each instance's non-RT plugin-host API
@@ -49,6 +51,10 @@ private:
     void RebuildParamPanel();
     void BuildDrumRack(PluginInstance *inst);
     void ClearParamPanel();
+    // Detach the embedded native editor view (without deleting it — the UI's
+    // own cleanup owns the view) and, when destroy is true, tear the editor
+    // down via pluginhost_ui_destroy.
+    void DetachEmbeddedUi(bool destroy);
     void SyncControlsRow();
     void UpdateValueLabel(guint param);
     void UpdateFileLabels();
@@ -83,6 +89,11 @@ private:
     std::vector<BStringView *> m_drum_note;
     int m_learn_slot;             // slot whose Learn is armed, or -1
     BMessageRunner *m_learn_poll; // polls the RT-captured learn note
+
+    // Embedded native plugin editor (shown instead of the generic sliders).
+    BView *m_embedded_ui;            // borrowed; owned by the plugin UI
+    PluginInstance *m_embedded_inst; // instance the embedded view belongs to
+    BMessageRunner *m_ui_poll;       // ~30 Hz host→UI port_event feedback
 };
 
 #endif // FX_WINDOW_H
