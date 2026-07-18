@@ -139,10 +139,16 @@ enum {
     MSG_PRESET_SAVE_REFS = 'psrf', // save panel result: entry_ref "directory" + "name"
     MSG_PRESET_LOAD_REFS = 'plrf', // open panel result: entry_ref "refs"
 
-    MSG_FXUI_TICK = 'uitk', // ~30 Hz host→UI feedback for an embedded editor
+    MSG_FXUI_TICK = 'uitk',    // ~30 Hz host→UI feedback for an embedded editor
+    MSG_FX_TOGGLE_UI = 'fxtg', // switch the selected plugin editor ⇄ generic panel
 };
 
 static const int32 kSliderSteps = 1000; // BSlider is integer; params are [0,1]
+
+// Vertical space around an embedded editor (toggle-button row + add-effect
+// toolbar + window insets/spacing) added to the editor's own height when
+// sizing the window so the whole editor is visible.
+static const float kEditorChromeHeight = 118.0f;
 
 FxWindow::FxWindow(JackDawTrack *track, MainWindow *main)
     : BWindow(BRect(0, 0, 900, 460), "Effects", B_TITLED_WINDOW,
@@ -411,29 +417,60 @@ void FxWindow::RebuildParamPanel()
     PluginInstance *inst = Selected();
     SyncControlsRow();
 
-    // A drum rack gets a purpose-built per-slot panel instead of the generic
-    // slider list.
-    if (inst && ph_drum_is_rack(inst)) {
-        BuildDrumRack(inst);
-        return;
-    }
-
-    // A plugin that ships a native editor (LV2 HaikuUI) shows it in place of
-    // the generic sliders — same behavior as the Linux FX window embedding
-    // suil editors. The view is created once per instance and re-attached on
-    // every selection; a ~30 Hz runner delivers host→UI port_event feedback.
-    if (inst) {
+    // A plugin that ships a native editor (LV2 HaikuUI or a VST3 IPlugView
+    // supporting kPlatformTypeHaikuBView) shows it in place of the generic
+    // panels — same behavior as the Linux FX window embedding suil editors —
+    // unless the user toggled this instance to the generic controls. The view
+    // is created once per instance and re-attached on every selection; a
+    // ~30 Hz runner delivers host→UI feedback.
+    if (inst && m_prefer_generic.find(inst) == m_prefer_generic.end()) {
         BView *ui = (BView *)pluginhost_ui_create(inst);
         if (ui) {
             BLayoutBuilder::Group<> uiBuilder(m_param_group->GroupLayout());
-            uiBuilder.Add(ui);
-            uiBuilder.AddGlue();
+            // clang-format off
+            uiBuilder
+                .AddGroup(B_HORIZONTAL, 6.0f)
+                    .Add(new BButton("ui-toggle", "Generic controls",
+                                     new BMessage(MSG_FX_TOGGLE_UI)))
+                    .AddGlue()
+                .End()
+                .Add(ui)
+                .AddGlue();
+            // clang-format on
             m_embedded_ui = ui;
             m_embedded_inst = inst;
+            // The editor sits in a scroll view that clips a tall editor to the
+            // visible height, so grow the window to show the whole editor plus
+            // the toggle-button row and the surrounding toolbar/insets chrome.
+            float editorH = ui->MinSize().height;
+            if (editorH > 0.0f)
+                ResizeTo(Bounds().Width(), editorH + kEditorChromeHeight);
             BMessage tick(MSG_FXUI_TICK);
             m_ui_poll = new BMessageRunner(BMessenger(this), &tick, 33000);
             return;
         }
+    }
+
+    // The way back to the editor exists only for instances toggled away from
+    // one (editor-less plugins never enter m_prefer_generic).
+    bool editorToggle = inst && m_prefer_generic.find(inst) != m_prefer_generic.end();
+
+    // A drum rack gets a purpose-built per-slot panel instead of the generic
+    // slider list.
+    if (inst && ph_drum_is_rack(inst)) {
+        if (editorToggle) {
+            BLayoutBuilder::Group<> tb(m_param_group->GroupLayout());
+            // clang-format off
+            tb
+                .AddGroup(B_HORIZONTAL, 6.0f)
+                    .Add(new BButton("ui-toggle", "Plugin editor",
+                                     new BMessage(MSG_FX_TOGGLE_UI)))
+                    .AddGlue()
+                .End();
+            // clang-format on
+        }
+        BuildDrumRack(inst);
+        return;
     }
 
     BLayoutBuilder::Group<> builder(m_param_group->GroupLayout());
@@ -441,6 +478,17 @@ void FxWindow::RebuildParamPanel()
         builder.Add(new BStringView("hint", "Select or add an effect."));
         builder.AddGlue();
         return;
+    }
+
+    if (editorToggle) {
+        // clang-format off
+        builder
+            .AddGroup(B_HORIZONTAL, 6.0f)
+                .Add(new BButton("ui-toggle", "Plugin editor",
+                                 new BMessage(MSG_FX_TOGGLE_UI)))
+                .AddGlue()
+            .End();
+        // clang-format on
     }
 
     // File loading rows first (NAMku's model/IR — the slider-only equivalent
@@ -637,6 +685,16 @@ void FxWindow::MessageReceived(BMessage *message)
             break;
         }
 
+        case MSG_FX_TOGGLE_UI: {
+            PluginInstance *inst = Selected();
+            if (!inst)
+                break;
+            if (!m_prefer_generic.erase(inst))
+                m_prefer_generic.insert(inst);
+            RebuildParamPanel();
+            break;
+        }
+
         case MSG_FX_REMOVE: {
             int32 sel = m_chain_list->CurrentSelection();
             if (sel < 0)
@@ -647,6 +705,8 @@ void FxWindow::MessageReceived(BMessage *message)
                 DetachEmbeddedUi(true);
             else if (inst)
                 pluginhost_ui_destroy(inst);
+            if (inst)
+                m_prefer_generic.erase(inst); // pointer may be reused later
             jackdaw_track_fx_remove(m_track, (guint)sel);
             guint n = jackdaw_track_fx_count(m_track);
             RebuildChainList(n > 0 ? MIN((int)n - 1, (int)sel) : -1);

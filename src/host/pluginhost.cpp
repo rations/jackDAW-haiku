@@ -1,18 +1,23 @@
 /* pluginhost.cpp — VST3 backend + format dispatch for the jackDAW plugin host.
  *
  * Port of the Linux JackDAW host (pluginhost.c + pluginhost_vst3.cpp) reduced
- * to the VST3 backend, with every X11/GDK editor path removed: on Haiku no
- * VST3 plug-in ships a compatible IPlugView, so VST3 hosting is
- * parameter-based and the FX window builds its own native controls from the
- * IEditController. This TU also owns the public entry points, dispatching
- * PH_LV2 instances to the LV2 backend (pluginhost_lv2.cpp) — the Steinberg
- * SDK headers here and lilv there never meet in one TU.
+ * to the VST3 backend, with every X11/GDK editor path replaced by the native
+ * Haiku one: plug-ins built against the Haiku-patched SDK can return an
+ * IPlugView supporting kPlatformTypeHaikuBView (the host passes a BView* it
+ * owns; the plug-in AddChild()s its editor). Plug-ins without an editor keep
+ * the parameter-based FX window controls. This TU also owns the public entry
+ * points, dispatching PH_LV2 instances to the LV2 backend
+ * (pluginhost_lv2.cpp) — the Steinberg SDK headers here and lilv there never
+ * meet in one TU.
  *
- * Threading: instantiate/free/params/state run on the owning FX window's
- * looper thread; pluginhost_process() runs on the JACK RT thread. UI → RT
- * parameter changes go through the SDK's lock-free ParameterChangeTransfer
- * ring (the Linux original wrote the RT ParameterChanges from the UI thread —
- * fixed here). Nothing on the RT path allocates, locks, or logs.
+ * Threading: instantiate/free/params/state/editor run on the owning FX
+ * window's looper thread; pluginhost_process() runs on the JACK RT thread.
+ * UI → RT parameter changes go through the SDK's lock-free
+ * ParameterChangeTransfer ring (the Linux original wrote the RT
+ * ParameterChanges from the UI thread — fixed here); RT → UI output parameter
+ * changes (meters, DRUMku's learn feedback and pad activity) come back
+ * through a second transfer ring drained by pluginhost_ui_poll(). Nothing on
+ * the RT path allocates, locks, or logs.
  */
 
 #include "pluginhost.h"
@@ -26,6 +31,7 @@
 #include "public.sdk/source/vst/hosting/plugprovider.h"
 #include "public.sdk/source/vst/hosting/processdata.h"
 #include "public.sdk/source/vst/utility/stringconvert.h"
+#include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -37,6 +43,9 @@
 #include "inamfileloader.h"
 
 #include "engine/rt_denormal.h"
+
+#include <Looper.h> /* BLooper definition for the defensive editor teardown */
+#include <View.h>   /* native editor host view (kPlatformTypeHaikuBView) */
 
 #include <image.h> /* Haiku: get_next_image_info → own executable path */
 
@@ -108,6 +117,9 @@ static void ph_ensure_context(void)
 
 /* ---- Backend ---- */
 
+class Vst3ComponentHandler;
+class Vst3EditorHostView;
+
 struct Vst3Backend {
     VST3::Hosting::Module::Ptr module;
     IPtr<PlugProvider> provider;
@@ -118,12 +130,20 @@ struct Vst3Backend {
     IPtr<DRUMku::IDrumLoader> drum_loader;   /* NULL unless the plug-in is a drum rack */
     HostProcessData data;
     ProcessContext ctx;
-    ParameterChanges in_params;       /* RT-side, pre-allocated */
-    ParameterChangeTransfer transfer; /* UI → RT lock-free ring */
-    EventList in_events{256};         /* MIDI for instruments, pre-allocated */
+    ParameterChanges in_params;           /* RT-side, pre-allocated */
+    ParameterChangeTransfer transfer;     /* UI → RT lock-free ring */
+    ParameterChanges out_params;          /* RT-side output changes, pre-allocated */
+    ParameterChangeTransfer out_transfer; /* RT → UI lock-free ring */
+    EventList in_events{256};             /* MIDI for instruments, pre-allocated */
     int max_block = 0;
     std::vector<ParamID> param_ids;
     char class_uid[16] = {0}; /* VST3 class CID, for preset-file identity guard */
+
+    /* Native editor (kPlatformTypeHaikuBView). handler receives the editor's
+     * performEdit calls; editor_view is the host BView wrapper handed to the
+     * FX window (created once per instance, deleted in pluginhost_ui_destroy). */
+    Vst3ComponentHandler *handler = nullptr;
+    Vst3EditorHostView *editor_view = nullptr;
 
     /* MIDI CC / pitch-bend delivery (IMidiMapping). Built at load (non-RT):
      * midi_map is the queried interface; cc_param[ch*kCountCtrlNumber + cn] is
@@ -132,6 +152,159 @@ struct Vst3Backend {
     IPtr<IMidiMapping> midi_map;
     std::vector<ParamID> cc_param;
     std::vector<uint8> cc_valid;
+};
+
+/* Host IComponentHandler: receives parameter edits from a plug-in's own
+ * editor and forwards them to the RT thread. The editor already updated its
+ * controller value before calling performEdit (standard VST3 widget flow), so
+ * only the RT hand-off is needed — the same second half of
+ * pluginhost_param_set. Window-looper thread only. Ref counting is inert: the
+ * handler lives and dies with its backend. */
+class Vst3ComponentHandler : public IComponentHandler
+{
+public:
+    explicit Vst3ComponentHandler(Vst3Backend *b) : fBackend(b)
+    {
+    }
+    virtual ~Vst3ComponentHandler() = default;
+
+    tresult PLUGIN_API beginEdit(ParamID) SMTG_OVERRIDE
+    {
+        return kResultOk;
+    }
+    tresult PLUGIN_API performEdit(ParamID id, ParamValue value) SMTG_OVERRIDE
+    {
+        fBackend->transfer.addChange(id, value, 0);
+        return kResultOk;
+    }
+    tresult PLUGIN_API endEdit(ParamID) SMTG_OVERRIDE
+    {
+        return kResultOk;
+    }
+    tresult PLUGIN_API restartComponent(int32 flags) SMTG_OVERRIDE
+    {
+        /* Our plug-ins never call this; log so an unexpected request from a
+         * third-party plug-in is visible instead of silently ignored. */
+        g_message("pluginhost: restartComponent(0x%x) ignored", (unsigned)flags);
+        return kResultOk;
+    }
+
+    tresult PLUGIN_API queryInterface(const TUID _iid, void **obj) SMTG_OVERRIDE
+    {
+        if (!obj)
+            return kInvalidArgument;
+        if (FUnknownPrivate::iidEqual(_iid, IComponentHandler::iid) ||
+            FUnknownPrivate::iidEqual(_iid, FUnknown::iid)) {
+            *obj = static_cast<IComponentHandler *>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
+    {
+        return 100;
+    }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE
+    {
+        return 100;
+    }
+
+private:
+    Vst3Backend *fBackend;
+};
+
+/* Host BView wrapping a plug-in's IPlugView (kPlatformTypeHaikuBView): the FX
+ * window AddChild()s this view; the plug-in view attaches into it while the
+ * window looper is locked (AttachedToWindow/DetachedFromWindow both run under
+ * the lock). Also the IPlugFrame for plug-in-driven resizes. Owned by the
+ * backend; deleted in pluginhost_ui_destroy after the FX window removed it. */
+class Vst3EditorHostView : public BView, public IPlugFrame
+{
+public:
+    Vst3EditorHostView(IPlugView *view, BRect frame)
+        : BView(frame, "vst3-editor", B_FOLLOW_NONE, 0), fPlugView(view)
+    {
+        SetViewColor(B_TRANSPARENT_COLOR);
+        SetExplicitMinSize(BSize(frame.Width(), frame.Height()));
+        SetExplicitMaxSize(BSize(frame.Width(), frame.Height()));
+        SetExplicitPreferredSize(BSize(frame.Width(), frame.Height()));
+    }
+
+    void AttachedToWindow() override
+    {
+        BView::AttachedToWindow();
+        if (fPlugView && !fAttached) {
+            fPlugView->setFrame(this);
+            if (fPlugView->attached(this, kPlatformTypeHaikuBView) == kResultOk)
+                fAttached = true;
+            else
+                g_warning("pluginhost: IPlugView::attached() failed");
+        }
+    }
+
+    void DetachedFromWindow() override
+    {
+        DetachPlugView();
+        BView::DetachedFromWindow();
+    }
+
+    void DetachPlugView()
+    {
+        if (fPlugView && fAttached) {
+            fAttached = false;
+            fPlugView->setFrame(nullptr);
+            fPlugView->removed();
+        }
+    }
+
+    /* Final teardown (pluginhost_ui_destroy / pluginhost_free). */
+    void ReleasePlugView()
+    {
+        DetachPlugView();
+        if (fPlugView) {
+            fPlugView->release();
+            fPlugView = nullptr;
+        }
+    }
+
+    /* IPlugFrame — plug-in-driven resize (window looper thread). */
+    tresult PLUGIN_API resizeView(IPlugView *view, ViewRect *newSize) SMTG_OVERRIDE
+    {
+        if (!view || !newSize)
+            return kInvalidArgument;
+        float w = (float)newSize->getWidth() - 1, h = (float)newSize->getHeight() - 1;
+        SetExplicitMinSize(BSize(w, h));
+        SetExplicitMaxSize(BSize(w, h));
+        SetExplicitPreferredSize(BSize(w, h));
+        ResizeTo(w, h);
+        return view->onSize(newSize);
+    }
+
+    tresult PLUGIN_API queryInterface(const TUID _iid, void **obj) SMTG_OVERRIDE
+    {
+        if (!obj)
+            return kInvalidArgument;
+        if (FUnknownPrivate::iidEqual(_iid, IPlugFrame::iid) ||
+            FUnknownPrivate::iidEqual(_iid, FUnknown::iid)) {
+            *obj = static_cast<IPlugFrame *>(this);
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE
+    {
+        return 100;
+    }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE
+    {
+        return 100;
+    }
+
+private:
+    IPlugView *fPlugView;
+    bool fAttached = false;
 };
 
 /* PluginInstance itself lives in pluginhost_internal.h (shared with the LV2
@@ -441,6 +614,16 @@ extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
          * grows a queue: the ring, and the ParameterChanges it drains into. */
         b->transfer.setMaxParameters(MAX(256, (int32)b->param_ids.size() * 4));
         b->in_params.setMaxParameters((int32)b->param_ids.size());
+        /* ... and of the RT → UI path (processor output parameter changes,
+         * drained into out_transfer after each process() call). */
+        b->out_params.setMaxParameters((int32)b->param_ids.size());
+        b->out_transfer.setMaxParameters(MAX(256, (int32)b->param_ids.size() * 4));
+        b->data.outputParameterChanges = &b->out_params;
+
+        /* Receive performEdit from the plug-in's own editor (native BView
+         * path); without a handler the editor's knob moves never reach RT. */
+        b->handler = new Vst3ComponentHandler(b);
+        b->controller->setComponentHandler(b->handler);
 
         /* Optional file-loading extension (NAMku): discovered purely via
          * queryInterface, so unknown plug-ins are unaffected. */
@@ -506,6 +689,23 @@ extern "C" void pluginhost_free(PluginInstance *inst)
     }
     Vst3Backend *b = inst->b;
     if (b) {
+        if (b->editor_view) {
+            /* The FX window must pluginhost_ui_destroy before freeing; clean
+             * up defensively rather than leak the plug-in view. */
+            g_warning("pluginhost: editor view still alive in pluginhost_free");
+            if (b->editor_view->Window() && b->editor_view->LockLooper()) {
+                BLooper *looper = b->editor_view->Looper();
+                b->editor_view->RemoveSelf();
+                looper->Unlock();
+            }
+            b->editor_view->ReleasePlugView();
+            delete b->editor_view;
+            b->editor_view = nullptr;
+        }
+        if (b->controller && b->handler)
+            b->controller->setComponentHandler(nullptr);
+        delete b->handler;
+        b->handler = nullptr;
         b->file_loader = nullptr; /* before the controller goes away */
         b->drum_loader = nullptr;
         b->midi_map = nullptr;
@@ -585,6 +785,10 @@ extern "C" void pluginhost_process(PluginInstance *inst, float *L, float *R, int
     b->transfer.transferChangesTo(b->in_params);
     b->processor->process(b->data);
     b->in_params.clearQueue();
+    /* Publish the plug-in's output parameter changes to the UI-side ring
+     * (drained by pluginhost_ui_poll). Both sides pre-allocated. */
+    b->out_transfer.transferChangesFrom(b->out_params);
+    b->out_params.clearQueue();
 
     if (b->data.outputs && b->data.outputs[0].channelBuffers32) {
         memcpy(L, b->data.outputs[0].channelBuffers32[0], sizeof(float) * (size_t)nframes);
@@ -724,6 +928,8 @@ extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent 
     b->transfer.transferChangesTo(b->in_params);
     b->processor->process(b->data);
     b->in_params.clearQueue();
+    b->out_transfer.transferChangesFrom(b->out_params);
+    b->out_params.clearQueue();
     b->in_events.clear();
     b->data.inputEvents = nullptr; /* reset for the effect (audio) path */
 
@@ -1108,23 +1314,67 @@ extern "C" gboolean pluginhost_param_is_stepped(PluginInstance *inst, guint i, g
     return TRUE;
 }
 
-/* ---- Native plugin editor (dispatch; only the LV2 backend has one) ---- */
+/* ---- Native plugin editor ---- */
 
 extern "C" void *pluginhost_ui_create(PluginInstance *inst)
 {
-    return (inst && inst->format == PH_LV2) ? ph_lv2_ui_create(inst) : NULL;
+    if (inst && inst->format == PH_LV2)
+        return ph_lv2_ui_create(inst);
+    if (!inst || !inst->b || !inst->b->controller)
+        return NULL;
+    Vst3Backend *b = inst->b;
+    if (b->editor_view) /* created once per instance */
+        return b->editor_view;
+
+    IPlugView *view = b->controller->createView(ViewType::kEditor);
+    if (!view)
+        return NULL; /* no editor: FX window falls back to generic controls */
+    if (view->isPlatformTypeSupported(kPlatformTypeHaikuBView) != kResultTrue) {
+        view->release();
+        return NULL;
+    }
+    ViewRect size;
+    if (view->getSize(&size) != kResultOk || size.getWidth() <= 0 || size.getHeight() <= 0) {
+        view->release();
+        return NULL;
+    }
+    b->editor_view = new Vst3EditorHostView(
+        view, BRect(0, 0, (float)size.getWidth() - 1, (float)size.getHeight() - 1));
+    return b->editor_view;
 }
 
 extern "C" void pluginhost_ui_poll(PluginInstance *inst)
 {
-    if (inst && inst->format == PH_LV2)
+    if (inst && inst->format == PH_LV2) {
         ph_lv2_ui_poll(inst);
+        return;
+    }
+    if (!inst || !inst->b || !inst->b->controller)
+        return;
+    /* Drain RT → UI output parameter changes into the controller; DRUMku's
+     * editor learns about note bindings and pad activity this way. Runs on
+     * the FX window's looper thread (the controller's UI thread). */
+    Vst3Backend *b = inst->b;
+    ParamID id;
+    ParamValue value;
+    int32 offset;
+    while (b->out_transfer.getNextChange(id, value, offset))
+        b->controller->setParamNormalized(id, value);
 }
 
 extern "C" void pluginhost_ui_destroy(PluginInstance *inst)
 {
-    if (inst && inst->format == PH_LV2)
+    if (inst && inst->format == PH_LV2) {
         ph_lv2_ui_destroy(inst);
+        return;
+    }
+    if (!inst || !inst->b || !inst->b->editor_view)
+        return;
+    /* The FX window has already RemoveChild()ed the view (which detached the
+     * plug-in view via DetachedFromWindow). Final release + delete here. */
+    inst->b->editor_view->ReleasePlugView();
+    delete inst->b->editor_view;
+    inst->b->editor_view = nullptr;
 }
 
 /* ---- File loading (INamFileLoader) ---- */

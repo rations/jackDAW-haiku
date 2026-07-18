@@ -21,7 +21,8 @@
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/vst/vsttypes.h"
 
-namespace DRUMku {
+namespace DRUMku
+{
 
 // Maximum number of loader slots. The rack shows the first `slot count`
 // (kSlotCountId) of these; the rest stay silent. Volume/Note parameters for all
@@ -43,6 +44,12 @@ enum ParamIDs : Steinberg::Vst::ParamID {
     // Per-slot parameter bases: slot i's parameter has ID (base + i).
     kSlotVolumeBase = 1000, // linear gain 0 .. 1, default 0.8
     kSlotNoteBase = 2000,   // assigned MIDI note: plain 0..127, plain 128 = unassigned
+
+    // Hidden, read-only, transient (never persisted): the processor pulses the
+    // note-on velocity here through the output parameter changes so an editor
+    // can flash the pad. Also the return channel for plug-in-side MIDI learn —
+    // a captured note arrives as an output change on (kSlotNoteBase + slot).
+    kSlotActivityBase = 3000, // last trigger velocity 0 .. 1
 };
 
 // A slot's Note parameter is a stepped range 0..kNoteUnassigned; the top step

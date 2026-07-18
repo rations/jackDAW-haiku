@@ -3,6 +3,7 @@
 
 #include <Window.h>
 
+#include <set>
 #include <vector>
 
 #include "engine/track.h"
@@ -94,6 +95,11 @@ private:
     BView *m_embedded_ui;            // borrowed; owned by the plugin UI
     PluginInstance *m_embedded_inst; // instance the embedded view belongs to
     BMessageRunner *m_ui_poll;       // ~30 Hz host→UI port_event feedback
+
+    // Instances the user toggled from their native editor to the generic
+    // panel (compared by pointer only; entries erased when a plugin is
+    // removed).
+    std::set<PluginInstance *> m_prefer_generic;
 };
 
 #endif // FX_WINDOW_H
