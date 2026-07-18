@@ -18,3 +18,7 @@ jackdaw
 *~
 *.swp
 .DS_Store
+
+# Built packages: attached to GitHub Releases, never committed.
+packaging/*.hpkg
+packaging/stage/
