@@ -1,12 +1,14 @@
 name			jackdaw
-version			0.1-1
+version			0.2-1
 architecture	x86_64
 summary			"JackDAW - multitrack JACK DAW (native Haiku)"
 description		"A native Haiku multitrack digital audio workstation built on the
-Interface Kit: audio and MIDI tracks, a piano-roll editor, a mixer, VST3 effects and
-instruments, MIDI control-surface mapping, project save/load, and offline/realtime
-render. A JACK client - run the jack server first; VST3 plug-ins such as NAMku and
-DRUMku are picked up from the system and user add-ons/vst3 directories."
+Interface Kit: audio and MIDI tracks, a piano-roll editor, a mixer, VST3 and LV2 effects,
+VST3 instruments, MIDI control-surface mapping, project save/load, and offline/realtime
+render. Plug-in editors are embedded natively in the FX window when a plug-in provides
+one. A JACK client - run the jack server first; VST3 plug-ins such as NAMku and DRUMku
+are picked up from the system and user add-ons/vst3 directories, and LV2 plug-ins such
+as hktuner from the add-ons/lv2 directories on LV2_PATH."
 packager		"rations <ehqcar@proton.me>"
 vendor			"rations"
 copyrights {
@@ -17,12 +19,13 @@ licenses {
 	"MIT"
 }
 provides {
-	jackdaw = 0.1
-	app:JackDAW = 0.1
+	jackdaw = 0.2
+	app:JackDAW = 0.2
 }
 requires {
 	haiku
 	jack
+	lv2_haiku
 	glib2
 	libsndfile
 	libsamplerate

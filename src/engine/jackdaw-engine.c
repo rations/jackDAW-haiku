@@ -171,6 +171,19 @@ static volatile gint g_diag_quit = 0;
 static volatile gint g_diag_midi_in = 0;
 static volatile gint g_diag_midi_rec = 0;
 static volatile gint g_diag_instr_state = -1;
+/* Per-plugin worst-case µs inside process(), written by whichever RT thread
+ * owns the track this cycle and read-and-reset by the diag thread. Indexed
+ * [track slot][chain position] so no off-RT code ever has to walk (and race
+ * with the retire of) a track's rt_chain snapshot. A plugin past the slot
+ * count is timed into the last slot rather than dropped.
+ *
+ * gint (not gint64) so the accesses can use glib's portable atomics: a block
+ * period is microseconds, far inside 32 bits. The "keep the larger" update is
+ * deliberately not a compare-and-swap — two RT threads racing on one element
+ * can at worst drop a sample from a diagnostic maximum, which is not worth a
+ * CAS loop on the audio path. */
+#define ENG_DIAG_FX_SLOTS 8
+static volatile gint g_diag_fx_us[JACKDAW_MAX_TRACKS][ENG_DIAG_FX_SLOTS];
 
 static gpointer diag_thread_func(gpointer arg)
 {
@@ -191,6 +204,20 @@ static gpointer diag_thread_func(gpointer arg)
          * instrument track with a registered midi_in reached the RT pass). */
         g_message("[diag] midi_in=%d midi_rec=%d instr_state=%d", g_atomic_int_get(&g_diag_midi_in),
                   g_atomic_int_get(&g_diag_midi_rec), g_atomic_int_get(&g_diag_instr_state));
+        /* Per-plugin worst case for the last second, as µs and as a share of
+         * the period budget — this is what attributes an xrun to one plugin
+         * rather than to the callback as a whole. */
+        for (guint ti = 0; ti < JACKDAW_MAX_TRACKS; ti++) {
+            for (int fi = 0; fi < ENG_DIAG_FX_SLOTS; fi++) {
+                gint us = g_atomic_int_get(&g_diag_fx_us[ti][fi]);
+                if (us <= 0)
+                    continue;
+                g_atomic_int_set(&g_diag_fx_us[ti][fi], 0);
+                g_message("[diag]   track %u fx[%d] max=%ldus (%.1f%% of period)", ti, fi, (long)us,
+                          g_diag_period_us > 0 ? 100.0 * (double)us / (double)g_diag_period_us
+                                               : 0.0);
+            }
+        }
     }
     return NULL;
 }
@@ -1041,7 +1068,14 @@ static volatile jack_nframes_t g_rt_nframes;
 static volatile gint g_rt_flags;
 static volatile off_t g_rt_blk_start;
 static volatile gint g_rt_any_soloed;
-static volatile gint g_rt_task_next; /* work-stealing slot index */
+static volatile gint g_rt_task_next; /* work-stealing index into g_rt_task_slot */
+/* Compact list of the slots that actually hold a track this cycle, rebuilt on
+ * the JACK thread before the barrier opens. The work-stealing loop iterates
+ * this rather than all JACKDAW_MAX_TRACKS slots: the shared counter is a
+ * contended atomic, so scanning 64 slots to find one track made every worker
+ * hammer the same cache line ~64 times per cycle for no work. */
+static int g_rt_task_slot[JACKDAW_MAX_TRACKS];
+static volatile gint g_rt_task_count;
 
 /* Port buffers pre-fetched on the JACK thread (only it may call
  * jack_port_get_buffer); workers read these cached pointers. */
@@ -1195,6 +1229,17 @@ static void engine_process_track(int i)
         }
         for (; fi < chain->n; fi++)
             pluginhost_process((PluginInstance *)chain->fx[fi], bL, bR, (int)nframes);
+        /* Fold this cycle's per-plugin timings into the diag table. Reading
+         * them here (on the RT thread that just produced them) keeps the
+         * instance pointers valid without extra synchronisation. */
+        if (g_diag_on) {
+            for (int di = 0; di < chain->n; di++) {
+                gint us = (gint)pluginhost_diag_take_max_us((PluginInstance *)chain->fx[di]);
+                int slot = di < ENG_DIAG_FX_SLOTS ? di : ENG_DIAG_FX_SLOTS - 1;
+                if (us > g_atomic_int_get(&g_diag_fx_us[i][slot]))
+                    g_atomic_int_set(&g_diag_fx_us[i][slot], us);
+            }
+        }
     }
 
     /* Constant-power pan + effective fader, written in place into the slot; meter
@@ -1223,11 +1268,10 @@ static void engine_process_track(int i)
  * remain. Called by both the JACK thread and every worker. */
 static void rt_run_tasks(void)
 {
+    const int n = g_atomic_int_get(&g_rt_task_count);
     int idx;
-    while ((idx = g_atomic_int_add(&g_rt_task_next, 1)) < JACKDAW_MAX_TRACKS) {
-        if (engine.slots[idx])
-            engine_process_track(idx);
-    }
+    while ((idx = g_atomic_int_add(&g_rt_task_next, 1)) < n)
+        engine_process_track(g_rt_task_slot[idx]);
 }
 
 static void rt_sem_wait(sem_t *s)
@@ -1466,12 +1510,33 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     g_rt_flags = flags;
     g_rt_blk_start = blk_start;
     g_rt_any_soloed = any_soloed ? 1 : 0;
+
+    /* Build this cycle's compact task list. */
+    int ntasks = 0;
+    for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+        if (engine.slots[i])
+            g_rt_task_slot[ntasks++] = (int)i;
+    }
+    g_atomic_int_set(&g_rt_task_count, ntasks);
     g_atomic_int_set(&g_rt_task_next, 0);
-    if (g_rt_nworkers > 0) {
-        for (int w = 0; w < g_rt_nworkers; w++)
+
+    /* Wake only as many workers as there is parallel work for: the JACK thread
+     * takes one track itself, so N tracks need at most N-1 helpers. Waking the
+     * full pool for a one-track project cost two semaphore round-trips per
+     * worker per cycle and had every woken thread contend for a task list it
+     * would find empty — enough wall-clock to push a heavy plugin past its
+     * deadline even though the CPU work was unchanged. */
+    int wake = ntasks - 1;
+    if (wake > g_rt_nworkers)
+        wake = g_rt_nworkers;
+    if (wake < 0)
+        wake = 0;
+
+    if (wake > 0) {
+        for (int w = 0; w < wake; w++)
             sem_post(&g_rt_sem_go);
         rt_run_tasks();
-        for (int w = 0; w < g_rt_nworkers; w++)
+        for (int w = 0; w < wake; w++)
             rt_sem_wait(&g_rt_sem_done);
     } else {
         rt_run_tasks();

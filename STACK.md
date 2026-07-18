@@ -24,8 +24,16 @@ compatible Haiku.
         ├─► NAMku  ───────────► namku       Neural Amp Modeler VST3 instrument/effect
         ├─► DRUMku ───────────► drumku      MIDI drum-sampler VST3 instrument
         │
-  jackDAW-haiku ────────────► jackdaw     the multitrack DAW (hosts the VST3 plug-ins)
+  LV2-haiku ────────────────► lv2_haiku   LV2 stack (lilv/serd/sord/sratom/zix,
+        │  (static libs, MIT/ISC)           spec bundles), JACK LV2 host + tools
+        ├─► hktuner ─────────► hktuner      chromatic tuner LV2 (native GUI)
+        │
+  jackDAW-haiku ────────────► jackdaw     the multitrack DAW (hosts VST3 + LV2)
 ```
+
+`lv2_haiku` is both a build-time and a runtime dependency of `jackdaw`: the libraries are
+linked statically, but lilv needs the LV2 **specification bundles** it installs to
+`/boot/system/add-ons/lv2` (on lilv's compiled-in default `LV2_PATH`) to load any plug-in.
 
 | Package | Repo | Role | License |
 |---|---|---|---|
@@ -36,6 +44,8 @@ compatible Haiku.
 | `vst3_haiku` | VST3-haiku | JACK VST3 host + example plug-ins (+ the SDK) | MIT |
 | `namku` | NAMku | Neural Amp Modeler VST3 | MIT (+ MPL 2.0, Eigen) |
 | `drumku` | DRUMku | MIDI drum-sampler VST3 | MIT |
+| `lv2_haiku` | LV2-haiku | LV2 stack + spec bundles, JACK LV2 host + tools | ISC |
+| `hktuner` | hktuner | chromatic tuner LV2 plug-in | MIT |
 | `jackdaw` | jackDAW-haiku | the DAW | MIT |
 
 ## Getting the sources
@@ -47,7 +57,7 @@ If git is not installed, install it first, then clone the repos you need
 pkgman install -y git
 ```
 
-Prebuilt `.hpkg`s are attached to each project's GitHub release (and all seven to the
+Prebuilt `.hpkg`s are attached to each project's GitHub release (and all nine to the
 [jackDAW-haiku full-stack release](https://github.com/rations/jackDAW-haiku/releases)), so
 for the packaged install you only need to clone what you build from source. The USB-audio
 driver is always built locally and additionally needs the Haiku source on the
@@ -61,12 +71,13 @@ driver is always built locally and additionally needs the Haiku source on the
    `usb-audio-uac2` Haiku source), then reboot. Verify: the interface enumerates and a node
    appears under `/dev/audio/hmulti/`.
 2. **Everything else** — build each `.hpkg` on the nightly with its
-   `packaging/make-hpkg.sh` (build order: jack → tools/graph/vst3_haiku → namku/drumku →
-   jackdaw), then install the lot; `pkgman` pulls external deps (glib2, libsndfile,
-   libsamplerate) from HaikuPorts:
+   `packaging/make-hpkg.sh` (build order: jack → tools/graph/vst3_haiku/lv2_haiku →
+   namku/drumku/hktuner → jackdaw), then install the lot; `pkgman` pulls external deps
+   (glib2, libsndfile, libsamplerate) from HaikuPorts:
    ```
    pkgman install ./jack-*.hpkg ./jack_tools-*.hpkg ./jackgraph-*.hpkg \
-                  ./vst3_haiku-*.hpkg ./namku-*.hpkg ./drumku-*.hpkg ./jackdaw-*.hpkg
+                  ./vst3_haiku-*.hpkg ./lv2_haiku-*.hpkg \
+                  ./namku-*.hpkg ./drumku-*.hpkg ./hktuner-*.hpkg ./jackdaw-*.hpkg
    ```
 
 ## Install order (from source)
@@ -79,14 +90,17 @@ jack-port-haiku      # libjack -> /boot/system/non-packaged
 jack-example-tools   # needs jack
 jack-graph-haiku     # needs jack
 VST3-haiku           # SDK static libs + vst3jackhost
+LV2-haiku            # lilv/serd/sord/sratom/zix static + spec bundles + lv2jackhost
 NAMku                # needs the VST3-haiku SDK
 DRUMku               # needs the VST3-haiku SDK
-jackDAW-haiku        # needs jack + the VST3-haiku SDK
+hktuner              # needs the LV2-haiku staged headers
+jackDAW-haiku        # needs jack + the VST3-haiku SDK + the LV2-haiku stack
 ```
 
 ## Run
 Launch **JackGraph** (to wire ports / manage the server) and **JackDAW** from Deskbar
-(Applications). NAMku/DRUMku appear in JackDAW's VST3 plug-in list automatically
+(Applications). NAMku/DRUMku appear in JackDAW's VST3 plug-in list automatically, and
+hktuner in its LV2 list; plug-ins that ship a native editor open it inside the FX window.
 
 Start the JACK server in Jack Graph > Jack Settings (adjust the capture device path to your interface):
 
