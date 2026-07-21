@@ -1667,6 +1667,13 @@ bool MainWindow::QuitRequested()
         Lock();
     }
 
+    // FX windows likewise lock THIS window in their destructors (to unregister),
+    // so they must drain the same way — async-quit each, dropping our lock while
+    // waiting — before this window's looper dies. Skipping this let an open FX
+    // window outlive the main window and fault when its destructor locked a dead
+    // looper.
+    CloseAllFxWindows();
+
     // Cancel and drain any in-flight render (it holds the engine suspended /
     // the transport running and a worker thread we must join before teardown).
     if (m_render_active) {

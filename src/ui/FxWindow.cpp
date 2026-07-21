@@ -241,12 +241,15 @@ FxWindow::~FxWindow()
     // only if this window is still the registered FX window). Runs on whichever
     // thread called Quit(); the main window's shutdown path drops its own lock
     // while waiting for this rather than locking FX windows (mirrors the piano-
-    // roll editor handshake).
-    m_main->Lock();
-    if (g_object_get_data(G_OBJECT(m_track), "fx-window") == this)
-        g_object_set_data(G_OBJECT(m_track), "fx-window", NULL);
-    m_main->UnregisterFxWindow(this);
-    m_main->Unlock();
+    // roll editor handshake). Lock() can still fail if the main looper is already
+    // dead (e.g. an unexpected teardown order) — only unregister/unlock when it
+    // succeeded; a dead main window has nothing left to unregister from.
+    if (m_main->Lock()) {
+        if (g_object_get_data(G_OBJECT(m_track), "fx-window") == this)
+            g_object_set_data(G_OBJECT(m_track), "fx-window", NULL);
+        m_main->UnregisterFxWindow(this);
+        m_main->Unlock();
+    }
     g_object_unref(m_track);
 }
 
