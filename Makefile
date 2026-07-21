@@ -46,7 +46,7 @@ CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/MixerView.cpp src/ui/MixerWindow.cpp src/ui/RegionGainWindow.cpp \
               src/ui/MidiWindow.cpp src/ui/FxWindow.cpp src/ui/RenderWindow.cpp \
               src/ui/IoWindow.cpp src/ui/MidiControlWindow.cpp
-HOST_SOURCES = src/host/pluginhost.cpp src/host/pluginhost_lv2.cpp
+HOST_SOURCES = src/host/pluginhost.cpp src/host/pluginhost_lv2.cpp src/host/pluginhost_vst2.cpp
 
 # SDK sources compiled directly (they are not part of the SDK's static libs;
 # same set the VST3-haiku hosts compile): the Haiku module loader, the
@@ -71,6 +71,13 @@ $(TARGET): $(OBJECTS)
 # (explicit rule, so it wins over the src/host/%.o pattern below).
 src/host/pluginhost_lv2.o: src/host/pluginhost_lv2.cpp
 	$(CXX) $(CXXFLAGS) $(LV2_CFLAGS) -c $< -o $@
+
+# The VST2 backend TU drives the plain AEffect ABI (clean-room vst2_abi.h) and
+# must never see the VST3 SDK headers (both typedef int8/int16 — they cannot
+# share a TU). Plain CXXFLAGS only; -lbe (for the Part B editor view) is already
+# in LDFLAGS. Explicit rule so it wins over the src/host/%.o pattern below.
+src/host/pluginhost_vst2.o: src/host/pluginhost_vst2.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 src/host/%.o: src/host/%.cpp
 	$(CXX) $(HOST_CXXFLAGS) -c $< -o $@

@@ -15,6 +15,7 @@
 
 struct Vst3Backend; /* defined in pluginhost.cpp */
 struct Lv2Backend;  /* defined in pluginhost_lv2.cpp */
+struct Vst2Backend; /* defined in pluginhost_vst2.cpp */
 
 /* Format-independent instance front. Exactly one backend pointer is non-NULL,
  * matching `format`. POD: allocated with g_new0, freed by the owning backend's
@@ -29,8 +30,9 @@ struct PluginInstance {
     volatile gint mix_q15; /* wet/dry: 0 = fully dry .. 32768 = fully wet */
     double sample_rate;
     int max_block;
-    Vst3Backend *b;  /* PH_VST3 only */
-    Lv2Backend *lv2; /* PH_LV2 only */
+    Vst3Backend *b;    /* PH_VST3 only */
+    Lv2Backend *lv2;   /* PH_LV2 only */
+    Vst2Backend *vst2; /* PH_VST2 only */
 
     /* Dry-signal scratch for the wet/dry mix (allocated to max_block). */
     float *dry_L, *dry_R;
@@ -95,6 +97,16 @@ static inline gint64 ph_now_us_i(void)
 
 G_BEGIN_DECLS
 
+/* Transport snapshot published by the RT thread (pluginhost_set_transport),
+ * read by the VST2 audioMaster callback. Any out-param may be NULL. */
+void ph_get_transport(double *bpm, double *sr, gint64 *frame, gboolean *playing);
+
+/* Spawn the out-of-process scan helper (`JackDAW --scan-plugin <fmt> <path>`)
+ * for one plug-in file/bundle and append its catalog entries. Implemented in
+ * pluginhost.cpp; used by both the VST3 and VST2 scans so a crashing module
+ * kills only the throwaway helper. */
+void ph_scan_via_helper(const char *fmt, const char *path, GList **catalog);
+
 void ph_lv2_init(double sample_rate, int max_block);
 void ph_lv2_shutdown(void);
 /* Prepend LV2 catalog entries (PluginInfo*, key = plugin URI) to *catalog. */
@@ -114,6 +126,37 @@ gboolean ph_lv2_state_load(PluginInstance *inst, const void *data, gsize len);
 void *ph_lv2_ui_create(PluginInstance *inst);
 void ph_lv2_ui_poll(PluginInstance *inst);
 void ph_lv2_ui_destroy(PluginInstance *inst);
+
+/* ---- VST2 backend entry points (pluginhost_vst2.cpp). Same threading
+ * contract as the LV2 set: ph_vst2_process / ph_vst2_process_midi are the RT
+ * path (no alloc/lock/log); everything else runs on the instance's owning
+ * window looper. ph_vst2_describe runs only inside the out-of-process scan
+ * helper. ---- */
+
+void ph_vst2_init(double sample_rate, int max_block);
+void ph_vst2_shutdown(void);
+/* Enumerate VST2 .so plug-ins ($VST_PATH + ~/.vst) and append catalog entries
+ * (key = plug-in path), each described out-of-process via ph_scan_via_helper. */
+void ph_vst2_scan(GList **catalog);
+/* Helper-process only: load one .so and print its "VST2\t<name>\t<cat>" line. */
+void ph_vst2_describe(const char *path);
+PluginInstance *ph_vst2_instantiate(const PluginInfo *info);
+void ph_vst2_free(PluginInstance *inst);
+void ph_vst2_process(PluginInstance *inst, float *L, float *R, int nframes);
+void ph_vst2_process_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev, float *L, float *R,
+                          int nframes);
+void ph_vst2_reset(PluginInstance *inst);
+guint ph_vst2_param_count(PluginInstance *inst);
+void ph_vst2_param_name(PluginInstance *inst, guint i, char *buf, int buflen);
+float ph_vst2_param_get(PluginInstance *inst, guint i);
+void ph_vst2_param_set(PluginInstance *inst, guint i, float v);
+void ph_vst2_param_display(PluginInstance *inst, guint i, char *buf, int buflen);
+gboolean ph_vst2_param_is_stepped(PluginInstance *inst, guint i, gint *steps);
+gboolean ph_vst2_state_save(PluginInstance *inst, void **out, gsize *out_len);
+gboolean ph_vst2_state_load(PluginInstance *inst, const void *data, gsize len);
+void *ph_vst2_ui_create(PluginInstance *inst);
+void ph_vst2_ui_poll(PluginInstance *inst);
+void ph_vst2_ui_destroy(PluginInstance *inst);
 
 G_END_DECLS
 

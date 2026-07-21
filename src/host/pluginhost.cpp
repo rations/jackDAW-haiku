@@ -46,6 +46,7 @@
 
 #include <Looper.h> /* BLooper definition for the defensive editor teardown */
 #include <View.h>   /* native editor host view (kPlatformTypeHaikuBView) */
+#include <Window.h> /* BWindow::Lock() around off-looper resizes */
 
 #include <image.h> /* Haiku: get_next_image_info → own executable path */
 
@@ -268,16 +269,36 @@ public:
         }
     }
 
-    /* IPlugFrame — plug-in-driven resize (window looper thread). */
+    /* IPlugFrame — plug-in-driven resize.
+     *
+     * This is NOT necessarily the window looper thread. A native plug-in calls
+     * it from the looper, but a bridged one delivers it over IPC and it arrives
+     * on whichever thread that bridge reads on, so the window is locked here
+     * rather than assumed. BView::ResizeBy() and friends call debugger() when
+     * the looper is not locked, which kills the whole team.
+     *
+     * The lock is released before onSize(), which calls back into the plug-in
+     * and may block; the host's window must not be held across that. */
     tresult PLUGIN_API resizeView(IPlugView *view, ViewRect *newSize) SMTG_OVERRIDE
     {
         if (!view || !newSize)
             return kInvalidArgument;
         float w = (float)newSize->getWidth() - 1, h = (float)newSize->getHeight() - 1;
+
+        /* Window() is NULL until the view is attached, and BView only checks the
+         * lock when it has an owner, so an unattached view resizes safely. */
+        BWindow *window = Window();
+        if (window != NULL && !window->Lock())
+            return kInternalError;
+
         SetExplicitMinSize(BSize(w, h));
         SetExplicitMaxSize(BSize(w, h));
         SetExplicitPreferredSize(BSize(w, h));
         ResizeTo(w, h);
+
+        if (window != NULL)
+            window->Unlock();
+
         return view->onSize(newSize);
     }
 
@@ -335,14 +356,15 @@ static std::string ph_self_path(void)
     return {};
 }
 
-static PluginInfo *ph_info_new(const char *key, const char *name, const char *category)
+static PluginInfo *ph_info_new(PluginFormat format, const char *key, const char *name,
+                               const char *category)
 {
     PluginInfo *pi = g_new0(PluginInfo, 1);
-    pi->format = PH_VST3;
+    pi->format = format;
     pi->key = g_strdup(key);
     pi->name = g_strdup(name);
     pi->category = g_strdup(category);
-    /* VST3 subcategory strings mark synths as "Instrument|..." */
+    /* VST3/VST2 category strings mark synths as "Instrument|..." */
     pi->is_instrument = category && strstr(category, "Instrument") != NULL;
     return pi;
 }
@@ -360,6 +382,20 @@ extern "C" void pluginhost_set_transport(double bpm, double sr, gint64 frame, gb
     ph_xport_sr = sr;
     ph_xport_frame = frame;
     ph_xport_playing = playing;
+}
+
+/* Read side (VST2 audioMaster callback). Plain reads of the published values;
+ * any out-param may be NULL. */
+extern "C" void ph_get_transport(double *bpm, double *sr, gint64 *frame, gboolean *playing)
+{
+    if (bpm)
+        *bpm = ph_xport_bpm;
+    if (sr)
+        *sr = ph_xport_sr;
+    if (frame)
+        *frame = ph_xport_frame;
+    if (playing)
+        *playing = ph_xport_playing;
 }
 
 static void ph_info_free(gpointer p)
@@ -381,11 +417,19 @@ static void ph_info_free(gpointer p)
 
 extern "C" int pluginhost_scan_helper_main(int argc, char **argv)
 {
-    if (argc != 4 || strcmp(argv[1], "--scan-plugin") != 0 || strcmp(argv[2], "VST3") != 0)
+    if (argc != 4 || strcmp(argv[1], "--scan-plugin") != 0)
         return -1; /* not a scan invocation: continue normal startup */
-
+    const char *fmt = argv[2];
     const char *path = argv[3];
     if (!ph_path_is_safe(path))
+        return 1;
+
+    if (strcmp(fmt, "VST2") == 0) {
+        /* One line per plug-in, printed by the clean VST2 TU (no SDK here). */
+        ph_vst2_describe(path);
+        return 0;
+    }
+    if (strcmp(fmt, "VST3") != 0)
         return 1;
 
     ph_ensure_context();
@@ -406,34 +450,39 @@ extern "C" int pluginhost_scan_helper_main(int argc, char **argv)
     return 0;
 }
 
-/* Describe one bundle via the helper process and append its classes. */
-static void ph_scan_bundle(const char *path, GList **catalog)
+/* Describe one plug-in file/bundle via the throwaway helper process and append
+ * its catalog entries. `fmt` is the format tag ("VST3" or "VST2"); the helper
+ * prints "<fmt>\t<name>\t<category>" lines. VST3 keys carry the class name
+ * (path\nclass — one bundle has many classes); VST2 keys are just the path. */
+extern "C" void ph_scan_via_helper(const char *fmt, const char *path, GList **catalog)
 {
     std::string self = ph_self_path();
     if (self.empty())
         return;
 
-    gchar *argv[] = {(gchar *)self.c_str(), (gchar *)"--scan-plugin", (gchar *)"VST3",
-                     (gchar *)path, NULL};
+    gchar *argv[] = {(gchar *)self.c_str(), (gchar *)"--scan-plugin", (gchar *)fmt, (gchar *)path,
+                     NULL};
     gchar *out = NULL;
     gint status = 0;
     if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL, &out, NULL, &status,
                       NULL))
         return;
-    if (out) {
-        gchar **lines = g_strsplit(out, "\n", -1);
-        for (int i = 0; lines[i]; i++) {
-            gchar **f = g_strsplit(lines[i], "\t", 3);
-            if (f[0] && strcmp(f[0], "VST3") == 0 && f[1] && f[2]) {
-                gchar *key = g_strdup_printf("%s\n%s", path, f[1]);
-                *catalog = g_list_prepend(*catalog, ph_info_new(key, f[1], f[2]));
-                g_free(key);
-            }
-            g_strfreev(f);
+    if (!out)
+        return;
+    gboolean is_vst3 = (strcmp(fmt, "VST3") == 0);
+    PluginFormat pf = is_vst3 ? PH_VST3 : PH_VST2;
+    gchar **lines = g_strsplit(out, "\n", -1);
+    for (int i = 0; lines[i]; i++) {
+        gchar **f = g_strsplit(lines[i], "\t", 3);
+        if (f[0] && strcmp(f[0], fmt) == 0 && f[1] && f[2]) {
+            gchar *key = is_vst3 ? g_strdup_printf("%s\n%s", path, f[1]) : g_strdup(path);
+            *catalog = g_list_prepend(*catalog, ph_info_new(pf, key, f[1], f[2]));
+            g_free(key);
         }
-        g_strfreev(lines);
-        g_free(out);
+        g_strfreev(f);
     }
+    g_strfreev(lines);
+    g_free(out);
 }
 
 static void ph_do_scan(void)
@@ -443,10 +492,14 @@ static void ph_do_scan(void)
      * directories from find_paths() plus $HOME/.vst3) and returns the .vst3
      * BUNDLE paths themselves, ready to describe. */
     for (auto &module_path : VST3::Hosting::Module::getModulePaths())
-        ph_scan_bundle(module_path.c_str(), &ph_cat);
+        ph_scan_via_helper("VST3", module_path.c_str(), &ph_cat);
     /* LV2 discovery is pure Turtle parsing via lilv (no plugin code runs), so
-     * it happens in-process — the crash-isolating helper is VST3-only. */
+     * it happens in-process — the crash-isolating helper is for the binary
+     * formats. */
     ph_lv2_scan(&ph_cat);
+    /* VST2 .so plug-ins (mostly vstbridge stubs under ~/.vst); each is
+     * described out-of-process, same crash isolation as VST3. */
+    ph_vst2_scan(&ph_cat);
     ph_cat = g_list_reverse(ph_cat);
     ph_scanned = TRUE;
 }
@@ -473,6 +526,7 @@ extern "C" void pluginhost_init(double sample_rate, int max_block)
     ph_maxblock = MAX(max_block, 64);
     ph_ensure_context();
     ph_lv2_init(ph_sr, ph_maxblock);
+    ph_vst2_init(ph_sr, ph_maxblock);
 }
 
 extern "C" void pluginhost_shutdown(void)
@@ -481,6 +535,7 @@ extern "C" void pluginhost_shutdown(void)
     ph_cat = NULL;
     ph_scanned = FALSE;
     ph_lv2_shutdown();
+    ph_vst2_shutdown();
 }
 
 /* ---- Instantiate / free ---- */
@@ -491,6 +546,8 @@ extern "C" PluginInstance *pluginhost_instantiate(const PluginInfo *info)
         return NULL;
     if (info->format == PH_LV2)
         return ph_lv2_instantiate(info);
+    if (info->format == PH_VST2)
+        return ph_vst2_instantiate(info);
     if (info->format != PH_VST3)
         return NULL;
     ph_ensure_context();
@@ -687,6 +744,10 @@ extern "C" void pluginhost_free(PluginInstance *inst)
         ph_lv2_free(inst);
         return;
     }
+    if (inst->format == PH_VST2) {
+        ph_vst2_free(inst);
+        return;
+    }
     Vst3Backend *b = inst->b;
     if (b) {
         if (b->editor_view) {
@@ -746,6 +807,10 @@ extern "C" void pluginhost_process(PluginInstance *inst, float *L, float *R, int
         return;
     if (inst->format == PH_LV2) {
         ph_lv2_process(inst, L, R, nframes);
+        return;
+    }
+    if (inst->format == PH_VST2) {
+        ph_vst2_process(inst, L, R, nframes);
         return;
     }
     if (!inst->b || !inst->b->processor)
@@ -847,9 +912,15 @@ static inline void ph_deliver_controller(Vst3Backend *b, int channel, int ctrl_n
 extern "C" void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev,
                                         float *L, float *R, int nframes)
 {
+    if (!inst)
+        return;
+    if (inst->format == PH_VST2) {
+        ph_vst2_process_midi(inst, ev, n_ev, L, R, nframes);
+        return;
+    }
     /* LV2 instruments are not hosted yet (no MIDI→atom forge; they are
      * excluded from the catalog) — leave the caller's silent buffers as-is. */
-    if (!inst || inst->format != PH_VST3 || !inst->b || !inst->b->processor)
+    if (inst->format != PH_VST3 || !inst->b || !inst->b->processor)
         return;
     if (!g_atomic_int_get(&inst->active))
         return; /* bypassed: leave the caller's (silent) buffers as-is */
@@ -960,6 +1031,10 @@ extern "C" void pluginhost_reset(PluginInstance *inst)
         ph_lv2_reset(inst);
         return;
     }
+    if (inst->format == PH_VST2) {
+        ph_vst2_reset(inst);
+        return;
+    }
     if (!inst->b)
         return;
     Vst3Backend *b = inst->b;
@@ -988,6 +1063,8 @@ extern "C" gboolean pluginhost_state_save(PluginInstance *inst, void **out, gsiz
         return FALSE;
     if (inst->format == PH_LV2)
         return ph_lv2_state_save(inst, out, out_len);
+    if (inst->format == PH_VST2)
+        return ph_vst2_state_save(inst, out, out_len);
     if (!inst->b || !inst->b->component)
         return FALSE;
     Vst3Backend *b = inst->b;
@@ -1023,6 +1100,8 @@ extern "C" gboolean pluginhost_state_load(PluginInstance *inst, const void *data
         return FALSE;
     if (inst->format == PH_LV2)
         return ph_lv2_state_load(inst, data, len);
+    if (inst->format == PH_VST2)
+        return ph_vst2_state_load(inst, data, len);
     if (!inst->b || !inst->b->component || len < 8)
         return FALSE;
     Vst3Backend *b = inst->b;
@@ -1223,6 +1302,8 @@ extern "C" guint pluginhost_param_count(PluginInstance *inst)
 {
     if (inst && inst->format == PH_LV2)
         return ph_lv2_param_count(inst);
+    if (inst && inst->format == PH_VST2)
+        return ph_vst2_param_count(inst);
     return (inst && inst->b && inst->b->controller) ? (guint)inst->b->param_ids.size() : 0;
 }
 
@@ -1233,6 +1314,10 @@ extern "C" void pluginhost_param_name(PluginInstance *inst, guint i, char *buf, 
     buf[0] = 0;
     if (inst && inst->format == PH_LV2) {
         ph_lv2_param_name(inst, i, buf, buflen);
+        return;
+    }
+    if (inst && inst->format == PH_VST2) {
+        ph_vst2_param_name(inst, i, buf, buflen);
         return;
     }
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
@@ -1246,6 +1331,8 @@ extern "C" float pluginhost_param_get(PluginInstance *inst, guint i)
 {
     if (inst && inst->format == PH_LV2)
         return ph_lv2_param_get(inst, i);
+    if (inst && inst->format == PH_VST2)
+        return ph_vst2_param_get(inst, i);
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
         return 0.0f;
     return (float)inst->b->controller->getParamNormalized(inst->b->param_ids[i]);
@@ -1255,6 +1342,10 @@ extern "C" void pluginhost_param_set(PluginInstance *inst, guint i, float v)
 {
     if (inst && inst->format == PH_LV2) {
         ph_lv2_param_set(inst, i, v);
+        return;
+    }
+    if (inst && inst->format == PH_VST2) {
+        ph_vst2_param_set(inst, i, v);
         return;
     }
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
@@ -1277,6 +1368,10 @@ extern "C" void pluginhost_param_display(PluginInstance *inst, guint i, char *bu
     buf[0] = 0;
     if (inst && inst->format == PH_LV2) {
         ph_lv2_param_display(inst, i, buf, buflen);
+        return;
+    }
+    if (inst && inst->format == PH_VST2) {
+        ph_vst2_param_display(inst, i, buf, buflen);
         return;
     }
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
@@ -1302,6 +1397,8 @@ extern "C" gboolean pluginhost_param_is_stepped(PluginInstance *inst, guint i, g
         *steps = 1;
     if (inst && inst->format == PH_LV2)
         return ph_lv2_param_is_stepped(inst, i, steps);
+    if (inst && inst->format == PH_VST2)
+        return ph_vst2_param_is_stepped(inst, i, steps);
     if (!inst || !inst->b || !inst->b->controller || i >= inst->b->param_ids.size())
         return FALSE;
     ParameterInfo info;
@@ -1320,6 +1417,8 @@ extern "C" void *pluginhost_ui_create(PluginInstance *inst)
 {
     if (inst && inst->format == PH_LV2)
         return ph_lv2_ui_create(inst);
+    if (inst && inst->format == PH_VST2)
+        return ph_vst2_ui_create(inst);
     if (!inst || !inst->b || !inst->b->controller)
         return NULL;
     Vst3Backend *b = inst->b;
@@ -1349,6 +1448,10 @@ extern "C" void pluginhost_ui_poll(PluginInstance *inst)
         ph_lv2_ui_poll(inst);
         return;
     }
+    if (inst && inst->format == PH_VST2) {
+        ph_vst2_ui_poll(inst);
+        return;
+    }
     if (!inst || !inst->b || !inst->b->controller)
         return;
     /* Drain RT → UI output parameter changes into the controller; DRUMku's
@@ -1366,6 +1469,10 @@ extern "C" void pluginhost_ui_destroy(PluginInstance *inst)
 {
     if (inst && inst->format == PH_LV2) {
         ph_lv2_ui_destroy(inst);
+        return;
+    }
+    if (inst && inst->format == PH_VST2) {
+        ph_vst2_ui_destroy(inst);
         return;
     }
     if (!inst || !inst->b || !inst->b->editor_view)

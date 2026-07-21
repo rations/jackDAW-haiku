@@ -16,11 +16,14 @@ G_BEGIN_DECLS
  * touching RT state from the UI thread.
  */
 
-typedef enum { PH_VST3 = 0, PH_LV2, PH_NFORMATS } PluginFormat;
+/* PH_VST2 is appended, never inserted: saved .jdaw projects store the format
+ * as an int, so PH_VST3=0 / PH_LV2=1 must stay fixed. */
+typedef enum { PH_VST3 = 0, PH_LV2, PH_VST2, PH_NFORMATS } PluginFormat;
 
 /* A catalog entry produced by scanning. VST3: key = "<bundle path>\n<class
  * name>" (one .vst3 module can contain many effect classes, e.g. mda-vst3).
- * LV2: key = the plugin URI. */
+ * LV2: key = the plugin URI. VST2: key = the plug-in .so path (one plug-in per
+ * file; Wine-bridged .dll plug-ins appear as native vstbridge .so stubs). */
 typedef struct {
     PluginFormat format;
     char *key;
