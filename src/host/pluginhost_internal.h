@@ -135,8 +135,9 @@ void ph_lv2_ui_destroy(PluginInstance *inst);
 
 void ph_vst2_init(double sample_rate, int max_block);
 void ph_vst2_shutdown(void);
-/* Enumerate VST2 .so plug-ins ($VST_PATH + ~/.vst) and append catalog entries
- * (key = plug-in path), each described out-of-process via ph_scan_via_helper. */
+/* Enumerate VST2 plug-ins (add-ons/media/vstplugins via find_paths, plus an
+ * optional $VST_PATH override) and append catalog entries (key = plug-in path),
+ * each described out-of-process via ph_scan_via_helper. */
 void ph_vst2_scan(GList **catalog);
 /* Helper-process only: load one .so and print its "VST2\t<name>\t<cat>" line. */
 void ph_vst2_describe(const char *path);

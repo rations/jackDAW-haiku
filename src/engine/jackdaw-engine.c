@@ -14,6 +14,9 @@
 #include <sndfile.h>
 #include <samplerate.h>
 
+#include <FindDirectory.h> /* find_directory — recordings dir, no dot-folders */
+#include <StorageDefs.h>   /* B_PATH_NAME_LENGTH */
+
 #include "rt_denormal.h" /* FTZ/DAZ for the RT thread */
 
 #include "jackdaw-engine.h"
@@ -2602,15 +2605,26 @@ gboolean jackdaw_engine_set_audio_out_count(guint n)
  * open-ended, set later at stop). The caller must have verified the track is an
  * armed audio track. Runs on the main thread (does file I/O) BEFORE ENGINE_RECORDING
  * is set, so the RT thread is not yet touching this slot. Returns TRUE on success. */
+gchar *jackdaw_recordings_dir(void)
+{
+    /* Scratch recordings live under the Haiku settings hierarchy
+     * (<settings>/JackDAW/recordings), resolved via find_directory rather than a
+     * hidden dot-directory in $HOME. Created if missing. */
+    char base[B_PATH_NAME_LENGTH];
+    if (find_directory(B_USER_SETTINGS_DIRECTORY, -1, true, base, sizeof(base)) != B_OK)
+        g_strlcpy(base, "/boot/home/config/settings", sizeof(base));
+    gchar *dir = g_build_filename(base, "JackDAW", "recordings", NULL);
+    g_mkdir_with_parents(dir, 0700);
+    return dir;
+}
+
 static gboolean recorder_open_slot(guint i, JackDawTrack *t, off_t start_frame,
                                    off_t expected_frames)
 {
     if (recorder_slots[i].sf)
         return FALSE; /* already open */
 
-    /* Recordings live under ~/.jackdaw/recordings/. */
-    gchar *rec_dir = g_build_filename(g_get_home_dir(), ".jackdaw", "recordings", NULL);
-    g_mkdir_with_parents(rec_dir, 0700);
+    gchar *rec_dir = jackdaw_recordings_dir();
 
     jack_nframes_t sr = engine.client ? jack_get_sample_rate(engine.client) : 48000;
     GDateTime *now = g_date_time_new_now_local();

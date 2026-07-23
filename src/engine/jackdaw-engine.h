@@ -221,6 +221,10 @@ void jackdaw_engine_set_suspended(gboolean on);
 void jackdaw_engine_render_tap_start(off_t end_frame);
 void jackdaw_engine_render_tap_stop(void);
 gboolean jackdaw_engine_render_tap_done(void);
+
+/* Absolute path to the scratch-recordings directory
+ * (<settings>/JackDAW/recordings), created if missing. Caller g_free()s it. */
+gchar *jackdaw_recordings_dir(void);
 size_t jackdaw_engine_render_tap_read(float *L, float *R, size_t max_frames);
 
 G_END_DECLS

@@ -741,7 +741,7 @@ static gboolean project_move_asset(const char *src, const char *dst)
  * source absolute path to its bundle-relative path ("audio/<name>"). Files
  * already inside the bundle are referenced in place; imported files are copied
  * (leaving the user's original untouched); live takes still in the scratch dir
- * (~/.jackdaw/recordings) are moved in and their clips repointed. Differing
+ * (<settings>/JackDAW/recordings) are moved in and their clips repointed. Differing
  * sources sharing a basename are disambiguated with a numeric prefix. The
  * returned table is owned by the caller. */
 static GHashTable *project_collect_assets(JackDawProject *p, const char *audio_dir)
@@ -750,7 +750,7 @@ static GHashTable *project_collect_assets(JackDawProject *p, const char *audio_d
     GHashTable *used = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     GHashTable *moved = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     gchar *audio_prefix = g_strconcat(audio_dir, G_DIR_SEPARATOR_S, NULL);
-    gchar *rec_dir = g_build_filename(g_get_home_dir(), ".jackdaw", "recordings", NULL);
+    gchar *rec_dir = jackdaw_recordings_dir();
     gchar *rec_prefix = g_strconcat(rec_dir, G_DIR_SEPARATOR_S, NULL);
     g_free(rec_dir);
     /* Never move a file out from under the feeder thread, which reads paths only

@@ -296,8 +296,13 @@ public:
         SetExplicitPreferredSize(BSize(w, h));
         ResizeTo(w, h);
 
-        if (window != NULL)
+        if (window != NULL) {
             window->Unlock();
+            /* Re-fit the FX window chrome around the resized editor. The view is
+             * already sized, so no width/height payload is needed; PostMessage is
+             * thread-safe (this may not be the looper thread). */
+            window->PostMessage(PH_MSG_EDITOR_RESIZED);
+        }
 
         return view->onSize(newSize);
     }
@@ -488,17 +493,17 @@ extern "C" void ph_scan_via_helper(const char *fmt, const char *path, GList **ca
 static void ph_do_scan(void)
 {
     /* Module::getModulePaths() (module_haiku.cpp — the same enumeration the
-     * validator's -list uses) walks the Haiku VST3 locations (the add-on
-     * directories from find_paths() plus $HOME/.vst3) and returns the .vst3
-     * BUNDLE paths themselves, ready to describe. */
+     * validator's -list uses) walks the canonical Haiku VST3 location
+     * (add-ons/media/VST3 from find_paths(), every install root) and returns the
+     * .vst3 BUNDLE paths themselves, ready to describe. */
     for (auto &module_path : VST3::Hosting::Module::getModulePaths())
         ph_scan_via_helper("VST3", module_path.c_str(), &ph_cat);
     /* LV2 discovery is pure Turtle parsing via lilv (no plugin code runs), so
      * it happens in-process — the crash-isolating helper is for the binary
      * formats. */
     ph_lv2_scan(&ph_cat);
-    /* VST2 .so plug-ins (mostly vstbridge stubs under ~/.vst); each is
-     * described out-of-process, same crash isolation as VST3. */
+    /* VST2 plug-ins from add-ons/media/vstplugins (native add-ons + vstbridge
+     * stubs); each is described out-of-process, same crash isolation as VST3. */
     ph_vst2_scan(&ph_cat);
     ph_cat = g_list_reverse(ph_cat);
     ph_scanned = TRUE;

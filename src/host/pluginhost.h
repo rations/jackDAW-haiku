@@ -22,8 +22,9 @@ typedef enum { PH_VST3 = 0, PH_LV2, PH_VST2, PH_NFORMATS } PluginFormat;
 
 /* A catalog entry produced by scanning. VST3: key = "<bundle path>\n<class
  * name>" (one .vst3 module can contain many effect classes, e.g. mda-vst3).
- * LV2: key = the plugin URI. VST2: key = the plug-in .so path (one plug-in per
- * file; Wine-bridged .dll plug-ins appear as native vstbridge .so stubs). */
+ * LV2: key = the plugin URI. VST2: key = the plug-in file path (one plug-in per
+ * file; native Haiku add-ons are usually extension-less, Wine-bridged .dll
+ * plug-ins appear as native vstbridge stubs). */
 typedef struct {
     PluginFormat format;
     char *key;
@@ -54,8 +55,9 @@ void pluginhost_shutdown(void);
 int pluginhost_scan_helper_main(int argc, char **argv);
 
 /* Catalog (scans lazily on first call). GList of PluginInfo* (borrowed).
- * Bundles are found in the Haiku VST3 add-on directories (find_paths) plus
- * $HOME/.vst3; each is described out-of-process via the scan helper. */
+ * Plug-ins are found in the canonical Haiku add-ons/media/{VST3,LV2,vstplugins}
+ * directories (find_paths, every install root); each is described
+ * out-of-process via the scan helper. */
 const GList *pluginhost_catalog(void);
 void pluginhost_rescan(void);
 
@@ -137,6 +139,13 @@ gboolean pluginhost_param_is_stepped(PluginInstance *inst, guint i, gint *steps)
 void *pluginhost_ui_create(PluginInstance *inst);
 void pluginhost_ui_poll(PluginInstance *inst);
 void pluginhost_ui_destroy(PluginInstance *inst);
+
+/* BMessage `what` a backend posts to the embedded editor's BWindow (the FX
+ * window) when a plug-in resizes its own editor frame — VST2 audioMasterSizeWindow,
+ * VST3 IPlugFrame::resizeView, LV2 ui:resize. The one relayout path every backend
+ * drives. Optional float fields "width"/"height" carry the requested editor size
+ * (the window handler applies them to the embedded view before re-fitting). */
+#define PH_MSG_EDITOR_RESIZED 'phrz'
 
 /* File loading without a plugin GUI (the INamFileLoader host extension,
  * discovered via queryInterface — NAMku implements it; plug-ins that don't

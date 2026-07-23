@@ -5,14 +5,18 @@
  * dispatched from pluginhost.cpp on inst->format). Drives the plain VST 2.4
  * `AEffect` ABI declared in the clean-room vst2_abi.h — no SDK, no GTK/X11.
  *
- * There are no native Haiku VST2 plug-ins; the real targets are Windows .dll
- * plug-ins bridged by vstbridge, which installs a native Haiku .so stub per
- * plug-in under ~/.vst. That stub exports VSTPluginMain and returns an ordinary
- * AEffect that marshals every call to a Wine host — so from here a bridged VST2
- * plug-in loads and runs exactly like a local one; Wine is invisible below the
- * ABI. Only the plug-in editor is Haiku-specific (a captured shared-memory
- * surface, not an embedded window); that path is enabled separately once the
- * vstbridge VST2 bridge publishes the surface (see ph_vst2_ui_create).
+ * Two kinds of plug-in load through here, identically below the ABI:
+ *   - Native BeOS/Haiku VST2 add-ons (e.g. the mda set). These are ordinary
+ *     Haiku add-on images loaded with load_add_on(); their entry symbol is the
+ *     BeOS default main_plugin (older ones) or VSTPluginMain, resolved with
+ *     get_image_symbol(). They usually carry NO file extension, so discovery
+ *     cannot filter on ".so" — this mirrors Haiku's own media VST host.
+ *   - Windows .dll plug-ins bridged by vstbridge, which installs a native Haiku
+ *     add-on stub per plug-in. The stub exports VSTPluginMain and returns an
+ *     AEffect that marshals every call to a Wine host, so Wine is invisible here.
+ * Only the plug-in editor is Haiku-specific (a native embedded view, or for the
+ * bridge a captured shared-memory surface painted into the BView we hand to
+ * effEditOpen); see ph_vst2_ui_create.
  *
  * Threading: scan / instantiate / free / params / state run on the instance's
  * owning window looper; ph_vst2_process[_midi] run on the JACK RT thread and
@@ -26,8 +30,10 @@
 
 #include "../engine/rt_denormal.h"
 
-#include <dlfcn.h>
+#include <FindDirectory.h> /* find_paths — canonical add-on discovery */
+#include <image.h>         /* load_add_on / get_image_symbol — VST2 plug-ins are Haiku add-ons */
 #include <stdio.h>
+#include <stdlib.h> /* free() for the find_paths result */
 #include <string.h>
 
 /* Interface Kit — the editor host view (BView) embedded in the FX window.
@@ -48,8 +54,13 @@ static int vst2_maxblock = 1024;
 
 class Vst2EditorHostView; /* defined below, before ph_vst2_ui_create */
 
+/* Defined after Vst2EditorHostView: post a plug-in-driven editor resize to the
+ * FX window (on the editor's looper). Forward-declared so the host callback,
+ * which precedes the view class, can request a resize. */
+static void vst2_post_editor_resize(PluginInstance *inst, float w, float h);
+
 struct Vst2Backend {
-    void *dl;
+    image_id addon;
     AEffect *eff;
 
     /* Channel buffers sized to the plug-in's ACTUAL port counts. processReplacing
@@ -79,7 +90,9 @@ static gboolean vst2_path_is_safe(const char *path)
     if (!path || path[0] != '/')
         return FALSE;
     size_t len = strlen(path);
-    if (len < 5 || len > 4000) /* shortest plausible: "/a.so" */
+    /* No ".so" assumption: native VST2 add-ons are extension-less, so only the
+     * leading-slash and a sane length bound the name. */
+    if (len < 2 || len > 4000)
         return FALSE;
     if (strstr(path, ".."))
         return FALSE;
@@ -95,9 +108,6 @@ static gboolean vst2_path_is_safe(const char *path)
 static intptr_t VST_CALL_CONV vst2_master(AEffect *e, int32_t op, int32_t idx, intptr_t val,
                                           void *ptr, float opt)
 {
-    (void)e;
-    (void)idx;
-    (void)val;
     (void)opt;
     switch (op) {
         case audioMasterVersion:
@@ -137,9 +147,17 @@ static intptr_t VST_CALL_CONV vst2_master(AEffect *e, int32_t op, int32_t idx, i
         case audioMasterCanDo:
             if (ptr && (!strcmp((const char *)ptr, "sendVstMidiEvent") ||
                         !strcmp((const char *)ptr, "receiveVstMidiEvent") ||
-                        !strcmp((const char *)ptr, "sendVstTimeInfo")))
+                        !strcmp((const char *)ptr, "sendVstTimeInfo") ||
+                        !strcmp((const char *)ptr, "sizeWindow")))
                 return 1;
             return 0;
+        case audioMasterSizeWindow:
+            /* Plug-in wants its editor resized (index = width, value = height).
+             * Reached on the editor's looper thread; hand off to the FX window
+             * so all BView/BWindow sizing stays on that thread. e->user is the
+             * PluginInstance (stashed at instantiate; NULL during scan). */
+            vst2_post_editor_resize(e ? (PluginInstance *)e->user : NULL, (float)idx, (float)val);
+            return 1;
         default:
             return 0;
     }
@@ -147,28 +165,40 @@ static intptr_t VST_CALL_CONV vst2_master(AEffect *e, int32_t op, int32_t idx, i
 
 /* ---- Load ---- */
 
-static AEffect *vst2_load(const char *path, void **dl_out)
+static AEffect *vst2_load(const char *path, image_id *addon_out)
 {
     if (!vst2_path_is_safe(path))
         return NULL;
-    /* dlopen fails cleanly on a non-native / foreign ELF (e.g. a Linux .so),
-     * so only real Haiku plug-in stubs get this far. */
-    void *dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!dl)
+    /* Load as a native Haiku add-on. load_add_on() fails cleanly on a non-native
+     * / foreign ELF (e.g. a Linux .so) and on non-ELF data files, so an
+     * extension-less scan may hand us any file and only real Haiku plug-in code
+     * gets past here. */
+    image_id addon = load_add_on(path);
+    if (addon < 0)
         return NULL;
-    Vst2EntryProc entry = (Vst2EntryProc)dlsym(dl, "VSTPluginMain");
-    if (!entry)
-        entry = (Vst2EntryProc)dlsym(dl, "main");
+    /* Entry symbol, resolved within this image only: the standard VST2
+     * VSTPluginMain, then the BeOS/Haiku-native default main_plugin, then the
+     * legacy "main". get_image_symbol is scoped to `addon`, so a stray "main"
+     * in a dependency can never be picked up by mistake. */
+    Vst2EntryProc entry = NULL;
+    static const char *const kEntrySyms[] = {"VSTPluginMain", "main_plugin", "main"};
+    for (size_t i = 0; i < G_N_ELEMENTS(kEntrySyms); i++) {
+        void *sym = NULL;
+        if (get_image_symbol(addon, kEntrySyms[i], B_SYMBOL_TYPE_TEXT, &sym) == B_OK && sym) {
+            entry = (Vst2EntryProc)sym;
+            break;
+        }
+    }
     if (!entry) {
-        dlclose(dl);
+        unload_add_on(addon);
         return NULL;
     }
     AEffect *eff = entry(vst2_master);
     if (!eff || eff->magic != kEffectMagic) {
-        dlclose(dl);
+        unload_add_on(addon);
         return NULL;
     }
-    *dl_out = dl;
+    *addon_out = addon;
     return eff;
 }
 
@@ -192,12 +222,12 @@ static gboolean vst2_is_synth(AEffect *eff)
            eff->dispatcher(eff, effGetPlugCategory, 0, 0, NULL, 0.0f) == kPlugCategSynth;
 }
 
-/* Helper-process only: load + describe one .so and print its catalog line.
+/* Helper-process only: load + describe one file and print its catalog line.
  * A crashing static initializer takes down only the throwaway helper. */
 extern "C" void ph_vst2_describe(const char *path)
 {
-    void *dl = NULL;
-    AEffect *eff = vst2_load(path, &dl);
+    image_id addon = -1;
+    AEffect *eff = vst2_load(path, &addon);
     if (!eff)
         return;
     char nm[128] = {0};
@@ -210,8 +240,23 @@ extern "C" void ph_vst2_describe(const char *path)
     gboolean synth = vst2_is_synth(eff);
     printf("VST2\t%s\t%s\n", nm, synth ? "Instrument|VST2" : "VST2");
     eff->dispatcher(eff, effClose, 0, 0, NULL, 0.0f);
-    if (dl)
-        dlclose(dl);
+    if (addon >= 0)
+        unload_add_on(addon);
+}
+
+/* Cheap gate before spawning the out-of-process describe helper on a file.
+ * VST2/BeOS plug-ins carry no extension, so we cannot filter by suffix; instead
+ * accept only regular files whose first bytes are the ELF magic, so data files
+ * (samples, presets, images) in a plug-in folder don't each spawn a helper. */
+static gboolean vst2_is_elf(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return FALSE;
+    unsigned char m[4] = {0};
+    size_t got = fread(m, 1, sizeof m, f);
+    fclose(f);
+    return got == sizeof m && m[0] == 0x7f && m[1] == 'E' && m[2] == 'L' && m[3] == 'F';
 }
 
 static void vst2_scan_dir(const char *dir, GList **catalog, int depth)
@@ -226,8 +271,8 @@ static void vst2_scan_dir(const char *dir, GList **catalog, int depth)
         gchar *full = g_build_filename(dir, e, NULL);
         if (g_file_test(full, G_FILE_TEST_IS_DIR))
             vst2_scan_dir(full, catalog, depth + 1);
-        else if (g_str_has_suffix(e, ".so"))
-            ph_scan_via_helper("VST2", full, catalog); /* out-of-process describe */
+        else if (g_file_test(full, G_FILE_TEST_IS_REGULAR) && vst2_is_elf(full))
+            ph_scan_via_helper("VST2", full, catalog); /* extension-less: ELF-gated */
         g_free(full);
     }
     g_dir_close(d);
@@ -235,7 +280,7 @@ static void vst2_scan_dir(const char *dir, GList **catalog, int depth)
 
 extern "C" void ph_vst2_scan(GList **catalog)
 {
-    /* User-supplied search list first. */
+    /* Optional power-user override first. */
     const char *envp = g_getenv("VST_PATH");
     if (envp) {
         gchar **parts = g_strsplit(envp, ":", -1);
@@ -244,10 +289,17 @@ extern "C" void ph_vst2_scan(GList **catalog)
                 vst2_scan_dir(*p, catalog, 0);
         g_strfreev(parts);
     }
-    /* vstbridge installs its native .so stubs here (vstbridgectl sync). */
-    gchar *vst = g_build_filename(g_get_home_dir(), ".vst", NULL);
-    vst2_scan_dir(vst, catalog, 0);
-    g_free(vst);
+    /* Canonical Haiku VST2 location: add-ons/media/vstplugins across every
+     * install root (system packaged/non-packaged and ~/config/non-packaged),
+     * enumerated in precedence order. vstbridge installs its native stubs here
+     * too. */
+    char **paths = NULL;
+    size_t count = 0;
+    if (find_paths(B_FIND_PATH_ADD_ONS_DIRECTORY, "media/vstplugins", &paths, &count) == B_OK) {
+        for (size_t i = 0; i < count; i++)
+            vst2_scan_dir(paths[i], catalog, 0);
+        free(paths);
+    }
 }
 
 /* ---- Process ----
@@ -481,6 +533,8 @@ public:
         SetExplicitMinSize(BSize(frame.Width(), frame.Height()));
         SetExplicitMaxSize(BSize(frame.Width(), frame.Height()));
         SetExplicitPreferredSize(BSize(frame.Width(), frame.Height()));
+        fLastW = frame.Width();
+        fLastH = frame.Height();
     }
 
     void AttachedToWindow() override
@@ -505,11 +559,40 @@ public:
     void MessageReceived(BMessage *msg) override
     {
         if (msg->what == MSG_VST2_EDIT_IDLE) {
-            if (fEff && fAttached)
+            if (fEff && fAttached) {
                 fEff->dispatcher(fEff, effEditIdle, 0, 0, NULL, 0.0f);
+                /* Belt-and-braces for plug-ins that resize their editor without
+                 * calling audioMasterSizeWindow: re-read the rect and, if it
+                 * changed, ask the FX window to re-fit. */
+                CheckEditorRect();
+            }
             return;
         }
         BView::MessageReceived(msg);
+    }
+
+    /* Poll effEditGetRect; on a size change, request a relayout from the FX
+     * window (the window applies the size + re-fits on its looper). */
+    void CheckEditorRect()
+    {
+        if (!fEff)
+            return;
+        ERect *r = NULL;
+        fEff->dispatcher(fEff, effEditGetRect, 0, 0, &r, 0.0f);
+        if (!r || r->right <= r->left || r->bottom <= r->top)
+            return;
+        float w = (float)(r->right - r->left);
+        float h = (float)(r->bottom - r->top);
+        if (w == fLastW && h == fLastH)
+            return;
+        fLastW = w;
+        fLastH = h;
+        if (BWindow *win = Window()) {
+            BMessage m(PH_MSG_EDITOR_RESIZED);
+            m.AddFloat("width", w);
+            m.AddFloat("height", h);
+            win->PostMessage(&m);
+        }
     }
 
     /* effEditClose + stop the idle runner. Idempotent (detach then destroy both
@@ -530,7 +613,26 @@ private:
     AEffect *fEff;
     bool fAttached = false;
     BMessageRunner *fIdle = NULL;
+    float fLastW = 0.0f, fLastH = 0.0f; /* last editor rect seen (resize detect) */
 };
+
+/* Post a plug-in-driven editor resize to the FX window (see the forward
+ * declaration above vst2_master). Runs on the editor's looper; PostMessage is
+ * thread-safe regardless. w/h <= 0 means "size unknown, just re-fit". */
+static void vst2_post_editor_resize(PluginInstance *inst, float w, float h)
+{
+    if (!inst || !inst->vst2 || !inst->vst2->editor_view)
+        return;
+    BWindow *win = inst->vst2->editor_view->Window();
+    if (!win)
+        return;
+    BMessage msg(PH_MSG_EDITOR_RESIZED);
+    if (w > 0.0f && h > 0.0f) {
+        msg.AddFloat("width", w);
+        msg.AddFloat("height", h);
+    }
+    win->PostMessage(&msg);
+}
 
 extern "C" void *ph_vst2_ui_create(PluginInstance *inst)
 {
@@ -582,13 +684,13 @@ extern "C" void ph_vst2_ui_destroy(PluginInstance *inst)
 
 extern "C" PluginInstance *ph_vst2_instantiate(const PluginInfo *info)
 {
-    void *dl = NULL;
-    AEffect *eff = vst2_load(info->key, &dl);
+    image_id addon = -1;
+    AEffect *eff = vst2_load(info->key, &addon);
     if (!eff)
         return NULL;
 
     Vst2Backend *b = g_new0(Vst2Backend, 1);
-    b->dl = dl;
+    b->addon = addon;
     b->eff = eff;
     b->max_block = vst2_maxblock;
     /* Size channel arrays to the plug-in's real port counts (pointer arrays
@@ -633,6 +735,9 @@ extern "C" PluginInstance *ph_vst2_instantiate(const PluginInfo *info)
     pi->learn_arm = 0;
     pi->learn_note = -1;
     pi->vst2 = b;
+    /* Stash the instance so the host callback (audioMasterSizeWindow) can reach
+     * this plug-in's editor view. */
+    eff->user = pi;
     return pi;
 }
 
@@ -655,8 +760,8 @@ extern "C" void ph_vst2_free(PluginInstance *inst)
             b->eff->dispatcher(b->eff, effMainsChanged, 0, 0, NULL, 0.0f);
             b->eff->dispatcher(b->eff, effClose, 0, 0, NULL, 0.0f);
         }
-        if (b->dl)
-            dlclose(b->dl);
+        if (b->addon >= 0)
+            unload_add_on(b->addon);
         for (int i = 0; i < b->n_out; i++)
             g_free(b->out_bufs[i]);
         g_free(b->out_bufs);

@@ -68,6 +68,7 @@ extern "C" {
 #define audioMasterCurrentId 2
 #define audioMasterWantMidi 6 /* deprecated, still queried */
 #define audioMasterGetTime 7
+#define audioMasterSizeWindow 15 /* plug-in requests its editor be resized: index=w, value=h */
 #define audioMasterGetSampleRate 16
 #define audioMasterGetBlockSize 17
 #define audioMasterGetCurrentProcessLevel 23

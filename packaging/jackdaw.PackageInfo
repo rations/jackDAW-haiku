@@ -1,5 +1,5 @@
 name			jackdaw
-version			0.2-1
+version			0.3.0-1
 architecture	x86_64
 summary			"JackDAW - multitrack JACK DAW (native Haiku)"
 description		"A native Haiku multitrack digital audio workstation built on the
@@ -19,8 +19,8 @@ licenses {
 	"MIT"
 }
 provides {
-	jackdaw = 0.2
-	app:JackDAW = 0.2
+	jackdaw = 0.3.0
+	app:JackDAW = 0.3.0
 }
 requires {
 	haiku

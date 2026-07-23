@@ -25,7 +25,7 @@ Jack Graph > Jack Settings (adjust the capture device path to your interface)
   ```
 - If you use a **USB audio interface**, install the UAC2 driver first (haiku-kernel-usb) —
   a stock Haiku will not expose class-compliant USB audio.
-- VST3 plug-ins are picked up from the system and user `add-ons/vst3` directories, so
+- VST3 plug-ins are picked up from the system and user `add-ons/media/VST3` directories, so
   installing the `namku` / `drumku` packages makes them available with no extra config.
 
 ## Install

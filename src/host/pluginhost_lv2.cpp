@@ -26,6 +26,12 @@
 
 #include "engine/rt_denormal.h"
 
+/* Interface Kit — to forward ui:resize to the FX window (the HaikuUI widget is a
+ * BView*). LV2 headers are plain C, so there is no ABI/type collision here. */
+#include <Message.h>
+#include <View.h>
+#include <Window.h>
+
 #include <lilv/lilv.h>
 #include <lv2/atom/atom.h>
 #include <lv2/buf-size/buf-size.h>
@@ -450,6 +456,11 @@ struct Lv2Backend {
     LV2UI_Handle ui_handle;
     void *ui_widget; /* the BView*, opaque here */
     float *ui_last;  /* per-port last value delivered via port_event */
+
+    /* ui:resize — lets the UI request its own editor be resized. Per-instance
+     * because the callback handle is this PluginInstance. */
+    LV2UI_Resize ui_resize;
+    LV2_Feature feat_ui_resize;
 };
 
 typedef struct {
@@ -1316,6 +1327,26 @@ static void lph_ui_write_cb(LV2UI_Controller controller, uint32_t port_index, ui
     }
 }
 
+/* ui:resize — the UI asks the host to resize its editor. Forward to the FX
+ * window so all BView/BWindow sizing stays on its looper (PostMessage is
+ * thread-safe). handle is the PluginInstance (set in ph_lv2_ui_create). */
+static int lph_ui_resize_cb(LV2UI_Feature_Handle handle, int width, int height)
+{
+    PluginInstance *inst = (PluginInstance *)handle;
+    if (!inst || !inst->lv2 || width <= 0 || height <= 0)
+        return 1; /* non-zero = failed, but non-fatal to the UI */
+    BView *view = (BView *)inst->lv2->ui_widget;
+    if (!view)
+        return 1;
+    if (BWindow *win = view->Window()) {
+        BMessage m(PH_MSG_EDITOR_RESIZED);
+        m.AddFloat("width", (float)width);
+        m.AddFloat("height", (float)height);
+        win->PostMessage(&m);
+    }
+    return 0;
+}
+
 extern "C" void *ph_lv2_ui_create(PluginInstance *inst)
 {
     if (!inst || !inst->lv2)
@@ -1351,7 +1382,13 @@ extern "C" void *ph_lv2_ui_create(PluginInstance *inst)
         return NULL;
     }
 
-    const LV2_Feature *feats[] = {&lph_feat_map, &lph_feat_unmap, NULL};
+    /* Offer ui:resize so a plug-in UI can grow/shrink its own editor. */
+    b->ui_resize.handle = inst;
+    b->ui_resize.ui_resize = lph_ui_resize_cb;
+    b->feat_ui_resize.URI = LV2_UI__resize;
+    b->feat_ui_resize.data = &b->ui_resize;
+
+    const LV2_Feature *feats[] = {&lph_feat_map, &lph_feat_unmap, &b->feat_ui_resize, NULL};
     LV2UI_Widget widget = NULL;
     b->ui_handle = b->ui_desc->instantiate(b->ui_desc, inst->key, b->ui_bundle, lph_ui_write_cb,
                                            (LV2UI_Controller)inst, &widget, feats);

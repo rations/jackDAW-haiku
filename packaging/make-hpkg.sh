@@ -9,7 +9,7 @@ set -e
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
-VERSION=0.2
+VERSION=0.3.0
 REVISION=1
 STAGE="$HERE/stage"
 

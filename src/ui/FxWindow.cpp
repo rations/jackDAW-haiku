@@ -384,6 +384,28 @@ void FxWindow::DetachEmbeddedUi(bool destroy)
     m_embedded_inst = NULL;
 }
 
+void FxWindow::FitWindowToEmbeddedEditor()
+{
+    if (!m_embedded_ui)
+        return;
+    // Backends publish the editor's desired size as the view's explicit min
+    // size (at embed and on every plug-in-driven resize).
+    BSize want = m_embedded_ui->MinSize();
+    float editorH = want.height;
+    if (editorH <= 0.0f)
+        return;
+    // Keep the current width unless the editor now wants to be wider than the
+    // space it currently has (the param scroll view scrolls vertically only, so
+    // extra width must come from the window). At embed time the view has not
+    // been laid out yet (Frame width 0), so width is left unchanged — matching
+    // the original embed behavior.
+    float targetW = Bounds().Width();
+    float have = m_embedded_ui->Frame().Width();
+    if (have > 0.0f && want.width > have)
+        targetW += want.width - have;
+    ResizeTo(targetW, editorH + kEditorChromeHeight);
+}
+
 void FxWindow::ClearParamPanel()
 {
     DetachEmbeddedUi(false);
@@ -445,9 +467,7 @@ void FxWindow::RebuildParamPanel()
             // The editor sits in a scroll view that clips a tall editor to the
             // visible height, so grow the window to show the whole editor plus
             // the toggle-button row and the surrounding toolbar/insets chrome.
-            float editorH = ui->MinSize().height;
-            if (editorH > 0.0f)
-                ResizeTo(Bounds().Width(), editorH + kEditorChromeHeight);
+            FitWindowToEmbeddedEditor();
             BMessage tick(MSG_FXUI_TICK);
             m_ui_poll = new BMessageRunner(BMessenger(this), &tick, 33000);
             return;
@@ -685,6 +705,24 @@ void FxWindow::MessageReceived(BMessage *message)
             // HaikuUI port_event contract requires.
             if (m_embedded_inst)
                 pluginhost_ui_poll(m_embedded_inst);
+            break;
+        }
+
+        case PH_MSG_EDITOR_RESIZED: {
+            // A plug-in resized its own editor frame (posted by the VST2/VST3/LV2
+            // backend). All embedded-view sizing happens here on the looper
+            // thread. Optional width/height set the new editor size; otherwise
+            // the backend already updated the view and we just re-fit the window.
+            if (!m_embedded_ui)
+                break;
+            float w, h;
+            if (message->FindFloat("width", &w) == B_OK &&
+                message->FindFloat("height", &h) == B_OK && w > 0.0f && h > 0.0f) {
+                m_embedded_ui->SetExplicitMinSize(BSize(w, h));
+                m_embedded_ui->SetExplicitMaxSize(BSize(w, h));
+                m_embedded_ui->SetExplicitPreferredSize(BSize(w, h));
+            }
+            FitWindowToEmbeddedEditor();
             break;
         }
 

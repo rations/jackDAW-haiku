@@ -51,6 +51,10 @@ private:
     void RebuildChainList(int select);
     void RebuildParamPanel();
     void BuildDrumRack(PluginInstance *inst);
+    // Grow the window to fit the currently embedded native editor (its height
+    // plus the surrounding chrome, and its width if it grew). Called at embed
+    // time and whenever a plug-in resizes its own editor (PH_MSG_EDITOR_RESIZED).
+    void FitWindowToEmbeddedEditor();
     void ClearParamPanel();
     // Detach the embedded native editor view (without deleting it — the UI's
     // own cleanup owns the view) and, when destroy is true, tear the editor
