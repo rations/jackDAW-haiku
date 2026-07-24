@@ -6,6 +6,7 @@ task.md
 PLAN.md
 .claude/
 prompt
+setup.md
 
 # Build artifacts
 *.o

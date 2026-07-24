@@ -44,15 +44,19 @@
 
 #include "engine/rt_denormal.h"
 
-#include <Looper.h> /* BLooper definition for the defensive editor teardown */
-#include <View.h>   /* native editor host view (kPlatformTypeHaikuBView) */
-#include <Window.h> /* BWindow::Lock() around off-looper resizes */
+#include <Looper.h>        /* BLooper definition for the defensive editor teardown */
+#include <MessageRunner.h> /* IRunLoop timer + fd-poll ticks on the looper thread */
+#include <Messenger.h>     /* BMessenger target for the run-loop BMessageRunners */
+#include <View.h>          /* native editor host view (kPlatformTypeHaikuBView) */
+#include <Window.h>        /* BWindow::Lock() around off-looper resizes */
 
 #include <image.h> /* Haiku: get_next_image_info → own executable path */
+#include <poll.h>  /* IRunLoop event-handler fd readiness polling */
 
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace Steinberg;
@@ -215,12 +219,31 @@ private:
     Vst3Backend *fBackend;
 };
 
+/* Internal `what` codes for the run-loop BMessageRunners (see the IRunLoop
+ * implementation below). Both are delivered to the host view's own handler, so
+ * their callbacks run on the FX window looper thread. */
+#define PH_MSG_RUNLOOP_POLL 'phrp'  /* poll registered event-handler fds */
+#define PH_MSG_RUNLOOP_TIMER 'phrt' /* fire an ITimerHandler ("handler" ptr) */
+
 /* Host BView wrapping a plug-in's IPlugView (kPlatformTypeHaikuBView): the FX
  * window AddChild()s this view; the plug-in view attaches into it while the
  * window looper is locked (AttachedToWindow/DetachedFromWindow both run under
  * the lock). Also the IPlugFrame for plug-in-driven resizes. Owned by the
- * backend; deleted in pluginhost_ui_destroy after the FX window removed it. */
-class Vst3EditorHostView : public BView, public IPlugFrame
+ * backend; deleted in pluginhost_ui_destroy after the FX window removed it.
+ *
+ * Additionally implements Steinberg::Linux::IRunLoop. Native Haiku plug-ins do
+ * not need it (each BWindow owns a looper thread; they use BMessageRunner for
+ * timers). But the Wine-bridge plug-in proxy is derived from a Linux host and
+ * queries this IPlugFrame for IRunLoop so it can defer IPlugFrame::resizeView()
+ * and context-menu work onto a host-owned GUI thread instead of its IPC read
+ * thread; without it the bridge falls back to calling those directly off-thread.
+ * We satisfy the contract with looper-thread machinery: a BMessageRunner polls
+ * the registered event-handler fds and BMessageRunners drive the timers, so
+ * every onFDIsSet()/onTimer() callback runs on this view's looper thread — the
+ * thread the bridge needs. All IRunLoop methods are only ever called on that
+ * looper thread (the bridge registers/unregisters from IPlugView::setFrame(),
+ * which the host drives under the window lock), so no locking is needed. */
+class Vst3EditorHostView : public BView, public IPlugFrame, public Steinberg::Linux::IRunLoop
 {
 public:
     Vst3EditorHostView(IPlugView *view, BRect frame)
@@ -250,6 +273,27 @@ public:
         BView::DetachedFromWindow();
     }
 
+    /* Run-loop ticks (poll fds / fire timers) are delivered here, so they run on
+     * this view's looper thread — exactly where the bridge needs its deferred
+     * IPlugFrame/context work to happen. */
+    void MessageReceived(BMessage *msg) override
+    {
+        switch (msg->what) {
+            case PH_MSG_RUNLOOP_POLL:
+                RunLoopPollFds();
+                break;
+            case PH_MSG_RUNLOOP_TIMER: {
+                void *h = nullptr;
+                if (msg->FindPointer("handler", &h) == B_OK)
+                    RunLoopFireTimer(static_cast<Steinberg::Linux::ITimerHandler *>(h));
+                break;
+            }
+            default:
+                BView::MessageReceived(msg);
+                break;
+        }
+    }
+
     void DetachPlugView()
     {
         if (fPlugView && fAttached) {
@@ -263,10 +307,18 @@ public:
     void ReleasePlugView()
     {
         DetachPlugView();
+        /* A well-behaved bridge unregisters everything from setFrame(nullptr)
+         * above; drop any stragglers so no BMessageRunner outlives this view. */
+        StopRunLoop();
         if (fPlugView) {
             fPlugView->release();
             fPlugView = nullptr;
         }
+    }
+
+    ~Vst3EditorHostView() override
+    {
+        StopRunLoop();
     }
 
     /* IPlugFrame — plug-in-driven resize.
@@ -316,6 +368,10 @@ public:
             *obj = static_cast<IPlugFrame *>(this);
             return kResultOk;
         }
+        if (FUnknownPrivate::iidEqual(_iid, Steinberg::Linux::IRunLoop::iid)) {
+            *obj = static_cast<Steinberg::Linux::IRunLoop *>(this);
+            return kResultOk;
+        }
         *obj = nullptr;
         return kNoInterface;
     }
@@ -328,9 +384,133 @@ public:
         return 100;
     }
 
+    /* ---- Steinberg::Linux::IRunLoop ----
+     *
+     * All four entry points are called only on this view's looper thread (the
+     * bridge registers/unregisters from IPlugView::setFrame(), driven by the
+     * host under the window lock), and onFDIsSet()/onTimer() are dispatched from
+     * MessageReceived() on that same thread, so the handler lists need no lock. */
+    tresult PLUGIN_API registerEventHandler(Steinberg::Linux::IEventHandler *handler,
+                                            Steinberg::Linux::FileDescriptor fd) SMTG_OVERRIDE
+    {
+        if (!handler || fd < 0)
+            return kInvalidArgument;
+        for (auto &e : fEventHandlers)
+            if (e.second == fd)
+                return kInvalidArgument; /* one handler per fd (SDK convention) */
+        fEventHandlers.push_back({handler, fd});
+        if (!fPollRunner) {
+            /* ~60 Hz — far faster than any editor resize/context-menu cadence,
+             * and only ticking while an event handler is registered. */
+            BMessage tick(PH_MSG_RUNLOOP_POLL);
+            fPollRunner = new BMessageRunner(BMessenger(this), &tick, 16000 /*µs*/);
+            if (fPollRunner->InitCheck() != B_OK) {
+                delete fPollRunner;
+                fPollRunner = nullptr;
+                fEventHandlers.pop_back();
+                return kInternalError;
+            }
+        }
+        return kResultTrue;
+    }
+
+    tresult PLUGIN_API unregisterEventHandler(Steinberg::Linux::IEventHandler *handler)
+        SMTG_OVERRIDE
+    {
+        if (!handler)
+            return kInvalidArgument;
+        bool removed = false;
+        for (size_t i = 0; i < fEventHandlers.size(); ++i)
+            if (fEventHandlers[i].first == handler) {
+                fEventHandlers.erase(fEventHandlers.begin() + i);
+                removed = true;
+                break;
+            }
+        if (fEventHandlers.empty() && fPollRunner) {
+            delete fPollRunner;
+            fPollRunner = nullptr;
+        }
+        return removed ? kResultTrue : kResultFalse;
+    }
+
+    tresult PLUGIN_API registerTimer(Steinberg::Linux::ITimerHandler *handler,
+                                     Steinberg::Linux::TimerInterval ms) SMTG_OVERRIDE
+    {
+        if (!handler || ms == 0)
+            return kInvalidArgument;
+        BMessage tick(PH_MSG_RUNLOOP_TIMER);
+        tick.AddPointer("handler", handler);
+        BMessageRunner *r = new BMessageRunner(BMessenger(this), &tick, (bigtime_t)ms * 1000);
+        if (r->InitCheck() != B_OK) {
+            delete r;
+            return kInternalError;
+        }
+        fTimers.push_back({handler, r});
+        return kResultTrue;
+    }
+
+    tresult PLUGIN_API unregisterTimer(Steinberg::Linux::ITimerHandler *handler) SMTG_OVERRIDE
+    {
+        if (!handler)
+            return kInvalidArgument;
+        for (size_t i = 0; i < fTimers.size(); ++i)
+            if (fTimers[i].first == handler) {
+                delete fTimers[i].second;
+                fTimers.erase(fTimers.begin() + i);
+                return kResultTrue;
+            }
+        return kResultFalse;
+    }
+
 private:
+    /* Non-blocking readiness check over the registered fds, dispatching
+     * onFDIsSet() for each ready one. Walks a snapshot so a handler that
+     * unregisters itself from within onFDIsSet() cannot invalidate the walk. */
+    void RunLoopPollFds()
+    {
+        if (fEventHandlers.empty())
+            return;
+        std::vector<struct pollfd> pfds;
+        std::vector<Steinberg::Linux::IEventHandler *> handlers;
+        pfds.reserve(fEventHandlers.size());
+        handlers.reserve(fEventHandlers.size());
+        for (auto &e : fEventHandlers) {
+            struct pollfd p = {e.second, POLLIN, 0};
+            pfds.push_back(p);
+            handlers.push_back(e.first);
+        }
+        if (poll(pfds.data(), pfds.size(), 0) <= 0)
+            return;
+        for (size_t i = 0; i < pfds.size(); ++i)
+            if (pfds[i].revents & POLLIN)
+                handlers[i]->onFDIsSet(pfds[i].fd);
+    }
+
+    void RunLoopFireTimer(Steinberg::Linux::ITimerHandler *handler)
+    {
+        /* Ignore a tick already queued when the timer was unregistered. */
+        for (auto &t : fTimers)
+            if (t.first == handler) {
+                handler->onTimer();
+                return;
+            }
+    }
+
+    void StopRunLoop()
+    {
+        delete fPollRunner;
+        fPollRunner = nullptr;
+        fEventHandlers.clear();
+        for (auto &t : fTimers)
+            delete t.second;
+        fTimers.clear();
+    }
+
     IPlugView *fPlugView;
     bool fAttached = false;
+    BMessageRunner *fPollRunner = nullptr;
+    std::vector<std::pair<Steinberg::Linux::IEventHandler *, int>> fEventHandlers;
+    std::vector<std::pair<Steinberg::Linux::ITimerHandler *, BMessageRunner *>> fTimers;
 };
 
 /* PluginInstance itself lives in pluginhost_internal.h (shared with the LV2
