@@ -88,6 +88,9 @@ enum {
     MSG_TRACK_DELETE_SLOT = 'tdes', // delete track at int32 "slot"
     MSG_TRACK_CONTEXT = 'tctx',     // strip right-click: int32 "slot" + BPoint "screen_where"
     MSG_TRACK_MOVE = 'tmov',        // reorder: int32 "from", int32 "to"
+    // Right-click on the empty strip column below the last track: BPoint
+    // "screen_where". Offers Add Track / Add MIDI Track.
+    MSG_TRACK_AREA_CONTEXT = 'tacx',
 
     // Mixer strip -> MainWindow (single-mutator: a detached mixer window routes
     // its edits here rather than calling the engine from its own looper). Each

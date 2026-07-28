@@ -130,6 +130,7 @@ struct _JackDawTrack {
     gpointer rt_chain;
     GPtrArray *retire_chains; /* JackDawFxChain* awaiting free */
     GPtrArray *retire_fx;     /* PluginInstance* awaiting free */
+    guint retire_cycle;       /* engine cycle count when retire_fx last grew */
 };
 
 /* Immutable FX chain snapshot. fx[i] is a PluginInstance* (opaque here, so
@@ -256,6 +257,17 @@ void jackdaw_track_fx_remove(JackDawTrack *t, guint index);
 void jackdaw_track_fx_move(JackDawTrack *t, guint from, guint to);
 guint jackdaw_track_fx_count(JackDawTrack *t);
 gpointer jackdaw_track_fx_get(JackDawTrack *t, guint index);
+
+/* Free instances retired by an earlier fx edit, once the RT thread has run
+ * again since they were retired (so nothing can still reach them through the
+ * chain snapshot that referenced them). Returns TRUE when the retire queue is
+ * empty afterwards; FALSE means "not yet, call again".
+ *
+ * Without this, a removed plug-in is only freed by the NEXT edit on the same
+ * track — which for a Wine-bridged plug-in leaves its Wine host process running
+ * until the track is destroyed. Must be called on the thread that instantiated
+ * the plug-ins (their FX window's looper), like pluginhost_free itself. */
+gboolean jackdaw_track_fx_collect(JackDawTrack *t);
 
 G_END_DECLS
 

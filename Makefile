@@ -45,7 +45,7 @@ CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/VuView.cpp src/ui/StateButton.cpp src/ui/TrackStripView.cpp src/ui/MixerStripView.cpp \
               src/ui/MixerView.cpp src/ui/MixerWindow.cpp src/ui/RegionGainWindow.cpp \
               src/ui/MidiWindow.cpp src/ui/FxWindow.cpp src/ui/RenderWindow.cpp \
-              src/ui/IoWindow.cpp src/ui/MidiControlWindow.cpp
+              src/ui/IoWindow.cpp src/ui/MidiControlWindow.cpp src/ui/ScanWindow.cpp
 HOST_SOURCES = src/host/pluginhost.cpp src/host/pluginhost_lv2.cpp src/host/pluginhost_vst2.cpp
 
 # SDK sources compiled directly (they are not part of the SDK's static libs;

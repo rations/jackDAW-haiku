@@ -201,6 +201,15 @@ void jackdaw_engine_get_master_peaks(gfloat *out_L, gfloat *out_R);
 /* Cumulative xrun count reported by JACK since engine init (display only). */
 guint jackdaw_engine_get_xrun_count(void);
 
+/* Process callbacks completed since engine init (wraps; compare differences,
+ * never absolutes). Lets non-RT code establish that the RT thread has run again
+ * since a structure was retired — see jackdaw_track_fx_collect. */
+guint jackdaw_engine_get_cycle_count(void);
+
+/* TRUE while the JACK client is active, i.e. while the process callback can
+ * still be running. FALSE means nothing is reading the RT graph. */
+gboolean jackdaw_engine_is_processing(void);
+
 /* ---- Render / export support (P11) ----
  * The offline render (render.c) reads track audio synchronously through an
  * EngTrackReader and mixes on a worker thread while the RT graph is held off

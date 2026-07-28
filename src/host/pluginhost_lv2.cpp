@@ -516,7 +516,11 @@ static void lph_write_control(PluginInstance *inst, uint32_t port, float val)
  * plugin code during a scan is exactly what the scan design avoids, so this
  * is a static check: the library file must exist, be ELF, and reference
  * libroot.so in its dynamic strings — every native Haiku shared object does,
- * and no Linux build ever does. */
+ * and no Linux build ever does.
+ *
+ * Reading every DSP binary in full is the LV2 scan's dominant cost, and the
+ * answer only changes when the binary does, so the verdict goes through the
+ * host's on-disk scan cache (keyed by path + mtime). */
 static gboolean lph_binary_is_loadable(const LilvPlugin *p)
 {
     const LilvNode *lib = lilv_plugin_get_library_uri(p);
@@ -525,6 +529,11 @@ static gboolean lph_binary_is_loadable(const LilvPlugin *p)
     char *path = lilv_file_uri_parse(lilv_node_as_uri(lib), NULL);
     if (!path)
         return FALSE;
+    gboolean cached = FALSE;
+    if (ph_cache_flag_get(path, &cached)) {
+        lilv_free(path);
+        return cached;
+    }
     gboolean ok = FALSE;
     gchar *data = NULL;
     gsize len = 0;
@@ -542,6 +551,7 @@ static gboolean lph_binary_is_loadable(const LilvPlugin *p)
         }
         g_free(data);
     }
+    ph_cache_flag_set(path, ok);
     lilv_free(path);
     return ok;
 }

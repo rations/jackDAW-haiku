@@ -259,7 +259,10 @@ static gboolean vst2_is_elf(const char *path)
     return got == sizeof m && m[0] == 0x7f && m[1] == 'E' && m[2] == 'L' && m[3] == 'F';
 }
 
-static void vst2_scan_dir(const char *dir, GList **catalog, int depth)
+/* One directory walk serving both the scan and the candidate count: with
+ * `catalog` NULL nothing is described, each candidate is only counted (used to
+ * make the startup scan's progress bar determinate). */
+static void vst2_scan_dir(const char *dir, GList **catalog, int depth, guint *n_found)
 {
     if (depth > 6)
         return;
@@ -269,24 +272,29 @@ static void vst2_scan_dir(const char *dir, GList **catalog, int depth)
     const char *e;
     while ((e = g_dir_read_name(d))) {
         gchar *full = g_build_filename(dir, e, NULL);
-        if (g_file_test(full, G_FILE_TEST_IS_DIR))
-            vst2_scan_dir(full, catalog, depth + 1);
-        else if (g_file_test(full, G_FILE_TEST_IS_REGULAR) && vst2_is_elf(full))
-            ph_scan_via_helper("VST2", full, catalog); /* extension-less: ELF-gated */
+        if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
+            vst2_scan_dir(full, catalog, depth + 1, n_found);
+        } else if (g_file_test(full, G_FILE_TEST_IS_REGULAR) && vst2_is_elf(full)) {
+            (*n_found)++;
+            if (catalog)
+                ph_scan_via_helper("VST2", full, catalog); /* extension-less: ELF-gated */
+        }
         g_free(full);
     }
     g_dir_close(d);
 }
 
-extern "C" void ph_vst2_scan(GList **catalog)
+/* Walk every VST2 search root. `catalog` NULL = count only (see vst2_scan_dir). */
+static guint vst2_walk_roots(GList **catalog)
 {
+    guint n_found = 0;
     /* Optional power-user override first. */
     const char *envp = g_getenv("VST_PATH");
     if (envp) {
         gchar **parts = g_strsplit(envp, ":", -1);
         for (gchar **p = parts; *p; p++)
             if (**p)
-                vst2_scan_dir(*p, catalog, 0);
+                vst2_scan_dir(*p, catalog, 0, &n_found);
         g_strfreev(parts);
     }
     /* Canonical Haiku VST2 location: add-ons/media/vstplugins across every
@@ -297,9 +305,20 @@ extern "C" void ph_vst2_scan(GList **catalog)
     size_t count = 0;
     if (find_paths(B_FIND_PATH_ADD_ONS_DIRECTORY, "media/vstplugins", &paths, &count) == B_OK) {
         for (size_t i = 0; i < count; i++)
-            vst2_scan_dir(paths[i], catalog, 0);
+            vst2_scan_dir(paths[i], catalog, 0, &n_found);
         free(paths);
     }
+    return n_found;
+}
+
+extern "C" void ph_vst2_scan(GList **catalog)
+{
+    vst2_walk_roots(catalog);
+}
+
+extern "C" guint ph_vst2_count_candidates(void)
+{
+    return vst2_walk_roots(NULL);
 }
 
 /* ---- Process ----

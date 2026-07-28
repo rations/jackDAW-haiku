@@ -141,7 +141,14 @@ enum {
 
     MSG_FXUI_TICK = 'uitk',    // ~30 Hz host→UI feedback for an embedded editor
     MSG_FX_TOGGLE_UI = 'fxtg', // switch the selected plugin editor ⇄ generic panel
+    MSG_FX_COLLECT = 'fxcl',   // one-shot: free the instance retired by a Remove
 };
+
+// Delay before collecting a removed plug-in. Only has to outlast the RT
+// thread's use of the chain snapshot that still referenced it — two JACK
+// periods, i.e. ~5 ms at -p 128 — but the collect is also gated on the engine's
+// cycle counter, so this is just a comfortable margin.
+static const bigtime_t kFxCollectDelay = 250000; // 250 ms
 
 static const int32 kSliderSteps = 1000; // BSlider is integer; params are [0,1]
 
@@ -155,7 +162,8 @@ FxWindow::FxWindow(JackDawTrack *track, MainWindow *main)
               B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE),
       m_track(track), m_main(main), m_file_panel(NULL), m_save_panel(NULL), m_preset_save(NULL),
       m_preset_load(NULL), m_model_label(NULL), m_ir_label(NULL), m_learn_slot(-1),
-      m_learn_poll(NULL), m_embedded_ui(NULL), m_embedded_inst(NULL), m_ui_poll(NULL)
+      m_learn_poll(NULL), m_embedded_ui(NULL), m_embedded_inst(NULL), m_ui_poll(NULL),
+      m_collect(NULL)
 {
     g_object_ref(m_track);
 
@@ -223,8 +231,28 @@ FxWindow::FxWindow(JackDawTrack *track, MainWindow *main)
     CenterOnScreen();
 }
 
+// One-shot timer that brings us back to free a just-retired instance.
+void FxWindow::ArmFxCollect()
+{
+    delete m_collect;
+    BMessage tick(MSG_FX_COLLECT);
+    m_collect = new BMessageRunner(BMessenger(this), &tick, kFxCollectDelay, 1);
+}
+
+bool FxWindow::QuitRequested()
+{
+    // Closing right after a Remove must not strand the retired instance (and,
+    // for a bridged plug-in, its Wine host) until the track is destroyed. This
+    // hook runs on this window's own looper — FX windows are always closed with
+    // PostMessage(B_QUIT_REQUESTED) — so it is the right thread to free on, and
+    // by now the RT thread has long since cycled past the retired chain.
+    jackdaw_track_fx_collect(m_track);
+    return BWindow::QuitRequested();
+}
+
 FxWindow::~FxWindow()
 {
+    delete m_collect;
     // Tear every native editor down BEFORE ~BWindow deletes child views: the
     // UI's cleanup() removes and deletes its own view, so a view left
     // attached here would be deleted twice. (Same discipline as the Linux
@@ -268,8 +296,9 @@ PluginInstance *FxWindow::Selected()
     return (PluginInstance *)jackdaw_track_fx_get(m_track, (guint)sel);
 }
 
-/* The catalog scan (out-of-process describe of every installed bundle) runs
- * lazily inside pluginhost_catalog() the first time any FX window opens. */
+/* The catalog is already warm: the app scans it at startup, behind the progress
+ * window, so this is a plain list walk and the FX window opens immediately.
+ * pluginhost_catalog() would still scan lazily if that ever did not happen. */
 void FxWindow::BuildAddMenu()
 {
     while (m_add_menu->CountItems() > 0)
@@ -749,11 +778,22 @@ void FxWindow::MessageReceived(BMessage *message)
             if (inst)
                 m_prefer_generic.erase(inst); // pointer may be reused later
             jackdaw_track_fx_remove(m_track, (guint)sel);
+            ArmFxCollect();
             guint n = jackdaw_track_fx_count(m_track);
             RebuildChainList(n > 0 ? MIN((int)n - 1, (int)sel) : -1);
             NotifyChainChanged();
             break;
         }
+
+        case MSG_FX_COLLECT:
+            // The retired instance is freed here rather than on the next chain
+            // edit: a Wine-bridged plug-in keeps its Wine host process alive
+            // until pluginhost_free reaches its effClose / module release.
+            // Runs on this looper, which is also the thread that instantiated
+            // it — the same-thread contract pluginhost.h requires.
+            if (!jackdaw_track_fx_collect(m_track))
+                ArmFxCollect(); // RT has not cycled yet; try again shortly
+            break;
 
         case MSG_FX_UP:
         case MSG_FX_DOWN: {

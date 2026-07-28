@@ -158,6 +158,11 @@ typedef struct {
 static JackDawEngine engine;
 
 static volatile gint engine_xruns = 0;
+/* Process-callback counter, incremented once per cycle on the RT thread. Reused
+ * by non-RT code that must know the RT thread has moved past a retired
+ * structure (see jackdaw_track_fx_collect). A lock-free atomic increment is the
+ * only RT cost. */
+static volatile gint engine_cycles = 0;
 
 /* Diagnostics (JACKDAW_DIAG): per-cycle callback timing + xrun reporter, so a
  * missed deadline can be attributed to this callback vs. external scheduling. */
@@ -1316,6 +1321,11 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
     /* Mark this thread RT for the plugin host's allocation diagnostics. */
     ph_rt_mark(1);
+
+    /* One cycle done. Counted before any early-out below so that a suspended or
+     * silent graph still advances it — the point is only "the RT thread has run
+     * again since you looked". */
+    g_atomic_int_inc(&engine_cycles);
 
     /* Offline render / graph-rebuild in progress: the render worker (or a
      * project load) owns the PluginInstances, so the live graph must touch none
@@ -3193,6 +3203,16 @@ void jackdaw_engine_get_master_peaks(gfloat *out_L, gfloat *out_R)
 guint jackdaw_engine_get_xrun_count(void)
 {
     return (guint)g_atomic_int_get(&engine_xruns);
+}
+
+guint jackdaw_engine_get_cycle_count(void)
+{
+    return (guint)g_atomic_int_get(&engine_cycles);
+}
+
+gboolean jackdaw_engine_is_processing(void)
+{
+    return engine.active;
 }
 
 /* ======================================================================

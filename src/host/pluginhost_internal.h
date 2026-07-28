@@ -107,6 +107,14 @@ void ph_get_transport(double *bpm, double *sr, gint64 *frame, gboolean *playing)
  * kills only the throwaway helper. */
 void ph_scan_via_helper(const char *fmt, const char *path, GList **catalog);
 
+/* On-disk scan cache (pluginhost.cpp), exposed for the LV2 backend's
+ * native-binary check — reading every DSP binary in full is that scan's
+ * dominant cost, and the verdict only changes when the binary does. Both are
+ * usable ONLY from inside a scan; ph_cache_flag_get returns FALSE on a miss (or
+ * outside a scan) and leaves *out untouched. Keyed by path + mtime. */
+gboolean ph_cache_flag_get(const char *path, gboolean *out);
+void ph_cache_flag_set(const char *path, gboolean val);
+
 void ph_lv2_init(double sample_rate, int max_block);
 void ph_lv2_shutdown(void);
 /* Prepend LV2 catalog entries (PluginInfo*, key = plugin URI) to *catalog. */
@@ -139,6 +147,9 @@ void ph_vst2_shutdown(void);
  * optional $VST_PATH override) and append catalog entries (key = plug-in path),
  * each described out-of-process via ph_scan_via_helper. */
 void ph_vst2_scan(GList **catalog);
+/* Same enumeration as ph_vst2_scan, counting only — for a determinate scan
+ * progress bar. Loads no plug-in code. */
+guint ph_vst2_count_candidates(void);
 /* Helper-process only: load one .so and print its "VST2\t<name>\t<cat>" line. */
 void ph_vst2_describe(const char *path);
 PluginInstance *ph_vst2_instantiate(const PluginInfo *info);

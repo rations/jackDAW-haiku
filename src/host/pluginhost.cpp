@@ -50,8 +50,17 @@
 #include <View.h>          /* native editor host view (kPlatformTypeHaikuBView) */
 #include <Window.h>        /* BWindow::Lock() around off-looper resizes */
 
-#include <image.h> /* Haiku: get_next_image_info → own executable path */
-#include <poll.h>  /* IRunLoop event-handler fd readiness polling */
+#include <FindDirectory.h> /* B_USER_SETTINGS_DIRECTORY — the scan cache lives there */
+#include <StorageDefs.h>
+
+#include <dirent.h>   /* recursive mtime of a .vst3 bundle directory */
+#include <errno.h>    /* EINTR while draining the scan helper's stdout */
+#include <image.h>    /* Haiku: get_next_image_info → own executable path */
+#include <poll.h>     /* IRunLoop fd readiness + the bounded scan-helper wait */
+#include <signal.h>   /* SIGKILL for a scan helper that overran its deadline */
+#include <sys/stat.h> /* scan-cache validity: plug-in file mtime */
+#include <sys/wait.h> /* scan-helper exit status */
+#include <unistd.h>   /* read/close on the scan helper's stdout pipe */
 
 #include <cmath>
 #include <cstring>
@@ -593,12 +602,239 @@ static void ph_info_free(gpointer p)
 }
 
 /* ---- Scan ----
- * The main process only ENUMERATES .vst3 bundles; each is described by a
- * throwaway `JackDAW --scan-plugin VST3 <path>` helper process, so a module
- * with a crashing static initializer kills the helper, not the DAW. The
- * helper prints one tab-separated "VST3\t<class name>\t<category>" line per
- * audio-effect class. (No on-disk scan cache yet: the catalog is built
- * lazily on first use and bundle counts on Haiku are small.) */
+ * The main process only ENUMERATES .vst3 bundles and vstplugins files; each is
+ * described by a throwaway `JackDAW --scan-plugin <FMT> <path>` helper process,
+ * so a module with a crashing static initializer kills the helper, not the DAW.
+ * The helper prints one tab-separated "<FMT>\t<name>\t<category>" line per
+ * audio-effect class.
+ *
+ * Results persist in a Reaper-style on-disk cache keyed by path+mtime (port of
+ * the Linux tree's plugincache), so only new or changed plug-ins pay for a
+ * helper process — which for a Wine-bridged plug-in means starting Wine. LV2 is
+ * .ttl-only (lilv) and scans in-process; it uses the cache only for the
+ * native-binary check, which otherwise reads every DSP binary in full. */
+
+static void ph_esc(GString *s, const char *v)
+{
+    for (; v && *v; v++) {
+        if (*v == '\\')
+            g_string_append(s, "\\\\");
+        else if (*v == '\n')
+            g_string_append(s, "\\n");
+        else if (*v == '\t')
+            g_string_append(s, "\\t");
+        else
+            g_string_append_c(s, *v);
+    }
+}
+
+static char *ph_unesc(const char *v)
+{
+    GString *s = g_string_new("");
+    for (; v && *v; v++) {
+        if (*v == '\\' && v[1]) {
+            v++;
+            g_string_append_c(s, *v == 'n' ? '\n' : *v == 't' ? '\t' : *v);
+        } else {
+            g_string_append_c(s, *v);
+        }
+    }
+    return g_string_free(s, FALSE);
+}
+
+/* One cached path. `lines` holds the describe helper's raw stdout lines (or the
+ * single-flag payload used by the LV2 binary check); empty means "scanned, and
+ * it yielded nothing" — a negative result worth remembering so a broken plug-in
+ * is not re-probed on every launch. `seen` marks entries touched by the current
+ * scan; anything else is dropped on save, which is how uninstalled plug-ins
+ * leave the cache. */
+typedef struct {
+    gint64 mtime;
+    GPtrArray *lines;
+    gboolean seen;
+} PhCacheEnt;
+
+static GHashTable *ph_cache; /* path -> PhCacheEnt; valid only mid-scan */
+static void (*ph_progress_cb)(const char *plugin, void *user);
+static void *ph_progress_u;
+
+extern "C" void pluginhost_set_scan_progress(void (*cb)(const char *, void *), void *u)
+{
+    ph_progress_cb = cb;
+    ph_progress_u = u;
+}
+
+static void ph_cache_ent_free(gpointer p)
+{
+    PhCacheEnt *e = (PhCacheEnt *)p;
+    if (e->lines)
+        g_ptr_array_free(e->lines, TRUE);
+    g_free(e);
+}
+
+/* Both cache files live beside the settings file, in Haiku's per-user settings
+ * tree — the directory settings_init() already creates. */
+static char *ph_state_path(const char *leaf)
+{
+    char base[B_PATH_NAME_LENGTH];
+    if (find_directory(B_USER_SETTINGS_DIRECTORY, -1, true, base, sizeof(base)) != B_OK)
+        g_strlcpy(base, "/boot/home/config/settings", sizeof(base));
+    gchar *dir = g_build_filename(base, "JackDAW", NULL);
+    g_mkdir_with_parents(dir, 0700);
+    char *out = g_build_filename(dir, leaf, NULL);
+    g_free(dir);
+    return out;
+}
+
+/* Untrusted input (RULES: a corrupt cache must never crash or scribble). Every
+ * row that does not parse is skipped; a wrong mtime only forces a rescan. */
+static void ph_cache_load(void)
+{
+    ph_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, ph_cache_ent_free);
+
+    char *file = ph_state_path("plugincache");
+    char *data = NULL;
+    gsize len = 0;
+    if (g_file_get_contents(file, &data, &len, NULL)) {
+        gchar **rows = g_strsplit(data, "\n", -1);
+        for (int i = 0; rows[i]; i++) {
+            if (!rows[i][0])
+                continue;
+            gchar **f = g_strsplit(rows[i], "\t", 3); /* epath  mtime  eline */
+            if (f[0] && f[1] && f[2]) {
+                char *path = ph_unesc(f[0]);
+                PhCacheEnt *e = (PhCacheEnt *)g_hash_table_lookup(ph_cache, path);
+                if (!e) {
+                    e = g_new0(PhCacheEnt, 1);
+                    e->mtime = g_ascii_strtoll(f[1], NULL, 10);
+                    e->lines = g_ptr_array_new_with_free_func(g_free);
+                    g_hash_table_insert(ph_cache, path, e);
+                } else {
+                    g_free(path);
+                }
+                if (f[2][0]) /* an empty payload marks "scanned, nothing found" */
+                    g_ptr_array_add(e->lines, ph_unesc(f[2]));
+            }
+            g_strfreev(f);
+        }
+        g_strfreev(rows);
+        g_free(data);
+    }
+    g_free(file);
+}
+
+static void ph_cache_save(void)
+{
+    if (!ph_cache)
+        return;
+    GString *s = g_string_new("");
+    GHashTableIter it;
+    gpointer k, v;
+    g_hash_table_iter_init(&it, ph_cache);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        PhCacheEnt *e = (PhCacheEnt *)v;
+        if (!e->seen) /* not found this scan: the plug-in is gone */
+            continue;
+        GString *ep = g_string_new("");
+        ph_esc(ep, (const char *)k);
+        if (e->lines->len == 0) {
+            g_string_append_printf(s, "%s\t%lld\t\n", ep->str, (long long)e->mtime);
+        } else {
+            for (guint i = 0; i < e->lines->len; i++) {
+                GString *el = g_string_new("");
+                ph_esc(el, (const char *)g_ptr_array_index(e->lines, i));
+                g_string_append_printf(s, "%s\t%lld\t%s\n", ep->str, (long long)e->mtime, el->str);
+                g_string_free(el, TRUE);
+            }
+        }
+        g_string_free(ep, TRUE);
+    }
+    char *file = ph_state_path("plugincache");
+    g_file_set_contents(file, s->str, s->len, NULL);
+    g_free(file);
+    g_string_free(s, TRUE);
+}
+
+/* Cache validity stamp. VST3 plug-ins are BUNDLE directories, so take the
+ * newest mtime found inside (bounded recursion); VST2 plug-ins and LV2 binaries
+ * are plain files. 0 on failure — it never matches a stored stamp, so an
+ * unreadable path simply rescans. */
+static gint64 ph_path_mtime(const char *path, int depth)
+{
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    if (!S_ISDIR(st.st_mode) || depth >= 8)
+        return (gint64)st.st_mtime;
+
+    gint64 newest = (gint64)st.st_mtime;
+    DIR *d = opendir(path);
+    if (!d)
+        return newest;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        char *child = g_build_filename(path, ent->d_name, NULL);
+        gint64 m = ph_path_mtime(child, depth + 1);
+        if (m > newest)
+            newest = m;
+        g_free(child);
+    }
+    closedir(d);
+    return newest;
+}
+
+/* Return the entry for `path` if it is present and still current, marking it
+ * seen. NULL means the caller must produce fresh content (ph_cache_store). */
+static PhCacheEnt *ph_cache_hit(const char *path, gint64 mtime)
+{
+    if (!ph_cache)
+        return NULL;
+    PhCacheEnt *e = (PhCacheEnt *)g_hash_table_lookup(ph_cache, path);
+    if (!e || e->mtime != mtime)
+        return NULL;
+    e->seen = TRUE;
+    return e;
+}
+
+/* Install fresh content for `path`, replacing any stale entry. `lines` may be
+ * empty — a remembered negative result. */
+static void ph_cache_store(const char *path, gint64 mtime, const char *const *lines, guint n_lines)
+{
+    if (!ph_cache)
+        return;
+    PhCacheEnt *e = (PhCacheEnt *)g_hash_table_lookup(ph_cache, path);
+    if (!e) {
+        e = g_new0(PhCacheEnt, 1);
+        e->lines = g_ptr_array_new_with_free_func(g_free);
+        g_hash_table_insert(ph_cache, g_strdup(path), e);
+    } else {
+        g_ptr_array_set_size(e->lines, 0);
+    }
+    e->mtime = mtime;
+    for (guint i = 0; i < n_lines; i++)
+        g_ptr_array_add(e->lines, g_strdup(lines[i]));
+    e->seen = TRUE;
+}
+
+/* Native-binary verdict cache for the LV2 scan (see lph_binary_is_loadable):
+ * reading every DSP binary in full is that scan's dominant cost. Only usable
+ * while a scan is in progress; a miss returns FALSE and *out is untouched. */
+extern "C" gboolean ph_cache_flag_get(const char *path, gboolean *out)
+{
+    PhCacheEnt *e = ph_cache_hit(path, ph_path_mtime(path, 0));
+    if (!e)
+        return FALSE;
+    *out = (e->lines->len > 0 && ((const char *)g_ptr_array_index(e->lines, 0))[0] == '1');
+    return TRUE;
+}
+
+extern "C" void ph_cache_flag_set(const char *path, gboolean val)
+{
+    const char *line = val ? "1" : "0";
+    ph_cache_store(path, ph_path_mtime(path, 0), &line, 1);
+}
 
 extern "C" int pluginhost_scan_helper_main(int argc, char **argv)
 {
@@ -635,30 +871,122 @@ extern "C" int pluginhost_scan_helper_main(int argc, char **argv)
     return 0;
 }
 
-/* Describe one plug-in file/bundle via the throwaway helper process and append
- * its catalog entries. `fmt` is the format tag ("VST3" or "VST2"); the helper
- * prints "<fmt>\t<name>\t<category>" lines. VST3 keys carry the class name
- * (path\nclass — one bundle has many classes); VST2 keys are just the path. */
-extern "C" void ph_scan_via_helper(const char *fmt, const char *path, GList **catalog)
+/* A wedged helper must not stall the scan: the startup scan runs behind a
+ * progress window, where an unbounded wait looks like a hung launch. */
+#define PH_SCAN_TIMEOUT_MS 15000
+#define PH_SCAN_MAX_OUTPUT (1u << 20) /* untrusted child output, bounded */
+
+/* Run the describe helper for one plug-in. Returns its stdout, or an empty
+ * string when the helper ran but produced nothing usable (crashed, refused the
+ * file, or overran the deadline) — a negative result the caller caches so a
+ * broken plug-in is not re-probed on every launch. NULL means the helper could
+ * not be started at all, which is not cached. Caller frees.
+ *
+ * The child is read to EOF against a deadline rather than waited on: for a
+ * Wine-bridged plug-in the child spawns a Wine host that inherits its stdout,
+ * so EOF is the honest "everything it started is done" signal. */
+static gchar *ph_run_scan_helper(const char *fmt, const char *path)
 {
     std::string self = ph_self_path();
     if (self.empty())
-        return;
+        return NULL;
 
     gchar *argv[] = {(gchar *)self.c_str(), (gchar *)"--scan-plugin", (gchar *)fmt, (gchar *)path,
                      NULL};
-    gchar *out = NULL;
-    gint status = 0;
-    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL, &out, NULL, &status,
-                      NULL))
-        return;
-    if (!out)
-        return;
+    GPid pid = 0;
+    gint out_fd = -1;
+    GSpawnFlags flags = (GSpawnFlags)(G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDERR_TO_DEV_NULL);
+    if (!g_spawn_async_with_pipes(NULL, argv, NULL, flags, NULL, NULL, &pid, NULL, &out_fd, NULL,
+                                  NULL))
+        return NULL;
+
+    GString *out = g_string_new("");
+    gint64 deadline = g_get_monotonic_time() + (gint64)PH_SCAN_TIMEOUT_MS * 1000;
+    gboolean failed = FALSE;
+    for (;;) {
+        gint64 left_us = deadline - g_get_monotonic_time();
+        if (left_us <= 0) {
+            failed = TRUE;
+            break;
+        }
+        struct pollfd pfd = {out_fd, POLLIN, 0};
+        int pr = poll(&pfd, 1, (int)(left_us / 1000));
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            failed = TRUE;
+            break;
+        }
+        if (pr == 0) { /* deadline */
+            failed = TRUE;
+            break;
+        }
+        char buf[4096];
+        ssize_t n = read(out_fd, buf, sizeof buf);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            failed = TRUE;
+            break;
+        }
+        if (n == 0)
+            break; /* EOF: the helper and anything holding its stdout are done */
+        if (out->len + (gsize)n > PH_SCAN_MAX_OUTPUT) {
+            failed = TRUE;
+            break;
+        }
+        g_string_append_len(out, buf, n);
+    }
+    close(out_fd);
+
+    if (failed) {
+        kill((pid_t)pid, SIGKILL);
+        g_warning("pluginhost: scan of '%s' did not complete within %d s; skipping it", path,
+                  PH_SCAN_TIMEOUT_MS / 1000);
+    }
+    int status = 0;
+    waitpid((pid_t)pid, &status, 0);
+    g_spawn_close_pid(pid);
+
+    if (failed || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        g_string_free(out, TRUE);
+        return g_strdup(""); /* ran, nothing usable — remember that */
+    }
+    return g_string_free(out, FALSE);
+}
+
+/* Describe one plug-in file/bundle and append its catalog entries, reusing the
+ * on-disk cache when the path's mtime is unchanged. `fmt` is the format tag
+ * ("VST3" or "VST2"); the helper prints "<fmt>\t<name>\t<category>" lines, and
+ * those raw lines are what the cache stores. VST3 keys carry the class name
+ * (path\nclass — one bundle has many classes); VST2 keys are just the path. */
+extern "C" void ph_scan_via_helper(const char *fmt, const char *path, GList **catalog)
+{
+    gint64 mtime = ph_path_mtime(path, 0);
+    GPtrArray *owned = NULL; /* freshly scanned rows, when it was a cache miss */
+    PhCacheEnt *e = ph_cache_hit(path, mtime);
+    if (!e) {
+        if (ph_progress_cb)
+            ph_progress_cb(path, ph_progress_u);
+        gchar *out = ph_run_scan_helper(fmt, path);
+        if (!out)
+            return;
+        owned = g_ptr_array_new_with_free_func(g_free);
+        gchar **split = g_strsplit(out, "\n", -1);
+        for (int i = 0; split[i]; i++)
+            if (split[i][0])
+                g_ptr_array_add(owned, g_strdup(split[i]));
+        g_strfreev(split);
+        g_free(out);
+        /* No-op when no scan is in progress; the rows below are used either way. */
+        ph_cache_store(path, mtime, (const char *const *)owned->pdata, owned->len);
+    }
+
+    GPtrArray *lines = owned ? owned : e->lines;
     gboolean is_vst3 = (strcmp(fmt, "VST3") == 0);
     PluginFormat pf = is_vst3 ? PH_VST3 : PH_VST2;
-    gchar **lines = g_strsplit(out, "\n", -1);
-    for (int i = 0; lines[i]; i++) {
-        gchar **f = g_strsplit(lines[i], "\t", 3);
+    for (guint i = 0; i < lines->len; i++) {
+        gchar **f = g_strsplit((const char *)g_ptr_array_index(lines, i), "\t", 3);
         if (f[0] && strcmp(f[0], fmt) == 0 && f[1] && f[2]) {
             gchar *key = is_vst3 ? g_strdup_printf("%s\n%s", path, f[1]) : g_strdup(path);
             *catalog = g_list_prepend(*catalog, ph_info_new(pf, key, f[1], f[2]));
@@ -666,12 +994,28 @@ extern "C" void ph_scan_via_helper(const char *fmt, const char *path, GList **ca
         }
         g_strfreev(f);
     }
-    g_strfreev(lines);
-    g_free(out);
+    if (owned)
+        g_ptr_array_free(owned, TRUE);
+}
+
+/* Count the paths a scan will describe, so a progress bar can be determinate.
+ * Pure enumeration — no plug-in code is loaded. */
+extern "C" guint pluginhost_scan_candidate_count(void)
+{
+    guint n = 0;
+    for (auto &module_path : VST3::Hosting::Module::getModulePaths()) {
+        (void)module_path;
+        n++;
+    }
+    return n + ph_vst2_count_candidates();
 }
 
 static void ph_do_scan(void)
 {
+    g_list_free_full(ph_cat, ph_info_free);
+    ph_cat = NULL;
+    ph_cache_load();
+
     /* Module::getModulePaths() (module_haiku.cpp — the same enumeration the
      * validator's -list uses) walks the canonical Haiku VST3 location
      * (add-ons/media/VST3 from find_paths(), every install root) and returns the
@@ -685,6 +1029,11 @@ static void ph_do_scan(void)
     /* VST2 plug-ins from add-ons/media/vstplugins (native add-ons + vstbridge
      * stubs); each is described out-of-process, same crash isolation as VST3. */
     ph_vst2_scan(&ph_cat);
+
+    ph_cache_save();
+    g_hash_table_destroy(ph_cache);
+    ph_cache = NULL;
+
     ph_cat = g_list_reverse(ph_cat);
     ph_scanned = TRUE;
 }
@@ -698,9 +1047,59 @@ extern "C" const GList *pluginhost_catalog(void)
 
 extern "C" void pluginhost_rescan(void)
 {
-    g_list_free_full(ph_cat, ph_info_free);
-    ph_cat = NULL;
-    ph_scanned = FALSE;
+    ph_do_scan();
+}
+
+/* Persisted baseline of every plugin identity seen on the previous scan, used
+ * to tell which plug-ins are newly installed. Separate from plugincache because
+ * LV2 is scanned in-process and never populates that cache with catalog rows. */
+
+/* Stable identity for diffing across runs: "<format>:<escaped key>". */
+static char *ph_identity(const PluginInfo *pi)
+{
+    GString *s = g_string_new("");
+    g_string_append_printf(s, "%d:", (int)pi->format);
+    ph_esc(s, pi->key);
+    return g_string_free(s, FALSE);
+}
+
+extern "C" GList *pluginhost_scan_report_new(void)
+{
+    /* Load the previous identity set. On the very first run this stays empty,
+     * so every plug-in found is reported as new (seeding the baseline too). */
+    GHashTable *prev = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    char *file = ph_state_path("pluginindex");
+    char *data = NULL;
+    gsize len = 0;
+    if (g_file_get_contents(file, &data, &len, NULL)) {
+        gchar **rows = g_strsplit(data, "\n", -1);
+        for (int i = 0; rows[i]; i++)
+            if (rows[i][0])
+                g_hash_table_add(prev, g_strdup(rows[i]));
+        g_strfreev(rows);
+        g_free(data);
+    }
+
+    ph_do_scan();
+
+    /* Diff the fresh catalog against the baseline; collect new names and
+     * rebuild the index to persist. */
+    GList *new_names = NULL;
+    GString *idx = g_string_new("");
+    for (const GList *l = ph_cat; l; l = l->next) {
+        const PluginInfo *pi = (const PluginInfo *)l->data;
+        char *id = ph_identity(pi);
+        g_string_append(idx, id);
+        g_string_append_c(idx, '\n');
+        if (!g_hash_table_contains(prev, id))
+            new_names = g_list_prepend(new_names, g_strdup(pi->name));
+        g_free(id);
+    }
+    g_file_set_contents(file, idx->str, idx->len, NULL);
+    g_string_free(idx, TRUE);
+    g_free(file);
+    g_hash_table_destroy(prev);
+    return g_list_reverse(new_names);
 }
 
 /* ---- Init / shutdown ---- */

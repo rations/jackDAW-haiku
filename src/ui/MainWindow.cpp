@@ -34,6 +34,7 @@
 #include "MixerView.h"
 #include "MixerWindow.h"
 #include "RenderWindow.h"
+#include "ScanWindow.h"
 #include "TimelineView.h"
 #include "TrackAreaView.h"
 #include "TransportView.h"
@@ -967,6 +968,25 @@ void MainWindow::ShowTrackContext(int slot, BPoint screen_where)
         DeleteTrack(t);
 }
 
+void MainWindow::ShowTrackAreaContext(BPoint screen_where)
+{
+    // Mirrors the Linux track-container context menu, minus "Show Master
+    // Track" — this port has no master row, only master_volume/master_muted
+    // project fields and the mixer's master strip.
+    BPopUpMenu menu("track_area_context", false, false);
+    BMenuItem *add = new BMenuItem("Add Track", NULL);
+    BMenuItem *add_midi = new BMenuItem("Add MIDI Track", NULL);
+    menu.AddItem(add);
+    menu.AddItem(add_midi);
+    BMenuItem *chosen = menu.Go(screen_where, false, false);
+    // Post rather than calling AddTrack directly so both entry points (menu bar
+    // and popup) go through the same handler.
+    if (chosen == add)
+        PostMessage(MSG_TRACK_ADD);
+    else if (chosen == add_midi)
+        PostMessage(MSG_TRACK_ADD_MIDI);
+}
+
 void MainWindow::ShowRecordMenu(BPoint screen_where)
 {
     BPopUpMenu menu("record_mode", false, false);
@@ -1320,6 +1340,12 @@ void MainWindow::MessageReceived(BMessage *message)
             }
             break;
         }
+        case MSG_TRACK_AREA_CONTEXT: {
+            BPoint where;
+            if (message->FindPoint("screen_where", &where) == B_OK)
+                ShowTrackAreaContext(where);
+            break;
+        }
         case MSG_TRACK_MOVE: {
             int32 from = -1, to = -1;
             message->FindInt32("from", &from);
@@ -1461,9 +1487,17 @@ void MainWindow::MessageReceived(BMessage *message)
         }
 
         case MSG_OPT_PLUGINS: {
-            // Drop the catalog; the next FX-window "Add effect" menu rebuild
-            // rescans the VST3 add-on directories out-of-process.
+            // Rescan now, behind the same progress window the startup scan
+            // uses. It runs on its own looper, so it keeps repainting while
+            // this looper is busy scanning; we only ever post to it.
+            ScanWindow *scan = new ScanWindow(pluginhost_scan_candidate_count());
+            BMessenger scan_msgr(scan);
+            scan->Show();
+            pluginhost_set_scan_progress(&ScanWindow::ProgressHook, &scan_msgr);
             pluginhost_rescan();
+            pluginhost_set_scan_progress(NULL, NULL);
+            scan->PostMessage(B_QUIT_REQUESTED);
+
             guint n = g_list_length((GList *)pluginhost_catalog());
             char text[96];
             snprintf(text, sizeof(text), "Plugin rescan complete: %u effects found.", n);

@@ -556,6 +556,37 @@ void jackdaw_track_get_peaks(JackDawTrack *t, gfloat *out_L, gfloat *out_R)
 
 /* ---- FX chain ---- */
 
+/* Free the retired instance queue. Callers must already have established that
+ * the RT thread cannot reach them (see track_retire_is_safe / finalize). */
+static void track_free_retired_fx(JackDawTrack *t)
+{
+    for (guint i = 0; i < t->retire_fx->len; i++)
+        pluginhost_free(g_ptr_array_index(t->retire_fx, i));
+    g_ptr_array_set_size(t->retire_fx, 0);
+}
+
+/* TRUE once the RT thread has completed a cycle after the retire — it can no
+ * longer be inside the chain snapshot that referenced these instances. Two
+ * cycles for margin. With the engine stopped nothing reads the chain at all. */
+static gboolean track_retire_is_safe(JackDawTrack *t)
+{
+    if (!jackdaw_engine_is_processing())
+        return TRUE;
+    /* Unsigned wrap-around subtraction: correct across the counter's rollover. */
+    return (guint)(jackdaw_engine_get_cycle_count() - t->retire_cycle) >= 2u;
+}
+
+gboolean jackdaw_track_fx_collect(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), TRUE);
+    if (t->retire_fx->len == 0)
+        return TRUE;
+    if (!track_retire_is_safe(t))
+        return FALSE;
+    track_free_retired_fx(t);
+    return TRUE;
+}
+
 /* Reclaim chains/instances retired by the PREVIOUS edit (the RT thread has
  * had many cycles to move past them by now), then publish a fresh chain built
  * from fx_list and retire the old one. */
@@ -567,9 +598,7 @@ static void track_publish_chain(JackDawTrack *t)
         g_free(c);
     }
     g_ptr_array_set_size(t->retire_chains, 0);
-    for (guint i = 0; i < t->retire_fx->len; i++)
-        pluginhost_free(g_ptr_array_index(t->retire_fx, i));
-    g_ptr_array_set_size(t->retire_fx, 0);
+    track_free_retired_fx(t);
 
     JackDawFxChain *nc = g_new0(JackDawFxChain, 1);
     nc->n = (int)t->fx_list->len;
@@ -602,9 +631,12 @@ void jackdaw_track_fx_remove(JackDawTrack *t, guint index)
     gpointer inst = g_ptr_array_index(t->fx_list, index);
     g_ptr_array_remove_index(t->fx_list, index);
     track_publish_chain(t);
-    /* Defer the instance free until the next edit so the retired chain that
-     * still references it is no longer read by the RT thread. */
+    /* Defer the instance free until the RT thread has moved past the chain
+     * snapshot that still references it. The caller collects it shortly after
+     * (jackdaw_track_fx_collect) rather than waiting for the next edit —
+     * a Wine-bridged plug-in holds a Wine host process until it is freed. */
     g_ptr_array_add(t->retire_fx, inst);
+    t->retire_cycle = jackdaw_engine_get_cycle_count();
 }
 
 void jackdaw_track_fx_move(JackDawTrack *t, guint from, guint to)

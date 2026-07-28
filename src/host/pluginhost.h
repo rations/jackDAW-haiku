@@ -54,12 +54,31 @@ void pluginhost_shutdown(void);
  * scans (a crashing module kills only the helper). */
 int pluginhost_scan_helper_main(int argc, char **argv);
 
-/* Catalog (scans lazily on first call). GList of PluginInfo* (borrowed).
- * Plug-ins are found in the canonical Haiku add-ons/media/{VST3,LV2,vstplugins}
- * directories (find_paths, every install root); each is described
- * out-of-process via the scan helper. */
+/* Catalog (scans lazily on first call; normally already warm because the app
+ * scans at startup). GList of PluginInfo* (borrowed). Plug-ins are found in the
+ * canonical Haiku add-ons/media/{VST3,LV2,vstplugins} directories (find_paths,
+ * every install root); each binary-format plug-in is described out-of-process
+ * via the scan helper, and the result is cached on disk keyed by path+mtime, so
+ * only new or changed plug-ins pay for a helper process. pluginhost_rescan()
+ * performs a fresh scan (the cache still spares unchanged plug-ins). */
 const GList *pluginhost_catalog(void);
 void pluginhost_rescan(void);
+
+/* Rescan, then report plug-ins newly discovered since the previous call (the
+ * baseline persists next to the cache). Returns a newly-allocated GList of
+ * g_strdup'd display names; free with g_list_free_full(list, g_free). An empty
+ * list means nothing new. The first run has no baseline, so it reports
+ * everything found. */
+GList *pluginhost_scan_report_new(void);
+
+/* Optional progress callback, fired with each plug-in path as it is described
+ * (drives the scan-progress window). Set to NULL to detach. The callback runs
+ * on the scanning thread and must not block it — post, never lock. */
+void pluginhost_set_scan_progress(void (*cb)(const char *plugin, void *user), void *user);
+
+/* How many paths the next scan will consider, for a determinate progress bar.
+ * Pure enumeration: loads no plug-in code. */
+guint pluginhost_scan_candidate_count(void);
 
 /* Lifecycle. Instantiate and free from the SAME thread that will make all
  * other non-RT calls on the instance (its FX window's looper thread). */

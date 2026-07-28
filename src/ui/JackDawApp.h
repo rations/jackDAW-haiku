@@ -15,6 +15,9 @@ public:
     bool QuitRequested() override;
 
 private:
+    // Catalog scan behind a progress window, before the main window is shown.
+    void RunStartupScan();
+
     JackDawProject *m_project; // borrowed; main() owns the reference
     MainWindow *m_main_window;
 };

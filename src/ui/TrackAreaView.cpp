@@ -1304,13 +1304,6 @@ void TrackAreaView::Draw(BRect updateRect)
 void TrackAreaView::MouseDown(BPoint where)
 {
     JackDawProject *p = m_timeline->Project();
-    if (where.x < kTimelineHeaderWidth) {
-        // Empty strip column below the last track: clear the selection.
-        if (RowAtY(where.y) < 0)
-            jackdaw_project_clear_selection(p);
-        return;
-    }
-
     int32 buttons = 0, mods = 0, clicks = 1;
     BMessage *msg = Window() ? Window()->CurrentMessage() : NULL;
     if (msg) {
@@ -1318,6 +1311,23 @@ void TrackAreaView::MouseDown(BPoint where)
         msg->FindInt32("modifiers", &mods);
         msg->FindInt32("clicks", &clicks);
     }
+
+    if (where.x < kTimelineHeaderWidth) {
+        // Empty strip column below the last track. Right-click offers the track
+        // creation menu (the main window builds it, next to its other track
+        // actions); a plain click clears the selection.
+        if (RowAtY(where.y) < 0) {
+            if (buttons & B_SECONDARY_MOUSE_BUTTON) {
+                BMessage m(MSG_TRACK_AREA_CONTEXT);
+                m.AddPoint("screen_where", ConvertToScreen(where));
+                m_main.SendMessage(&m);
+            } else {
+                jackdaw_project_clear_selection(p);
+            }
+        }
+        return;
+    }
+
     bool ctrl = (mods & (B_COMMAND_KEY | B_CONTROL_KEY)) != 0;
     bool secondary = (buttons & B_SECONDARY_MOUSE_BUTTON) != 0;
 

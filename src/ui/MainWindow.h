@@ -64,6 +64,8 @@ private:
     void AddTrack(JackDawTrackKind kind);
     void DeleteTrack(JackDawTrack *track);
     void ShowTrackContext(int slot, BPoint screen_where);
+    // Right-click on the empty strip column: Add Track / Add MIDI Track.
+    void ShowTrackAreaContext(BPoint screen_where);
     // Import an audio file onto a fresh audio track (region placed at timeline 0).
     void LoadFileAsTrack(const char *path);
 

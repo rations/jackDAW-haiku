@@ -42,9 +42,13 @@ public:
     virtual ~FxWindow();
 
     virtual void MessageReceived(BMessage *message);
+    // Frees any instance retired by a Remove before the window goes away.
+    virtual bool QuitRequested();
 
 private:
     void BuildAddMenu();
+    // Schedule the one-shot collect of a just-retired plug-in instance.
+    void ArmFxCollect();
     // Tell the main window the chain gained/lost a plug-in so the track + mixer
     // strips can refresh their blue Fx state.
     void NotifyChainChanged();
@@ -99,6 +103,9 @@ private:
     BView *m_embedded_ui;            // borrowed; owned by the plugin UI
     PluginInstance *m_embedded_inst; // instance the embedded view belongs to
     BMessageRunner *m_ui_poll;       // ~30 Hz host→UI port_event feedback
+
+    // One-shot timer that frees the instance retired by the last Remove.
+    BMessageRunner *m_collect;
 
     // Instances the user toggled from their native editor to the generic
     // panel (compared by pointer only; entries erased when a plugin is
