@@ -26,9 +26,8 @@ typedef struct PluginInstance PluginInstance;
  * mix, and a parameter area that shows the plug-in's own native editor when
  * it has one (an LV2 HaikuUI BView, embedded like the Linux JackDAW embeds
  * suil editors) and otherwise a generic panel (one BSlider per parameter,
- * values shown with the plug-in's own display strings). Plug-ins implementing
- * the INamFileLoader host extension (NAMku) additionally get "Load model…"/
- * "Load IR…" buttons backed by a BFilePanel.
+ * values shown with the plug-in's own display strings). File-loading
+ * plug-ins (NAMku) load their files from their own editors.
  *
  * Threading: this window's looper thread is the ONLY mutator of its track's
  * FX chain and the only caller into each instance's non-RT plugin-host API
@@ -66,7 +65,6 @@ private:
     void DetachEmbeddedUi(bool destroy);
     void SyncControlsRow();
     void UpdateValueLabel(guint param);
-    void UpdateFileLabels();
     PluginInstance *Selected();
 
     JackDawTrack *m_track;
@@ -88,8 +86,6 @@ private:
 
     std::vector<BSlider *> m_sliders;
     std::vector<BStringView *> m_value_labels;
-    BStringView *m_model_label;
-    BStringView *m_ir_label;
 
     // Drum-rack rows (parallel, indexed by slot), plus MIDI-learn state.
     std::vector<BStringView *> m_drum_file;

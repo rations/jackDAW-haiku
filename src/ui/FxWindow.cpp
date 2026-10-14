@@ -120,10 +120,7 @@ enum {
     MSG_FX_BYPASS = 'fxby',
     MSG_FX_MIX = 'fxmx',
     MSG_FX_PARAM = 'fxpm', // int32 "param" (index into the instance's params)
-    MSG_FX_LOAD_MODEL = 'fxlm',
-    MSG_FX_LOAD_IR = 'fxli',
-    MSG_FX_FILE_REFS = 'fxrf', // BFilePanel result; int32 "which" from the template
-    MSG_FX_RAISE = 'fxrs',     // re-activate an already-open window
+    MSG_FX_RAISE = 'fxrs', // re-activate an already-open window
 
     // Drum rack (DRUMku). All carry int32 "slot" except Add and Poll.
     MSG_DRUM_LOAD = 'dkld',      // open a file panel for a slot
@@ -161,9 +158,8 @@ FxWindow::FxWindow(JackDawTrack *track, MainWindow *main)
     : BWindow(BRect(0, 0, 900, 460), "Effects", B_TITLED_WINDOW,
               B_AUTO_UPDATE_SIZE_LIMITS | B_CLOSE_ON_ESCAPE),
       m_track(track), m_main(main), m_file_panel(NULL), m_save_panel(NULL), m_preset_save(NULL),
-      m_preset_load(NULL), m_model_label(NULL), m_ir_label(NULL), m_learn_slot(-1),
-      m_learn_poll(NULL), m_embedded_ui(NULL), m_embedded_inst(NULL), m_ui_poll(NULL),
-      m_collect(NULL)
+      m_preset_load(NULL), m_learn_slot(-1), m_learn_poll(NULL), m_embedded_ui(NULL),
+      m_embedded_inst(NULL), m_ui_poll(NULL), m_collect(NULL)
 {
     g_object_ref(m_track);
 
@@ -378,20 +374,6 @@ static void fx_basename(const char *path, const char *prefix, char *out, size_t 
     snprintf(out, outlen, "%s%s", prefix, base);
 }
 
-void FxWindow::UpdateFileLabels()
-{
-    PluginInstance *inst = Selected();
-    if (!inst || !m_model_label || !m_ir_label)
-        return;
-    char path[1024], label[1100];
-    pluginhost_file_get(inst, PH_FILE_MODEL, path, sizeof(path));
-    fx_basename(path, "Model: ", label, sizeof(label));
-    m_model_label->SetText(label);
-    pluginhost_file_get(inst, PH_FILE_IR, path, sizeof(path));
-    fx_basename(path, "IR: ", label, sizeof(label));
-    m_ir_label->SetText(label);
-}
-
 // Fully tear the parameter panel down. Removing only the child VIEWS (as the
 // first version did) leaks the layout items the builder created — the nested
 // BGroupLayouts of each row and the trailing glue are BLayoutItems, not views,
@@ -441,8 +423,6 @@ void FxWindow::ClearParamPanel()
 
     m_sliders.clear();
     m_value_labels.clear();
-    m_model_label = NULL;
-    m_ir_label = NULL;
 
     // Drop any armed MIDI-learn state (the checkbox views are about to go away).
     // The plug-in's own learn flag is reset when a rack is (re)built.
@@ -543,32 +523,8 @@ void FxWindow::RebuildParamPanel()
         // clang-format on
     }
 
-    // File loading rows first (NAMku's model/IR — the slider-only equivalent
-    // of the plug-in GUI's two folder buttons).
-    if (pluginhost_has_file_loader(inst)) {
-        m_model_label = new BStringView("model", "Model: (none)");
-        m_ir_label = new BStringView("ir", "IR: (none)");
-        BButton *load_model =
-            new BButton("load-model", "Load model…", new BMessage(MSG_FX_LOAD_MODEL));
-        BButton *load_ir = new BButton("load-ir", "Load IR…", new BMessage(MSG_FX_LOAD_IR));
-        // clang-format off
-        builder
-            .AddGroup(B_HORIZONTAL, 6.0f)
-                .Add(load_model)
-                .Add(m_model_label)
-                .AddGlue()
-            .End()
-            .AddGroup(B_HORIZONTAL, 6.0f)
-                .Add(load_ir)
-                .Add(m_ir_label)
-                .AddGlue()
-            .End();
-        // clang-format on
-        UpdateFileLabels();
-    }
-
     guint n = pluginhost_param_count(inst);
-    if (n == 0 && !pluginhost_has_file_loader(inst))
+    if (n == 0)
         builder.Add(new BStringView("none", "This plugin exposes no editable parameters."));
 
     for (guint i = 0; i < n; i++) {
@@ -834,40 +790,6 @@ void FxWindow::MessageReceived(BMessage *message)
             float v = (float)m_sliders[param]->Value() / kSliderSteps;
             pluginhost_param_set(inst, (guint)param, v);
             UpdateValueLabel((guint)param);
-            break;
-        }
-
-        case MSG_FX_LOAD_MODEL:
-        case MSG_FX_LOAD_IR: {
-            if (!m_file_panel)
-                m_file_panel = new BFilePanel(B_OPEN_PANEL);
-            BMessage tmpl(MSG_FX_FILE_REFS);
-            tmpl.AddInt32("which", message->what == MSG_FX_LOAD_MODEL ? PH_FILE_MODEL : PH_FILE_IR);
-            m_file_panel->SetTarget(BMessenger(this));
-            m_file_panel->SetMessage(&tmpl);
-            m_file_panel->Window()->SetTitle(message->what == MSG_FX_LOAD_MODEL
-                                                 ? "Load NAM model (.nam)"
-                                                 : "Load impulse response (.wav)");
-            m_file_panel->Show();
-            break;
-        }
-
-        case MSG_FX_FILE_REFS: {
-            PluginInstance *inst = Selected();
-            entry_ref ref;
-            int32 which = PH_FILE_MODEL;
-            message->FindInt32("which", &which);
-            if (!inst || message->FindRef("refs", &ref) != B_OK)
-                break;
-            BPath path(&ref);
-            if (path.InitCheck() != B_OK)
-                break;
-            if (!pluginhost_file_set(inst, (int)which, path.Path()))
-                g_warning("FxWindow: plugin refused file '%s'", path.Path());
-            // Full rebuild rather than just the file labels: loading a model
-            // can retitle parameters (e.g. NAMku's "Slim (n/a)" capability
-            // reporting), and titles are only read at panel build time.
-            RebuildParamPanel();
             break;
         }
 
