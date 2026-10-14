@@ -944,6 +944,19 @@ typedef PhMidiEvent EngMidiEv;
 static EngMidiEv eng_block_ev[JACKDAW_MAX_TRACKS][ENG_MIDI_MAX_EV];
 static int eng_block_nev[JACKDAW_MAX_TRACKS];
 
+/* This cycle's control-input MIDI (the footswitch), for the effect plug-ins.
+ * The same messages drive JackDAW's MIDI options through eng_control_rb, so one
+ * press can mute a track and switch an amp plug-in's channel at once: a
+ * plug-in with MIDI features of its own (MIDI learn, a footswitch) hears the
+ * control input as a hardware amp would hear the pedal. Channel messages only.
+ * Ownership: written by the JACK thread before it wakes the workers, then only
+ * read by the workers (track chains) until the next cycle; the semaphore
+ * post/wait that dispatches them orders the writes before their reads, as for
+ * the g_rt_* slots. */
+#define ENG_FX_MAX_EV 256
+static EngMidiEv eng_fx_ev[ENG_FX_MAX_EV];
+static int eng_fx_nev;
+
 /* Preview-note injection (main thread -> RT). The main thread queues short
  * messages tagged with a track slot; the RT thread drains the ring once per
  * cycle into per-slot scratch, emitted at block offset 0. Lock-free SPSC. */
@@ -1282,7 +1295,8 @@ static void engine_process_track(int i)
 
     /* Per-track FX chain, in place on bL/bR (pre-fader). On an instrument track
      * the FIRST plugin is the instrument: it receives the block's MIDI and
-     * renders audio into the (silent) track buffers; the rest process it. */
+     * renders audio into the (silent) track buffers; the rest process it, and
+     * hear the control input rather than the track's notes (see eng_fx_ev). */
     JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
     if (chain) {
         int fi = 0;
@@ -1292,7 +1306,8 @@ static void engine_process_track(int i)
             fi = 1;
         }
         for (; fi < chain->n; fi++)
-            pluginhost_process((PluginInstance *)chain->fx[fi], bL, bR, (int)nframes);
+            pluginhost_process_fx_midi((PluginInstance *)chain->fx[fi], eng_fx_ev, eng_fx_nev, bL,
+                                       bR, (int)nframes);
         /* Fold this cycle's per-plugin timings into the diag table. Reading
          * them here (on the RT thread that just produced them) keeps the
          * instance pointers valid without extra synchronisation. */
@@ -1511,6 +1526,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     /* Copy the dedicated control-surface input into the RT->main ring; the main
      * thread interprets the mappings. RT side does only a bounded lock-free write
      * (drops on overflow) — no malloc/lock/log here. */
+    eng_fx_nev = 0;
     if (engine.control_in && eng_control_rb) {
         void *cbuf = jack_port_get_buffer(engine.control_in, nframes);
         uint32_t cn = jack_midi_get_event_count(cbuf);
@@ -1525,6 +1541,18 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             cm.data[2] = ev.size > 2 ? ev.buffer[2] : 0;
             if (jack_ringbuffer_write_space(eng_control_rb) >= sizeof cm)
                 jack_ringbuffer_write(eng_control_rb, (const char *)&cm, sizeof cm);
+            /* And to the effect plug-ins: channel messages (0x80-0xEF) whose
+             * length matches their status; SysEx and clock are not theirs. */
+            guint8 st = ev.buffer[0];
+            size_t want = (st >= 0xC0 && st <= 0xDF) ? 2 : 3;
+            if (st >= 0x80 && st <= 0xEF && ev.size == want && eng_fx_nev < ENG_FX_MAX_EV) {
+                EngMidiEv *fe = &eng_fx_ev[eng_fx_nev++];
+                fe->time = ev.time < nframes ? ev.time : nframes - 1;
+                fe->size = (guint8)want;
+                fe->data[0] = cm.data[0];
+                fe->data[1] = cm.data[1];
+                fe->data[2] = cm.data[2];
+            }
         }
     }
 

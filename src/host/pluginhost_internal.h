@@ -122,6 +122,9 @@ void ph_lv2_scan(GList **catalog);
 PluginInstance *ph_lv2_instantiate(const PluginInfo *info);
 void ph_lv2_free(PluginInstance *inst);
 void ph_lv2_process(PluginInstance *inst, float *L, float *R, int nframes);
+/* ph_lv2_process plus MIDI on the plug-in's atom input (pluginhost_process_fx_midi). */
+void ph_lv2_process_fx_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev, float *L,
+                            float *R, int nframes);
 void ph_lv2_reset(PluginInstance *inst);
 guint ph_lv2_param_count(PluginInstance *inst);
 void ph_lv2_param_name(PluginInstance *inst, guint i, char *buf, int buflen);
@@ -155,6 +158,9 @@ void ph_vst2_describe(const char *path);
 PluginInstance *ph_vst2_instantiate(const PluginInfo *info);
 void ph_vst2_free(PluginInstance *inst);
 void ph_vst2_process(PluginInstance *inst, float *L, float *R, int nframes);
+/* ph_vst2_process plus effProcessEvents first (pluginhost_process_fx_midi). */
+void ph_vst2_process_fx_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev, float *L,
+                             float *R, int nframes);
 void ph_vst2_process_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev, float *L, float *R,
                           int nframes);
 void ph_vst2_reset(PluginInstance *inst);

@@ -35,7 +35,7 @@ typedef struct {
 
 typedef struct PluginInstance PluginInstance;
 
-/* One MIDI event for delivery to an instrument plugin. `time` is the sample
+/* One MIDI event for delivery to a plugin. `time` is the sample
  * offset within the current process block; size is 1..3 bytes. */
 typedef struct {
     guint32 time;
@@ -94,6 +94,16 @@ void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes);
  * silence). Same safety net as pluginhost_process. */
 void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev, float *L,
                              float *R, int nframes);
+
+/* RT processing for an EFFECT that also hears MIDI: the control input, so a
+ * footswitch reaches a plug-in's own MIDI features (an amp's channel switching
+ * and MIDI learn) as well as JackDAW's MIDI options. In place, like
+ * pluginhost_process (wet/dry mix included); with no events it IS
+ * pluginhost_process. VST3 gets notes as events and CC / pitch bend / channel
+ * pressure / Program Change as parameter changes; VST2 gets effProcessEvents;
+ * LV2 gets MIDI on its atom input. */
+void pluginhost_process_fx_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev, float *L,
+                                float *R, int nframes);
 
 /* TRUE if this plugin is an instrument (synth) rather than an audio effect. */
 gboolean pluginhost_is_instrument(PluginInstance *inst);

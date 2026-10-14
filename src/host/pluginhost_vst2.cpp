@@ -341,7 +341,36 @@ static void vst2_run(Vst2Backend *b, float *inL, float *inR, float *L, float *R,
     }
 }
 
+/* Hand this block's MIDI to the plug-in (effProcessEvents, before process). */
+static void vst2_send_events(Vst2Backend *b, const PhMidiEvent *ev, int n_ev)
+{
+    if (n_ev > 0 && b->vst_events) {
+        if (n_ev > VST2_MAX_EVENTS)
+            n_ev = VST2_MAX_EVENTS;
+        for (int i = 0; i < n_ev; i++) {
+            VstMidiEvent *me = &b->midi_pool[i];
+            memset(me, 0, sizeof *me);
+            me->type = kVstMidiType;
+            me->byteSize = sizeof(VstMidiEvent);
+            me->deltaFrames = (int32_t)ev[i].time;
+            for (int k = 0; k < 3 && k < ev[i].size; k++)
+                me->midiData[k] = (char)ev[i].data[k];
+            b->vst_events->events[i] = (VstEvent *)me;
+        }
+        b->vst_events->numEvents = n_ev;
+        b->eff->dispatcher(b->eff, effProcessEvents, 0, 0, b->vst_events, 0.0f);
+    }
+}
+
 extern "C" void ph_vst2_process(PluginInstance *inst, float *L, float *R, int nframes)
+{
+    ph_vst2_process_fx_midi(inst, NULL, 0, L, R, nframes);
+}
+
+/* An effect that also hears the control input (pluginhost_process_fx_midi):
+ * MIDI, then the usual in-place audio. */
+extern "C" void ph_vst2_process_fx_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev,
+                                        float *L, float *R, int nframes)
 {
     if (!inst || !inst->vst2)
         return;
@@ -361,6 +390,7 @@ extern "C" void ph_vst2_process(PluginInstance *inst, float *L, float *R, int nf
     rt_set_denormal_mode();
     gint64 t0 = ph_diag_enabled_i() ? ph_now_us_i() : 0;
 
+    vst2_send_events(b, ev, n_ev);
     vst2_run(b, L, R, L, R, nframes); /* effect: in-place audio */
 
     if (t0) {
@@ -395,22 +425,7 @@ extern "C" void ph_vst2_process_midi(PluginInstance *inst, const PhMidiEvent *ev
     rt_set_denormal_mode();
     gint64 t0 = ph_diag_enabled_i() ? ph_now_us_i() : 0;
 
-    if (n_ev > 0 && b->vst_events) {
-        if (n_ev > VST2_MAX_EVENTS)
-            n_ev = VST2_MAX_EVENTS;
-        for (int i = 0; i < n_ev; i++) {
-            VstMidiEvent *me = &b->midi_pool[i];
-            memset(me, 0, sizeof *me);
-            me->type = kVstMidiType;
-            me->byteSize = sizeof(VstMidiEvent);
-            me->deltaFrames = (int32_t)ev[i].time;
-            for (int k = 0; k < 3 && k < ev[i].size; k++)
-                me->midiData[k] = (char)ev[i].data[k];
-            b->vst_events->events[i] = (VstEvent *)me;
-        }
-        b->vst_events->numEvents = n_ev;
-        b->eff->dispatcher(b->eff, effProcessEvents, 0, 0, b->vst_events, 0.0f);
-    }
+    vst2_send_events(b, ev, n_ev);
 
     /* Instruments take no audio input — feed silence; effects that also take
      * MIDI get the incoming signal. */

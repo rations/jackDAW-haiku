@@ -39,6 +39,7 @@
 #include <lv2/buf-size/buf-size.h>
 #include <lv2/core/lv2.h>
 #include <lv2/log/log.h>
+#include <lv2/midi/midi.h>
 #include <lv2/options/options.h>
 #include <lv2/parameters/parameters.h>
 #include <lv2/resize-port/resize-port.h>
@@ -441,7 +442,7 @@ struct Lv2Backend {
 
     LphAtomPort *atoms;
     uint32_t n_atoms;
-    LV2_URID urid_seq, urid_chunk, urid_float;
+    LV2_URID urid_seq, urid_chunk, urid_float, urid_midi;
 
     float *outA, *outB;          /* plugin output scratch (max_block) */
     float *dummy_in, *dummy_out; /* surplus audio / CV ports */
@@ -836,6 +837,7 @@ extern "C" PluginInstance *ph_lv2_instantiate(const PluginInfo *info)
     b->urid_seq = lph_urid_map_cb(NULL, LV2_ATOM__Sequence);
     b->urid_chunk = lph_urid_map_cb(NULL, LV2_ATOM__Chunk);
     b->urid_float = lph_urid_map_cb(NULL, LV2_ATOM__Float);
+    b->urid_midi = lph_urid_map_cb(NULL, LV2_MIDI__MidiEvent);
     b->urid_ev_transfer = lph_urid_map_cb(NULL, LV2_ATOM__eventTransfer);
     lv2_atom_forge_init(&b->forge, &lph_urid_map);
     if (b->n_atoms > 0) {
@@ -1118,13 +1120,14 @@ static uint32_t lph_stage_ui_atoms(Lv2Backend *b)
     return used;
 }
 
-/* Fill instance k's atom control port with what the editor sent this cycle,
+/* Fill instance k's atom control port with what the editor sent this cycle
+ * and this block's MIDI (the control input, see pluginhost_process_fx_midi),
  * replacing the empty sequence lph_reset_atoms wrote. The forge refuses to
  * write past the buffer, so an oversized message is dropped rather than
  * corrupting the heap. RT-safe. */
-static void lph_forge_input(Lv2Backend *b, int k, uint32_t staged)
+static void lph_forge_input(Lv2Backend *b, int k, uint32_t staged, const PhMidiEvent *ev, int n_ev)
 {
-    if (b->atom_in < 0 || staged == 0)
+    if (b->atom_in < 0 || (staged == 0 && n_ev == 0))
         return;
     LphAtomPort *ap = &b->atoms[b->atom_in];
     lv2_atom_forge_set_buffer(&b->forge, (uint8_t *)ap->buf[k],
@@ -1142,6 +1145,11 @@ static void lph_forge_input(Lv2Backend *b, int k, uint32_t staged)
             lv2_atom_forge_write(&b->forge, (char *)b->atom_scratch + off, rec.size);
         }
         off += rec.size;
+    }
+    for (int i = 0; i < n_ev; i++) {
+        lv2_atom_forge_frame_time(&b->forge, ev[i].time);
+        lv2_atom_forge_atom(&b->forge, ev[i].size, b->urid_midi);
+        lv2_atom_forge_write(&b->forge, ev[i].data, ev[i].size);
     }
     lv2_atom_forge_pop(&b->forge, &frame);
 }
@@ -1171,8 +1179,9 @@ static void lph_collect_atom_out(Lv2Backend *b)
     }
 }
 
-/* Run the plugin in place on L/R. RT context: no alloc, no locks, no log. */
-static void lph_run(Lv2Backend *b, float *L, float *R, uint32_t n)
+/* Run the plugin in place on L/R, with ev/n_ev on its atom input (or none).
+ * RT context: no alloc, no locks, no log. */
+static void lph_run(Lv2Backend *b, const PhMidiEvent *ev, int n_ev, float *L, float *R, uint32_t n)
 {
     const uint32_t staged = lph_stage_ui_atoms(b);
 
@@ -1183,8 +1192,8 @@ static void lph_run(Lv2Backend *b, float *L, float *R, uint32_t n)
         lilv_instance_connect_port(b->inst[1], b->aout[0], b->outB);
         lph_reset_atoms(b, 0);
         lph_reset_atoms(b, 1);
-        lph_forge_input(b, 0, staged);
-        lph_forge_input(b, 1, staged);
+        lph_forge_input(b, 0, staged, ev, n_ev);
+        lph_forge_input(b, 1, staged, ev, n_ev);
         lilv_instance_run(b->inst[0], n);
         lilv_instance_run(b->inst[1], n);
         lph_collect_atom_out(b);
@@ -1210,7 +1219,7 @@ static void lph_run(Lv2Backend *b, float *L, float *R, uint32_t n)
         lilv_instance_connect_port(b->inst[0], b->aout[i], b->dummy_out);
 
     lph_reset_atoms(b, 0);
-    lph_forge_input(b, 0, staged);
+    lph_forge_input(b, 0, staged, ev, n_ev);
     lilv_instance_run(b->inst[0], n);
     lph_collect_atom_out(b);
     lph_worker_apply_responses(&b->workers[0]);
@@ -1219,6 +1228,12 @@ static void lph_run(Lv2Backend *b, float *L, float *R, uint32_t n)
 }
 
 extern "C" void ph_lv2_process(PluginInstance *inst, float *L, float *R, int nframes)
+{
+    ph_lv2_process_fx_midi(inst, NULL, 0, L, R, nframes);
+}
+
+extern "C" void ph_lv2_process_fx_midi(PluginInstance *inst, const PhMidiEvent *ev, int n_ev,
+                                       float *L, float *R, int nframes)
 {
     if (!inst || !inst->lv2 || nframes <= 0)
         return;
@@ -1241,7 +1256,7 @@ extern "C" void ph_lv2_process(PluginInstance *inst, float *L, float *R, int nfr
     gint64 t0 = ph_diag_enabled_i() ? ph_now_us_i() : 0;
 
     lph_apply_ctl_writes(b);
-    lph_run(b, L, R, (uint32_t)nframes);
+    lph_run(b, ev, n_ev, L, R, (uint32_t)nframes);
 
     if (t0) {
         gint64 d = ph_now_us_i() - t0;

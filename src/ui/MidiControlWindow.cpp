@@ -85,6 +85,9 @@ MidiControlWindow::MidiControlWindow(BMessenger target)
 
     BStringView *hint = new BStringView(
         "hint", "Connect a footswitch / controller to jackdaw:control_in, then Learn a row.");
+    // The effect plug-ins hear the same device (pluginhost_process_fx_midi).
+    BStringView *hint2 =
+        new BStringView("hint2", "Effect plug-ins with MIDI features of their own hear it too.");
 
     BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
         .SetInsets(B_USE_WINDOW_INSETS)
@@ -94,7 +97,8 @@ MidiControlWindow::MidiControlWindow(BMessenger target)
         .Add(add)
         .End()
         .Add(scroll)
-        .Add(hint);
+        .Add(hint)
+        .Add(hint2);
 
     RebuildRows();
 }
