@@ -94,10 +94,12 @@ typedef struct {
 
     /* Loop region (frames). Looping is active only while loop_enabled is set and
      * loop_end > loop_start; the playhead wraps loop_end -> loop_start once it
-     * has entered the region. Written on the window thread, read by RT. */
+     * has entered the region. Written on window threads, read by RT. start/end
+     * are a pair: other threads read them through eng_loop_read(). */
     volatile gint loop_enabled;
     volatile off_t loop_start;
     volatile off_t loop_end;
+    volatile gint loop_seq; /* odd while set_loop_range is mid-update */
 
     /* Record mode (RECORD_MODE_NORMAL / RECORD_MODE_PUNCH). Punch capture over
      * the loop-tab region is wired in the recording phase; stored here now so
@@ -324,11 +326,63 @@ static void feeder_emit_silence(JackDawTrack *t, size_t n)
     feeder_write(t, n);
 }
 
+/* Loop range read off the writer's thread. start and end are two stores, so a
+ * reader could pair a new start with an old end and wrap to the wrong place (a
+ * seqlock around the pair closes that). The reader never waits for the writer:
+ * an RT thread spinning on a preempted window thread could spin for a whole
+ * scheduler slice. After a few tries it gives up and returns TRUE, and the
+ * caller keeps the pair it read last time, so a new range lands at most a
+ * cycle late but is never seen torn. */
+typedef struct {
+    off_t start, end;
+} EngLoopRange;
+
+static gboolean eng_loop_read(EngLoopRange *out)
+{
+    for (int tries = 0; tries < 4; tries++) {
+        gint s0 = g_atomic_int_get(&engine.loop_seq);
+        if (s0 & 1)
+            continue;
+        off_t a = __atomic_load_n(&engine.loop_start, __ATOMIC_RELAXED);
+        off_t b = __atomic_load_n(&engine.loop_end, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE); /* pair loads before re-check */
+        if (g_atomic_int_get(&engine.loop_seq) == s0) {
+            out->start = a;
+            out->end = b;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* Block until every RT cycle that could have seen the state from before this
+ * call has finished, so a port hidden from the callback (count lowered, slot
+ * cleared, or pointer cleared) can be unregistered. Hiding it is not enough on
+ * its own: a cycle already in flight loaded the old value and may still be
+ * about to jack_port_get_buffer() the port. engine_cycles is bumped at the
+ * START of each callback, so two increments prove the in-flight cycle is over.
+ *
+ * Bounded: if no cycle starts for ENG_RT_WAIT_US the callback is not being run
+ * (client zombified or server stalled), so nothing is in flight and returning
+ * is safe. Window threads only; costs at most about two periods. */
+#define ENG_RT_WAIT_US (2 * G_USEC_PER_SEC)
+static void eng_wait_rt_past(void)
+{
+    if (!engine.active || !engine.client)
+        return;
+    guint c0 = (guint)g_atomic_int_get(&engine_cycles);
+    gint64 deadline = g_get_monotonic_time() + ENG_RT_WAIT_US;
+    while ((guint)((guint)g_atomic_int_get(&engine_cycles) - c0) < 2u &&
+           g_get_monotonic_time() < deadline)
+        g_usleep(500);
+}
+
 static void *feeder_thread_func(void *arg)
 {
     (void)arg;
     guint i;
     struct timespec ts = {.tv_sec = 0, .tv_nsec = 2000000}; /* 2 ms sleep */
+    EngLoopRange feed_loop = {0, 0};
 
     while (!feeder_stop_flag) {
         nanosleep(&ts, NULL);
@@ -337,6 +391,8 @@ static void *feeder_thread_func(void *arg)
             continue;
         if (!engine.client)
             continue;
+
+        eng_loop_read(&feed_loop); /* one pair for the whole pass */
 
         int jack_sr = (int)jack_get_sample_rate(engine.client);
 
@@ -384,8 +440,8 @@ static void *feeder_thread_func(void *arg)
                 /* --- Loop wrap: keep the feeder's stream inside the loop region
                  * so the ringbuffer never buffers audio past loop_end. --- */
                 if (g_atomic_int_get(&engine.loop_enabled)) {
-                    off_t l_start = engine.loop_start;
-                    off_t l_end = engine.loop_end;
+                    off_t l_start = feed_loop.start;
+                    off_t l_end = feed_loop.end;
                     if (l_end > l_start) {
                         if (pf == l_end) {
                             pf = l_start;
@@ -1389,9 +1445,11 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * looping. The remainder past loop_end is carried over so the loop period
      * equals the region length. Checked at block granularity, so the loop point
      * quantizes to the JACK period (acceptable for now). */
+    static EngLoopRange rt_loop; /* JACK thread only; kept if a read fails */
+    eng_loop_read(&rt_loop);
     if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.loop_enabled)) {
-        off_t l_start = engine.loop_start;
-        off_t l_end = engine.loop_end;
+        off_t l_start = rt_loop.start;
+        off_t l_end = rt_loop.end;
         off_t bstart = engine.play_pos - (off_t)nframes;
         if (l_end > l_start && bstart >= l_start && bstart < l_end && engine.play_pos >= l_end)
             engine.play_pos = l_start + (engine.play_pos - l_end);
@@ -1404,8 +1462,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * pass acts on it. The capture slots were pre-opened in start_playback, so no
      * file I/O happens here. */
     if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.punch_armed)) {
-        off_t ls = engine.loop_start;
-        off_t le = engine.loop_end;
+        off_t ls = rt_loop.start;
+        off_t le = rt_loop.end;
         off_t bstart = engine.play_pos - (off_t)nframes;
         if (le > ls) {
             if (!(flags & ENGINE_RECORDING)) {
@@ -1507,9 +1565,10 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             engine.audio_in[(guint)t->audio_in_idx]) {
             g_slot_live_L[i] =
                 (float *)jack_port_get_buffer(engine.audio_in[(guint)t->audio_in_idx], nframes);
-            if (t->audio_src_port_r && engine.audio_in_r[(guint)t->audio_in_idx])
-                g_slot_live_R[i] = (float *)jack_port_get_buffer(
-                    engine.audio_in_r[(guint)t->audio_in_idx], nframes);
+            /* Loaded once: a window thread clears it before unregistering. */
+            jack_port_t *pr = g_atomic_pointer_get(&engine.audio_in_r[(guint)t->audio_in_idx]);
+            if (t->audio_src_port_r && pr)
+                g_slot_live_R[i] = (float *)jack_port_get_buffer(pr, nframes);
         }
         if (instr && t->midi_in_idx >= 0 && t->midi_in_idx < JACKDAW_MAX_TRACKS &&
             engine.midi_in[t->midi_in_idx])
@@ -2282,6 +2341,10 @@ void jackdaw_engine_remove_track(JackDawTrack *track)
         return;
 
     engine.slots[i] = NULL; /* RT callback stops using this slot */
+    /* ...from the next cycle on. One already running loaded the slot and may
+     * still be reading this track's ports, so wait it out before any of them
+     * is unregistered below. */
+    eng_wait_rt_past();
 
     /* Tear down any jackdaw-made input connections and the lazily-registered
      * right capture port before releasing the slot. */
@@ -2295,8 +2358,12 @@ void jackdaw_engine_remove_track(JackDawTrack *track)
             jack_disconnect(engine.client, track->audio_src_port_r,
                             jack_port_name(engine.audio_in_r[ai]));
         if (engine.audio_in_r[ai]) {
-            jack_port_unregister(engine.client, engine.audio_in_r[ai]);
-            engine.audio_in_r[ai] = NULL;
+            /* The audio input is shared by index: another track's cycle may be
+             * reading it, so hide it and wait before unregistering. */
+            jack_port_t *pr = engine.audio_in_r[ai];
+            g_atomic_pointer_set(&engine.audio_in_r[ai], NULL);
+            eng_wait_rt_past();
+            jack_port_unregister(engine.client, pr);
         }
     }
     /* Tear down the instrument track's MIDI capture/playback ports + connection. */
@@ -2398,10 +2465,11 @@ gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo)
         if (!engine.audio_in_r[(guint)ai]) {
             char name[64];
             g_snprintf(name, sizeof(name), "in_%uR", (guint)ai + 1);
-            engine.audio_in_r[(guint)ai] = jack_port_register(
-                engine.client, name, JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
-            if (!engine.audio_in_r[(guint)ai])
+            jack_port_t *pr = jack_port_register(engine.client, name, JACK_DEFAULT_AUDIO_TYPE,
+                                                 JackPortIsInput, 0);
+            if (!pr)
                 return TRUE;
+            g_atomic_pointer_set(&engine.audio_in_r[(guint)ai], pr);
         }
     } else {
         /* Clear the right source (so RT stops reading it), then drop the port. */
@@ -2412,8 +2480,10 @@ gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo)
             g_clear_pointer(&t->audio_src_port_r, g_free);
         }
         if (engine.audio_in_r[(guint)ai]) {
-            jack_port_unregister(engine.client, engine.audio_in_r[(guint)ai]);
-            engine.audio_in_r[(guint)ai] = NULL;
+            jack_port_t *pr = engine.audio_in_r[(guint)ai];
+            g_atomic_pointer_set(&engine.audio_in_r[(guint)ai], NULL);
+            eng_wait_rt_past();
+            jack_port_unregister(engine.client, pr);
         }
     }
     return FALSE;
@@ -2551,6 +2621,7 @@ gboolean jackdaw_engine_set_audio_in_count(guint n)
         g_atomic_int_set((gint *)&engine.audio_in_count, (gint)n);
     } else {
         g_atomic_int_set((gint *)&engine.audio_in_count, (gint)n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.audio_in[i]) {
                 jack_port_unregister(engine.client, engine.audio_in[i]);
@@ -2594,6 +2665,7 @@ gboolean jackdaw_engine_set_audio_out_count(guint n)
         g_atomic_int_set((gint *)&engine.audio_out_count, (gint)n);
     } else {
         g_atomic_int_set((gint *)&engine.audio_out_count, (gint)n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.audio_out[i]) {
                 jack_port_unregister(engine.client, engine.audio_out[i]);
@@ -2739,10 +2811,10 @@ void jackdaw_engine_start_playback(void)
      * The RT path engages recording as the playhead crosses loop_start and stops
      * it at loop_end. Independent of the loop button — only the tab positions are
      * used, and playback never wraps. */
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
     if (g_atomic_int_get(&engine.record_mode) == RECORD_MODE_PUNCH &&
-        !g_atomic_int_get(&engine.punch_armed) && engine.loop_end > engine.loop_start &&
-        engine.play_pos < engine.loop_end) {
-        off_t ls = engine.loop_start, le = engine.loop_end;
+        !g_atomic_int_get(&engine.punch_armed) && le > ls && engine.play_pos < le) {
         gboolean any = FALSE;
         for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
             JackDawTrack *t = engine.slots[i];
@@ -3126,17 +3198,27 @@ void jackdaw_engine_set_loop_range(off_t start, off_t end)
         start = 0;
     if (end < 0)
         end = 0;
-    /* Publish start first, then end, so the RT path never sees end < start. */
-    engine.loop_start = start;
-    engine.loop_end = end;
+    /* Seqlock write (see eng_loop_read): odd, the pair, even. The release
+     * fence keeps the pair stores from overtaking the odd count; the final
+     * increment is a full barrier, so the pair is visible before the even. */
+    g_atomic_int_inc(&engine.loop_seq);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&engine.loop_start, start, __ATOMIC_RELAXED);
+    __atomic_store_n(&engine.loop_end, end, __ATOMIC_RELAXED);
+    g_atomic_int_inc(&engine.loop_seq);
 }
 
 void jackdaw_engine_get_loop_range(off_t *start, off_t *end)
 {
+    /* Called from window threads and the offline render worker, never from
+     * RT, so it may wait out a writer mid-update. */
+    EngLoopRange r;
+    while (eng_loop_read(&r))
+        g_thread_yield();
     if (start)
-        *start = engine.loop_start;
+        *start = r.start;
     if (end)
-        *end = engine.loop_end;
+        *end = r.end;
 }
 
 void jackdaw_engine_set_loop_enabled(gboolean on)
@@ -3151,7 +3233,9 @@ gboolean jackdaw_engine_get_loop_enabled(void)
 
 gboolean jackdaw_engine_has_loop_region(void)
 {
-    return engine.loop_end > engine.loop_start;
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    return le > ls;
 }
 
 void jackdaw_engine_set_record_mode(int mode)
