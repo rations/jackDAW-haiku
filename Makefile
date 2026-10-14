@@ -54,12 +54,20 @@ HOST_SOURCES = src/host/pluginhost.cpp src/host/pluginhost_lv2.cpp src/host/plug
 SDK_OBJECTS = src/host/sdk_module_haiku.o src/host/sdk_plugprovider.o \
               src/host/sdk_memorystream.o
 
+# VERSION (repo root) is the only place the version lives: the link stamps it
+# into the app's version resource (Tracker's Get Info), and make-hpkg.sh names
+# the package and writes its PackageInfo from it. A bump re-stamps the app.
+VERSION       := $(shell cat VERSION)
+VERSION_PARTS := $(subst ., ,$(VERSION))
+
 OBJECTS = $(C_SOURCES:.c=.o) $(CXX_SOURCES:.cpp=.o) $(HOST_SOURCES:.cpp=.o) $(SDK_OBJECTS)
 DEPS    = $(OBJECTS:.o=.d)
 TARGET  = JackDAW
 
-$(TARGET): $(OBJECTS)
+$(TARGET): $(OBJECTS) VERSION
 	$(CXX) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
+	setversion $(TARGET) -app $(word 1,$(VERSION_PARTS)) $(word 2,$(VERSION_PARTS)) \
+		$(word 3,$(VERSION_PARTS)) -short $(VERSION) -long "JackDAW $(VERSION)"
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

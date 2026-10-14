@@ -9,8 +9,8 @@ set -e
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
-VERSION=0.5.0
-REVISION=1
+VERSION=$(cat "$ROOT/VERSION")   # the only place the version lives
+REVISION=1                       # bump for a rebuild of the same VERSION
 STAGE="$HERE/stage"
 
 pkgman install -y gcc make pkgconfig haiku_devel glib2_devel libsndfile_devel libsamplerate_devel || true
@@ -25,7 +25,8 @@ mkdir -p "$STAGE/apps" "$STAGE/data/deskbar/menu/Applications"
 cp JackDAW "$STAGE/apps/JackDAW"
 ln -sf ../../../../apps/JackDAW "$STAGE/data/deskbar/menu/Applications/JackDAW"
 
-cp "$HERE/jackdaw.PackageInfo" "$STAGE/.PackageInfo"
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@REVISION@/$REVISION/g" \
+	"$HERE/jackdaw.PackageInfo" > "$STAGE/.PackageInfo"
 OUT="$HERE/jackdaw-$VERSION-$REVISION-x86_64.hpkg"
 package create -C "$STAGE" "$OUT"
 echo ">> built $OUT"
