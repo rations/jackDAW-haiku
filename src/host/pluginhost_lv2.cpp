@@ -34,11 +34,14 @@
 
 #include <lilv/lilv.h>
 #include <lv2/atom/atom.h>
+#include <lv2/atom/forge.h>
+#include <lv2/atom/util.h>
 #include <lv2/buf-size/buf-size.h>
 #include <lv2/core/lv2.h>
 #include <lv2/log/log.h>
 #include <lv2/options/options.h>
 #include <lv2/parameters/parameters.h>
+#include <lv2/resize-port/resize-port.h>
 #include <lv2/state/state.h>
 #include <lv2/ui/ui.h>
 #include <lv2/urid/urid.h>
@@ -81,6 +84,11 @@ static LilvWorld *lph_world = NULL;
 /* Borrowed pointers into the world, valid while the world lives. */
 static LilvNode *lph_n_audio, *lph_n_control, *lph_n_input, *lph_n_output;
 static LilvNode *lph_n_atom, *lph_n_cv, *lph_n_toggled, *lph_n_integer, *lph_n_enum;
+static LilvNode *lph_n_min_size; /* resize-port:minimumSize */
+
+/* Capacity of each editor<->DSP atom ring, and the most any one atom port may
+ * ask for through rsz:minimumSize (the TTL is untrusted input). */
+#define LPH_ATOM_RING_BYTES (256u * 1024u)
 
 static LilvWorld *lph_world_get_locked(void)
 {
@@ -98,6 +106,7 @@ static LilvWorld *lph_world_get_locked(void)
         lph_n_toggled = lilv_new_uri(lph_world, LV2_CORE__toggled);
         lph_n_integer = lilv_new_uri(lph_world, LV2_CORE__integer);
         lph_n_enum = lilv_new_uri(lph_world, LV2_CORE__enumeration);
+        lph_n_min_size = lilv_new_uri(lph_world, LV2_RESIZE_PORT__minimumSize);
     }
     return lph_world;
 }
@@ -121,6 +130,7 @@ extern "C" void ph_lv2_shutdown(void)
         lilv_node_free(lph_n_toggled);
         lilv_node_free(lph_n_integer);
         lilv_node_free(lph_n_enum);
+        lilv_node_free(lph_n_min_size);
         lilv_world_free(lph_world);
         lph_world = NULL;
     }
@@ -447,6 +457,22 @@ struct Lv2Backend {
 
     ZixRing *ctl_ring; /* control writes: owning/UI threads -> RT */
 
+    /* Editor <-> DSP atom traffic (atom:eventTransfer / ui:portNotification).
+     * Control ports carry floats and nothing else, so everything that is not a
+     * number -- a file to load, patch:Set, the plugin's state -- travels as an
+     * atom through the plugin's atom control port and its notify port. Both
+     * rings are lock-free: RT forges atoms_to_dsp into the input sequence
+     * before run() and copies the atom OUTPUT ports into atoms_to_ui after. */
+    int atom_in;           /* index into atoms[] of the port forged into, or -1 */
+    ZixRing *atoms_to_dsp; /* editor thread -> RT */
+    ZixRing *atoms_to_ui;  /* RT -> editor thread */
+    void *atom_scratch;    /* RT staging buffer, LPH_ATOM_RING_BYTES */
+    uint32_t atom_scratch_sz;
+    LV2_URID urid_ev_transfer;
+    LV2_Atom_Forge forge;  /* RT only */
+    volatile gint ui_open; /* 0 = no editor drains atoms_to_ui */
+    void *ui_atom_buf;     /* editor-thread delivery buffer, while a UI is up */
+
     /* Native editor (HaikuUI), resolved at instantiate, loaded on demand. */
     char *ui_uri;    /* NULL = plugin has no HaikuUI */
     char *ui_binary; /* filesystem path of the UI shared object */
@@ -715,6 +741,7 @@ extern "C" PluginInstance *ph_lv2_instantiate(const PluginInfo *info)
     lilv_plugin_get_port_ranges_float(p, mins, maxs, defs);
 
     gboolean ok = TRUE;
+    b->atom_in = -1;
     for (uint32_t i = 0; i < b->n_ports && ok; i++) {
         const LilvPort *port = lilv_plugin_get_port_by_index(p, i);
         if (!port) {
@@ -734,6 +761,19 @@ extern "C" PluginInstance *ph_lv2_instantiate(const PluginInfo *info)
             ap->index = i;
             ap->is_input = is_in;
             ap->capacity = b->misc_bytes;
+            /* rsz:minimumSize: a notify port that carries state or a file list
+             * may need far more than the block-sized default. Capped, since a
+             * message larger than the ring could never be delivered anyway. */
+            LilvNode *min_size = lilv_port_get(p, port, lph_n_min_size);
+            if (min_size && lilv_node_is_int(min_size)) {
+                int v = lilv_node_as_int(min_size);
+                if (v > 0 && (uint32_t)v > ap->capacity)
+                    ap->capacity = MIN((uint32_t)v, (uint32_t)LPH_ATOM_RING_BYTES);
+            }
+            lilv_node_free(min_size);
+            /* The plugin's control port: the first atom input. */
+            if (is_in && b->atom_in < 0)
+                b->atom_in = (int)(b->n_atoms - 1);
         } else if (lilv_port_is_a(p, port, lph_n_control)) {
             float d = defs[i];
             if (d != d) /* NaN guard */
@@ -796,6 +836,14 @@ extern "C" PluginInstance *ph_lv2_instantiate(const PluginInfo *info)
     b->urid_seq = lph_urid_map_cb(NULL, LV2_ATOM__Sequence);
     b->urid_chunk = lph_urid_map_cb(NULL, LV2_ATOM__Chunk);
     b->urid_float = lph_urid_map_cb(NULL, LV2_ATOM__Float);
+    b->urid_ev_transfer = lph_urid_map_cb(NULL, LV2_ATOM__eventTransfer);
+    lv2_atom_forge_init(&b->forge, &lph_urid_map);
+    if (b->n_atoms > 0) {
+        b->atoms_to_dsp = zix_ring_new(NULL, LPH_ATOM_RING_BYTES);
+        b->atoms_to_ui = zix_ring_new(NULL, LPH_ATOM_RING_BYTES);
+        b->atom_scratch_sz = LPH_ATOM_RING_BYTES;
+        b->atom_scratch = g_malloc(b->atom_scratch_sz);
+    }
 
     /* Options: block length + sample rate (many plugins require these). */
     b->opt_minblk = 1;
@@ -921,8 +969,11 @@ extern "C" PluginInstance *ph_lv2_instantiate(const PluginInfo *info)
 
 static void lph_ui_unload(Lv2Backend *b)
 {
+    g_atomic_int_set(&b->ui_open, 0); /* RT stops queueing notify atoms */
     if (b->ui_handle && b->ui_desc && b->ui_desc->cleanup)
         b->ui_desc->cleanup(b->ui_handle); /* detaches + deletes the BView */
+    g_free(b->ui_atom_buf);
+    b->ui_atom_buf = NULL;
     b->ui_handle = NULL;
     b->ui_widget = NULL;
     b->ui_desc = NULL;
@@ -950,6 +1001,9 @@ static void lph_backend_destroy(Lv2Backend *b)
         g_free(b->atoms[a].buf[1]);
     }
     zix_ring_free(b->ctl_ring);
+    zix_ring_free(b->atoms_to_dsp);
+    zix_ring_free(b->atoms_to_ui);
+    g_free(b->atom_scratch);
     for (uint32_t i = 0; i < b->n_params; i++)
         g_free(b->params[i].points);
     g_free(b->params);
@@ -1017,9 +1071,111 @@ static inline void lph_reset_atoms(Lv2Backend *b, int k)
     }
 }
 
+/* One ring record: an atom addressed to a port. The payload that follows is
+ * the complete LV2_Atom (header included), so a reader can hand it straight to
+ * the forge or to port_event. Written as one zix transaction, so a reader sees
+ * a whole record or none of it. */
+typedef struct {
+    uint32_t port;
+    uint32_t size;
+} LphAtomRec;
+
+static bool lph_ring_put_atom(ZixRing *ring, uint32_t port, const void *atom, uint32_t size)
+{
+    LphAtomRec rec = {port, size};
+    if (zix_ring_write_space(ring) < sizeof(rec) + size)
+        return false;
+    ZixRingTransaction tx = zix_ring_begin_write(ring);
+    if (zix_ring_amend_write(ring, &tx, &rec, sizeof(rec)) != ZIX_STATUS_SUCCESS ||
+        zix_ring_amend_write(ring, &tx, atom, size) != ZIX_STATUS_SUCCESS)
+        return false;
+    zix_ring_commit_write(ring, &tx);
+    return true;
+}
+
+/* Move everything the editor queued since the last cycle into the RT scratch
+ * buffer, so it can be forged into EVERY instance (a dual-mono plugin runs two
+ * copies and both must see the same messages). Returns the bytes staged.
+ * RT-safe: no malloc, no lock. */
+static uint32_t lph_stage_ui_atoms(Lv2Backend *b)
+{
+    if (!b->atoms_to_dsp || !b->atom_scratch)
+        return 0;
+    uint32_t used = 0;
+    for (;;) {
+        LphAtomRec rec;
+        if (zix_ring_peek(b->atoms_to_dsp, &rec, sizeof(rec)) != sizeof(rec))
+            break;
+        if (used + sizeof(rec) + rec.size > b->atom_scratch_sz)
+            break; /* the rest waits for the next cycle */
+        zix_ring_skip(b->atoms_to_dsp, sizeof(rec));
+        memcpy((char *)b->atom_scratch + used, &rec, sizeof(rec));
+        if (zix_ring_read(b->atoms_to_dsp, (char *)b->atom_scratch + used + sizeof(rec),
+                          rec.size) != rec.size)
+            break;
+        used += (uint32_t)sizeof(rec) + rec.size;
+    }
+    return used;
+}
+
+/* Fill instance k's atom control port with what the editor sent this cycle,
+ * replacing the empty sequence lph_reset_atoms wrote. The forge refuses to
+ * write past the buffer, so an oversized message is dropped rather than
+ * corrupting the heap. RT-safe. */
+static void lph_forge_input(Lv2Backend *b, int k, uint32_t staged)
+{
+    if (b->atom_in < 0 || staged == 0)
+        return;
+    LphAtomPort *ap = &b->atoms[b->atom_in];
+    lv2_atom_forge_set_buffer(&b->forge, (uint8_t *)ap->buf[k],
+                              sizeof(LV2_Atom_Sequence) + ap->capacity);
+    LV2_Atom_Forge_Frame frame;
+    lv2_atom_forge_sequence_head(&b->forge, &frame, 0);
+    for (uint32_t off = 0; off + sizeof(LphAtomRec) <= staged;) {
+        LphAtomRec rec;
+        memcpy(&rec, (char *)b->atom_scratch + off, sizeof(rec));
+        off += (uint32_t)sizeof(rec);
+        if (off + rec.size > staged)
+            break;
+        if (rec.port == ap->index) {
+            lv2_atom_forge_frame_time(&b->forge, 0);
+            lv2_atom_forge_write(&b->forge, (char *)b->atom_scratch + off, rec.size);
+        }
+        off += rec.size;
+    }
+    lv2_atom_forge_pop(&b->forge, &frame);
+}
+
+/* Copy whatever the plugin wrote on its atom OUTPUT ports (its notify port:
+ * state, file lists, parameter echoes) to the editor's ring. Only while an
+ * editor is open -- with nobody draining, the ring would fill with stale
+ * replies. A full ring drops the rest of the block rather than blocking.
+ * Instance 0 only: a dual-mono pair has one editor. RT-safe. */
+static void lph_collect_atom_out(Lv2Backend *b)
+{
+    if (!b->atoms_to_ui || !g_atomic_int_get(&b->ui_open))
+        return;
+    for (uint32_t a = 0; a < b->n_atoms; a++) {
+        if (b->atoms[a].is_input)
+            continue;
+        LV2_Atom_Sequence *seq = (LV2_Atom_Sequence *)b->atoms[a].buf[0];
+        if (!seq || seq->atom.type != b->urid_seq)
+            continue;
+        LV2_ATOM_SEQUENCE_FOREACH(seq, ev)
+        {
+            const LV2_Atom *atom = &ev->body;
+            if (!lph_ring_put_atom(b->atoms_to_ui, b->atoms[a].index, atom,
+                                   (uint32_t)lv2_atom_total_size(atom)))
+                return;
+        }
+    }
+}
+
 /* Run the plugin in place on L/R. RT context: no alloc, no locks, no log. */
 static void lph_run(Lv2Backend *b, float *L, float *R, uint32_t n)
 {
+    const uint32_t staged = lph_stage_ui_atoms(b);
+
     if (b->dual_mono) {
         lilv_instance_connect_port(b->inst[0], b->ain[0], L);
         lilv_instance_connect_port(b->inst[0], b->aout[0], b->outA);
@@ -1027,8 +1183,11 @@ static void lph_run(Lv2Backend *b, float *L, float *R, uint32_t n)
         lilv_instance_connect_port(b->inst[1], b->aout[0], b->outB);
         lph_reset_atoms(b, 0);
         lph_reset_atoms(b, 1);
+        lph_forge_input(b, 0, staged);
+        lph_forge_input(b, 1, staged);
         lilv_instance_run(b->inst[0], n);
         lilv_instance_run(b->inst[1], n);
+        lph_collect_atom_out(b);
         lph_worker_apply_responses(&b->workers[0]);
         lph_worker_apply_responses(&b->workers[1]);
         memcpy(L, b->outA, (size_t)n * sizeof(float));
@@ -1051,7 +1210,9 @@ static void lph_run(Lv2Backend *b, float *L, float *R, uint32_t n)
         lilv_instance_connect_port(b->inst[0], b->aout[i], b->dummy_out);
 
     lph_reset_atoms(b, 0);
+    lph_forge_input(b, 0, staged);
     lilv_instance_run(b->inst[0], n);
+    lph_collect_atom_out(b);
     lph_worker_apply_responses(&b->workers[0]);
     memcpy(L, b->outA, (size_t)n * sizeof(float));
     memcpy(R, b->n_audio_out > 1 ? b->outB : b->outA, (size_t)n * sizeof(float));
@@ -1321,8 +1482,10 @@ extern "C" gboolean ph_lv2_state_load(PluginInstance *inst, const void *data, gs
  * with the looper locked; this TU treats the widget as an opaque pointer. ---- */
 
 /* write_function handed to the UI: control floats go through the same
- * owning-thread write path as the generic sliders; every other protocol is
- * ignored (allow-list). Runs on the FX window looper (the view's thread). */
+ * owning-thread write path as the generic sliders; atom:eventTransfer atoms (a
+ * file to load, patch:Set, state) are queued for the plugin's atom control
+ * port; every other protocol is ignored (allow-list). Runs on the FX window
+ * looper (the view's thread). */
 static void lph_ui_write_cb(LV2UI_Controller controller, uint32_t port_index, uint32_t buffer_size,
                             uint32_t protocol, const void *buffer)
 {
@@ -1334,6 +1497,16 @@ static void lph_ui_write_cb(LV2UI_Controller controller, uint32_t port_index, ui
         lph_write_control(inst, port_index, v);
         if (port_index < inst->lv2->n_ports)
             inst->lv2->ui_last[port_index] = v; /* no echo on the next poll */
+    } else if (protocol == inst->lv2->urid_ev_transfer && buffer &&
+               buffer_size >= sizeof(LV2_Atom)) {
+        Lv2Backend *b = inst->lv2;
+        /* Only the port RT forges into is driven; anything else would be
+         * queued and never delivered. The atom must also be what it says. */
+        const LV2_Atom *atom = (const LV2_Atom *)buffer;
+        if (b->atom_in < 0 || b->atoms[b->atom_in].index != port_index || !b->atoms_to_dsp ||
+            lv2_atom_total_size(atom) != buffer_size)
+            return;
+        lph_ring_put_atom(b->atoms_to_dsp, port_index, buffer, buffer_size);
     }
 }
 
@@ -1417,6 +1590,15 @@ extern "C" void *ph_lv2_ui_create(PluginInstance *inst)
      * has attached the view) pushes every current value to the UI. */
     for (uint32_t i = 0; i < b->n_ports; i++)
         b->ui_last[i] = NAN;
+    /* Start forwarding the notify port. Per instance, not static: every FX
+     * window polls on its own looper thread. Anything queued before now is
+     * stale; drain it from the read side, which is this thread's half of the
+     * ring (a reset would race the RT writer). */
+    if (b->atoms_to_ui) {
+        b->ui_atom_buf = g_malloc(LPH_ATOM_RING_BYTES);
+        zix_ring_skip(b->atoms_to_ui, zix_ring_read_space(b->atoms_to_ui));
+        g_atomic_int_set(&b->ui_open, 1);
+    }
     return b->ui_widget;
 }
 
@@ -1427,6 +1609,22 @@ extern "C" void ph_lv2_ui_poll(PluginInstance *inst)
     Lv2Backend *b = inst->lv2;
     if (!b->ui_handle || !b->ui_desc || !b->ui_desc->port_event)
         return;
+    /* Notify-port atoms first: a state or file-list reply should land before
+     * the meter values that follow it. */
+    if (b->atoms_to_ui && b->ui_atom_buf) {
+        LphAtomRec rec;
+        while (zix_ring_peek(b->atoms_to_ui, &rec, sizeof(rec)) == sizeof(rec)) {
+            zix_ring_skip(b->atoms_to_ui, sizeof(rec));
+            if (rec.size > LPH_ATOM_RING_BYTES) { /* cannot happen; never trust it */
+                zix_ring_skip(b->atoms_to_ui, rec.size);
+                continue;
+            }
+            if (zix_ring_read(b->atoms_to_ui, b->ui_atom_buf, rec.size) != rec.size)
+                break;
+            b->ui_desc->port_event(b->ui_handle, rec.port, rec.size, b->urid_ev_transfer,
+                                   b->ui_atom_buf);
+        }
+    }
     /* Input parameters: the owning-thread shadow is the truth. */
     for (uint32_t i = 0; i < b->n_params; i++) {
         uint32_t port = b->params[i].port_index;
