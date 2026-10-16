@@ -1,19 +1,25 @@
 # The JackDAW audio stack on Haiku
 
-A set of native Haiku projects that together turn a stock Haiku install into a working
-JACK-based recording/production system with a DAW and VST3 plug-ins. This document
-explains what each piece is and the order to install them.
+A set of native Haiku projects that together turn Haiku into a JACK-based recording and
+production system, with a DAW, plug-ins, and Windows plug-in support through Wine. This
+document explains what each piece is, how they depend on each other, and how they are built
+and released.
 
-Everything targets **Haiku nightly hrev59867, x86_64**. The USB-audio driver is ABI-tied
-to that revision (rebuild it for any other nightly); the userland packages just need a
-compatible Haiku.
+**To install the stack, use the release:** download the zip from the
+[jackDAW-haiku releases](https://github.com/rations/jackDAW-haiku/releases) and run
+`sh install.sh`. Its README and release notes cover the details. The rest of this document is
+for building and maintaining the stack.
+
+Release 0.5 targets **Haiku nightly hrev60256, x86_64**.
 
 ## The pieces
 
 ```
-  haiku-kernel-usb            USB Audio Class 2.0 driver (xhci + usb_audio + multi_audio)
-        │                     -> makes class-compliant USB interfaces usable
-        ▼
+  rations/haiku (fork)  ──► haiku, haiku_devel   the system package: stock Haiku plus
+  + haiku-kernel-usb          (r1~beta6_hrevN-2)   - the UAC2 USB-audio driver
+    (build script, tests)                         - 32-bit Windows code (per-team LDT)
+        │                                         - user traps and hardware breakpoints
+        ▼                                           delivered to programs (iLok/PACE)
   jack-port-haiku  ─────────► jack        the JACK2 server + libjack + backends
         │                                  (foundation; everything below is a JACK client)
         ├─► jack-example-tools ─► jack_tools   jack_lsp / jack_connect / jack_transport / ...
@@ -21,36 +27,77 @@ compatible Haiku.
         │
   VST3-haiku ───────────────► vst3_haiku  JACK VST3 host + example plug-ins
         │  (VST3 SDK, static, MIT)          (SDK is a build-time dep of the DAW + plug-ins)
-        ├─► NAMku  ───────────► namku       Neural Amp Modeler VST3 instrument/effect
+        ├─► NAMku  ───────────► namku       Neural Amp Modeler VST3
         ├─► DRUMku ───────────► drumku      MIDI drum-sampler VST3 instrument
-        ├─► vstbridge-haiku ──► vstbridge   Wine bridge: Windows VST2 + VST3 (needs wine)
-        │  (vendors the SDK)                 → native Haiku stub add-ons the DAW loads
         │
   LV2-haiku ────────────────► lv2_haiku   LV2 stack (lilv/serd/sord/sratom/zix,
         │  (static libs, MIT/ISC)           spec bundles), JACK LV2 host + tools
         ├─► hktuner ─────────► hktuner      chromatic tuner LV2 (native GUI)
         │
   jackDAW-haiku ────────────► jackdaw     the multitrack DAW (hosts VST3 + LV2 + VST2)
+
+  haiku-wine-port ──────────► wine        Wine 11.19 with the Haiku patches
+        └─► vstbridge-haiku ──► vstbridge   Wine bridge: Windows VST2 + VST3
+                                            → native Haiku stub add-ons the DAW loads
 ```
 
 `lv2_haiku` is both a build-time and a runtime dependency of `jackdaw`: the libraries are
 linked statically, but lilv needs the LV2 **specification bundles** it installs to
-`add-ons/media/LV2` (on lilv's compiled-in default `LV2_PATH`; see the path conventions
-below) to load any plug-in.
+`add-ons/media/LV2` to load any plug-in.
 
-| Package | Repo | Role | License |
-|---|---|---|---|
-| (driver) | haiku-kernel-usb | UAC2 USB-audio support (non-packaged override) | fork of Haiku (MIT) |
-| `jack` | jack-port-haiku | JACK2 server, libjack, audio/MIDI backends | GPL v2 / LGPL v2.1 |
-| `jack_tools` | jack-example-tools | standard JACK CLI utilities | GPL v2 |
-| `jackgraph` | jack-graph-haiku | native patchbay + server control GUI | MIT |
-| `vst3_haiku` | VST3-haiku | JACK VST3 host + example plug-ins (+ the SDK) | MIT |
-| `namku` | NAMku | Neural Amp Modeler VST3 | MIT (+ MPL 2.0, Eigen) |
-| `drumku` | DRUMku | MIDI drum-sampler VST3 | MIT |
-| `vstbridge` | vstbridge-haiku | Wine bridge for Windows VST2/VST3 → native stubs (requires `wine`) | GPL v3 (yabridge fork) |
-| `lv2_haiku` | LV2-haiku | LV2 stack + spec bundles, JACK LV2 host + tools | ISC |
-| `hktuner` | hktuner | chromatic tuner LV2 plug-in | MIT |
-| `jackdaw` | jackDAW-haiku | the DAW | MIT |
+| Package | Version (0.5) | Repo | Role | License |
+|---|---|---|---|---|
+| `haiku`, `haiku_devel` | r1~beta6_hrev60256-2 | [rations/haiku](https://github.com/rations/haiku) branch `jackdaw-stack-0.5-hrev60256`, built with [haiku-kernel-usb](https://github.com/rations/haiku-kernel-usb) | Haiku with the USB-audio driver and the kernel support Wine needs | MIT (Haiku) |
+| `jack` | 1.9.23-7 | [jack-port-haiku](https://github.com/rations/jack-port-haiku) | JACK2 server, libjack, audio/MIDI backends | GPL v2 / LGPL v2.1 |
+| `jack_tools` | 4-2 | [jack-example-tools](https://github.com/rations/jack-example-tools) | standard JACK CLI utilities | GPL v2 |
+| `jackgraph` | 0.2-1 | [jack-graph-haiku](https://github.com/rations/jack-graph-haiku) | native patchbay + server control GUI | MIT |
+| `vst3_haiku` | 0.3.0-2 | [VST3-haiku](https://github.com/rations/VST3-haiku) | JACK VST3 host + example plug-ins (+ the SDK) | MIT |
+| `lv2_haiku` | 0.3.0-2 | [LV2-haiku](https://github.com/rations/LV2-haiku) | LV2 stack + spec bundles, JACK LV2 host + tools | ISC |
+| `namku` | 0.4.0-1 | [NAMku](https://github.com/rations/NAMku) | Neural Amp Modeler VST3 | MIT (+ MPL 2.0, Eigen) |
+| `drumku` | 0.4.0-1 | [DRUMku](https://github.com/rations/DRUMku) | MIDI drum-sampler VST3 | MIT |
+| `hktuner` | 0.4.0-1 | [hktuner](https://github.com/rations/hktuner) | chromatic tuner LV2 plug-in | MIT |
+| `jackdaw` | 0.6.0-1 | [jackDAW-haiku](https://github.com/rations/jackDAW-haiku) | the DAW | MIT |
+| `wine` | 11.19-4 | [haiku-wine-port-jackdaw](https://github.com/rations/haiku-wine-port-jackdaw) | Wine with the Haiku patches (required by `vstbridge`) | LGPL v2.1 |
+| `vstbridge` | 0.2.0-1 | [vstbridge-haiku](https://github.com/rations/vstbridge-haiku) | Wine bridge for Windows VST2/VST3 → native stubs | GPL v3 (yabridge fork) |
+
+## The system package
+
+Stock Haiku cannot do three things the stack needs, and all three are kernel changes:
+
+- **USB Audio Class 2.0.** The stock `usb_audio` driver enumerates UAC2 interfaces but never
+  publishes an audio node for them. The driver branch adds UAC2 support and the `xhci`
+  isochronous fixes it depends on (tested with a Behringer UMC204HD).
+- **32-bit Windows code.** Wine runs 32-bit code inside 64-bit processes (WoW64). That needs a
+  per-thread 32-bit `%fs` segment that survives context switches and signals. The kernel gets
+  per-team local descriptor tables, as FreeBSD provides them for Wine.
+- **Self-debugging.** Copy protection such as iLok/PACE sets the trap flag and hardware
+  breakpoints on its own threads, and expects the exceptions. Without a debugger attached,
+  stock Haiku dropped those traps. Now they arrive as `SIGTRAP`, and a thread can set its own
+  debug registers.
+
+A Haiku kernel is not a separate package: `haiku` contains the kernel, the drivers and the
+rest of the base system, for one revision. So the changes ship as a full rebuild of `haiku`
+(and `haiku_devel`, which must match it exactly) for **one nightly**. They are built with
+package revision `-2`, which makes them an update to the official `-1` packages of the same
+nightly. pkgman installs them in a normal transaction, and the boot menu's *Select state* goes
+back to the official ones. The release installer pins the Haiku repository to that nightly,
+because a newer one would replace the custom package.
+
+Building it, on the target nightly:
+
+```sh
+git clone -b jackdaw-stack-0.5-hrev60256 https://github.com/rations/haiku.git ~/haiku
+git clone https://github.com/rations/haiku-kernel-usb
+sh haiku-kernel-usb/dist/build-system-package.sh ~/haiku
+```
+
+`haiku-kernel-usb/tests/wow64_ldt_test.c` tests the kernel side. The Windows-side tests are in
+`haiku-wine-port/tests`. **Moving to a newer nightly** means rebasing the release branch onto
+the new `hrev` tag, rebuilding the two packages there, and running both test sets.
+
+Only Wine, among the other packages, needs this system package, and only for 32-bit programs
+and PACE-protected plug-ins. On a stock kernel Wine runs 64-bit programs as before, and the
+apps do not need it at all (`install.sh --apps-only`).
 
 ## Plugin & data path conventions
 
@@ -86,103 +133,48 @@ Rules, binding across all repos:
 `add-ons/media/{vstplugins,VST3}` locations (under a `vstbridge/` subfolder), so the DAW
 finds bridged and native plug-ins through the one discovery path.
 
-## vstbridge — Windows plug-ins
+## vstbridge and Wine — Windows plug-ins
 
-`vstbridge` (a Haiku port of yabridge) is optional and independent of the rest of the stack: it
-adds Windows plug-ins to a working install, and nothing else here links against it.
+`vstbridge` (a Haiku port of yabridge) is independent of the rest of the stack: it adds Windows
+plug-ins to a working install, and nothing else links against it.
 
-- **Formats: VST2 and VST3 only.** There is no CLAP bridge on Haiku — upstream's CLAP bridge
-  builds on the X11 editor layer this port drops, so the package is built with `-Dclap=false`
-  and ships the VST2 + VST3 chainloader/bridge libraries only. `add-ons/media/CLAP` stays
-  reserved for later.
-- **Wine is required, and it must be the patched build.** `wine` is a hard dependency in the
-  `.PackageInfo`, and each bridged plug-in runs in a Wine host process (`vstbridge-host.exe`)
-  that the chainloader launches. Use the **`wine-11.8-3-x86_64.hpkg` shipped with this stack**
-  — it carries Haiku fixes that are not in any other Wine build, the essential one being running
-  static initialisers in Winelib modules (the bridge host is a C++ Winelib module). Install it
-  in the same command as the bridge so pkgman resolves the dependency locally:
-
-  ```sh
-  pkgman install ./wine-11.8-3-x86_64.hpkg ./vstbridge-*.hpkg
-  ```
-
-  It is built from the recipe in `haiku-wine-port` (a patched copy of the HaikuPorts
-  `app-emulation/wine` port); rebuild it there for a different Haiku revision.
-- **Two front-ends, same job.** `VSTBridge` is a native Interface Kit application installed to
-  `apps/` and linked into *Deskbar → Applications* (via `data/deskbar/menu/Applications`, the
-  way every stock Haiku app gets there). `vstbridgectl` is the equivalent CLI. Either one scans
-  the Windows plug-in directories you configure and syncs one native stub add-on per plug-in
-  into `add-ons/media/{vstplugins,VST3}/vstbridge`; JackDAW then loads them through its normal
-  discovery path. The upstream GTK GUI is Linux-only and is not built or packaged here.
+- **Formats: VST2 and VST3 only.** There is no CLAP bridge on Haiku: upstream's CLAP bridge
+  builds on the X11 editor layer this port drops, so the package is built with `-Dclap=false`.
+  `add-ons/media/CLAP` stays reserved for later.
+- **Wine must be this stack's build.** `wine` is a hard dependency, and each bridged plug-in
+  runs in a Wine host process (`vstbridge-host.exe`). The bridge host is a C++ Winelib module,
+  and only the patched Wine runs its static initialisers; the patches also cover the iLok
+  installers, PACE and 32-bit code. The recipe and patchset are in `haiku-wine-port`.
+- **Two front-ends, same job.** `VSTBridge` is a native Interface Kit application in
+  *Deskbar → Applications*, and `vstbridgectl` is the equivalent CLI. Either one scans the
+  Windows plug-in directories you configure and syncs one native stub add-on per plug-in into
+  `add-ons/media/{vstplugins,VST3}/vstbridge`. JackDAW then loads them through its normal
+  discovery path.
 - **Wine graphics driver: use `null`.** The editor is bridged by capturing the plug-in's window
-  and repainting it in JackDAW's FX window; the plug-in's own on-screen window is never wanted.
-  The `null` driver declines to create a driver window surface, which sends win32u down its
-  offscreen path — the window still gets somewhere to draw and still receives `WM_PAINT`, but
-  never reaches a display. (Hiding the window instead does not work: an invisible window gets no
-  surface and stops painting.) It is chosen once per prefix, by explorer when it creates the
-  desktop, from `HKCU\Software\Wine\Drivers\Graphics`:
+  and repainting it in JackDAW's FX window, so the plug-in's own on-screen window is never
+  wanted. With the `null` driver win32u draws offscreen: the window still gets `WM_PAINT` but
+  never reaches a display. The driver is chosen once per prefix:
 
   ```sh
   wine reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d null /f
   ```
 
-  Any other driver still works — the editor is simply visible twice. On the HaikuPorts Wayland
-  driver (`winewayland.drv`, what the port builds with, `--with-wayland --without-x`) a bridged
-  plug-in opens a floating window *and* renders in the FX window. That driver is the one to keep
-  if the prefix also runs ordinary Windows programs, since `null` leaves those with no window at
-  all. The bridge logs a warning naming the driver whenever it is not `null`
-  (`src/wine-host/editor-haiku.cpp`).
-- **No `WINELOADER` export needed.** Wine 11.8-3 resolves its loader through Haiku's
-  `find_path()` rather than `/proc`, so a bare `wine` picked up from `PATH` works from any
-  working directory. Earlier builds needed `export WINELOADER=/boot/system/bin/wine` in the
-  profile because winegcc's generated `.exe` wrapper scripts fall back to bare `wine`; that
-  workaround is now unnecessary (vstbridge still honours `WINELOADER` if you set it, e.g. to
-  point different prefixes at different Wine builds).
+  On the Wayland driver (`wayland`) the editor is visible twice: in its own window and in the FX
+  window. Keep that driver if the prefix also runs ordinary Windows programs, or for plug-ins
+  whose editors are drawn with Direct3D. The software-GL backend lives in `winewayland.drv`,
+  and `null` has no GL.
+- **No `WINELOADER` export needed.** Wine resolves its loader through Haiku's `find_path()`,
+  so a bare `wine` from `PATH` works. vstbridge still honours `WINELOADER`, which is how a
+  build-tree Wine is tested without installing it.
 
-## Getting the sources
+## Building from source
 
-If git is not installed, install it first, then clone the repos you need
-(the machine must be online — `pkgman` also pulls each package's runtime deps on install):
-
-```sh
-pkgman install -y git
-```
-
-Prebuilt `.hpkg`s are attached to each project's GitHub release (and all nine to the
-[jackDAW-haiku full-stack release](https://github.com/rations/jackDAW-haiku/releases)), so
-for the packaged install you only need to clone what you build from source. The USB-audio
-driver is always built locally and additionally needs the Haiku source on the
-`usb-audio-uac2` branch — its clone commands are in `haiku-kernel-usb/dist/INSTALL.md`
-(section 0).
-
-## Install order (prebuilt packages)
-
-1. **USB-audio driver** (only if using a USB interface) — build + install per
-   `haiku-kernel-usb/dist/INSTALL.md` (which starts by installing `git` and cloning the
-   `usb-audio-uac2` Haiku source), then reboot. Verify: the interface enumerates and a node
-   appears under `/dev/audio/hmulti/`.
-2. **Everything else** — build each `.hpkg` on the nightly with its
-   `packaging/make-hpkg.sh` (build order: jack → tools/graph/vst3_haiku/lv2_haiku →
-   namku/drumku/hktuner → jackdaw), then install the lot; `pkgman` pulls external deps
-   (glib2, libsndfile, libsamplerate) from HaikuPorts:
-   ```
-   pkgman install ./jack-*.hpkg ./jack_tools-*.hpkg ./jackgraph-*.hpkg \
-                  ./vst3_haiku-*.hpkg ./lv2_haiku-*.hpkg \
-                  ./namku-*.hpkg ./drumku-*.hpkg ./hktuner-*.hpkg ./jackdaw-*.hpkg
-   ```
-3. **`vstbridge`** (optional, only for Windows VST2/VST3 plug-ins) — kept out of the group
-   install because it needs the patched Wine, which is large (~360 MB) and only useful here:
-   ```
-   pkgman install ./wine-11.8-3-x86_64.hpkg ./vstbridge-*.hpkg
-   ```
-
-## Install order (from source)
-
-Each repo has a `build-from-source.sh` that installs into `/boot/system/non-packaged`.
-Run them in dependency order (later ones link against the earlier ones):
+Each app repo has a `packaging/make-hpkg.sh` that builds its package on Haiku. Most also have
+a `build-from-source.sh` that installs into `/boot/system/non-packaged` instead. The build
+order follows the dependencies:
 
 ```
-jack-port-haiku      # libjack -> /boot/system/non-packaged
+jack-port-haiku      # libjack
 jack-example-tools   # needs jack
 jack-graph-haiku     # needs jack
 VST3-haiku           # SDK static libs + vst3jackhost
@@ -191,42 +183,40 @@ NAMku                # needs the VST3-haiku SDK
 DRUMku               # needs the VST3-haiku SDK
 hktuner              # needs the LV2-haiku staged headers
 jackDAW-haiku        # needs jack + the VST3-haiku SDK + the LV2-haiku stack
-vstbridge-haiku      # optional; needs wine (winegcc) + meson/ninja, vendors its own SDK
+haiku-wine-port      # wine, built with haikuporter (about an hour)
+vstbridge-haiku      # needs wine (winegcc) + meson/ninja, vendors its own SDK
 ```
 
-`vstbridge-haiku` builds with `packaging/make-hpkg.sh` rather than a `build-from-source.sh`:
-meson/ninja produce the bridge libraries and the Winelib host, `make -C tools/vstbridgectl`
-produces both front-ends, and the script stages `apps/VSTBridge`, `bin/vstbridgectl`, the Wine
-host and the `lib/` bridges into one `.hpkg`.
+The system package is built separately, as above. `haikuporter` bakes the build machine's
+revision into each package as a minimum, so packages built on an older nightly install on newer
+ones, but not the other way round.
 
-## Run
-Launch **JackGraph** (to wire ports / manage the server) and **JackDAW** from Deskbar
-(Applications). NAMku/DRUMku appear in JackDAW's VST3 plug-in list automatically, and
-hktuner in its LV2 list; plug-ins that ship a native editor open it inside the FX window.
+## Releasing
 
-Start the JACK server in Jack Graph > Jack Settings (adjust the capture device path to your interface):
+`release/` in this repo holds the release tooling:
+- `install.sh`, the installer users run
+- `README.txt`
+- `RELEASE_NOTES-<version>.md`
+- `make-release.sh`, which assembles the zip from built packages
 
-or start Jack with the terminal
+`make-release.sh <input dir> <output dir>` expects the stack's `.hpkg` files, `system/` with
+the two system packages, and `tools/` with:
+- `wow64_ldt_test`, built on Haiku
+- `install-driver.sh` from haiku-kernel-usb, which the installer uses to remove the old
+  driver override
+- Wine Mono's `wine-mono-<version>-x86.msi`
 
-```
-jackd -X haikumidi -d hmulti -d /dev/audio/hmulti/usb/1 -r 48000 -p 128 -n 3
-```
+It copies only those files, writes `SHA256SUMS` and `release.conf`, and refuses to package any
+other Windows binary.
+
+**Versions:** bump a package's **version** for changes and its **revision** only for a rebuild
+of the same version. Never reuse a published version: pkgman compares labels, not contents.
 
 ## Notes
 
-- The HaikuPorts `.recipe` files (in each repo's `packaging/`) are drafted but not yet
-  validated — run `haikuporter -c <name>` on the target and pin each `SOURCE_URI` before
-  relying on them.
-- The MIT/permissive licensing is clean: the VST3 SDK 3.8 is MIT, and JACK client apps
-  link `libjack` (LGPL v2.1), so nothing forces copyleft on the MIT projects. `vstbridge` is
-  the exception: it is a GPL v3 yabridge fork (separate package, links nothing into the others).
-- **Versions:** the coordinated add-ons/media cutover is released as `0.3.0-1` across the whole
-  updated stack (`jackdaw`, `vst3_haiku`, `lv2_haiku`, `namku`, `drumku`, `hktuner`); `vstbridge`
-  starts at `0.1.0-1`. `jack`/`jack_tools`/`jackgraph` were unchanged. The `-1` is the package
-  revision, which the Haiku `.PackageInfo` format requires; bump the **version** (`0.3.0` →
-  `0.4.0`) for changes rather than the revision. Never reuse a published version — `pkgman`
-  compares the label, not the bits.
-- **`vstbridge` is new and lightly tested.** The package installs and both front-ends launch,
-  but the bridge has not been through a broad plug-in sweep. `VSTBridge` has no vector icon yet,
-  so it shows the generic executable icon in Deskbar/Tracker. See the vstbridge section above
-  for the VST2/VST3-only and Wine-version caveats.
+- Licensing: the VST3 SDK 3.8 is MIT, and JACK clients link `libjack` (LGPL v2.1), so nothing
+  forces copyleft on the MIT projects. `vstbridge` (GPL v3) and Wine (LGPL v2.1) are separate
+  packages that link nothing into the others.
+- The kernel and Wine changes are maintained in these repos and are not submitted upstream.
+- The HaikuPorts `.recipe` files in some repos' `packaging/` are drafts; the release packages
+  are built with each repo's `make-hpkg.sh`, except Wine, whose recipe is the real build.
