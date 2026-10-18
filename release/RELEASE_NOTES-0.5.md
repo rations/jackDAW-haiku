@@ -31,6 +31,12 @@ no longer needed (remove it first if you installed it).
 The system package is built for **hrev60256** only, because it contains all of Haiku. The
 installer updates your system to that nightly and pins the Haiku repository there.
 
+The USB stack in it (xhci, the USB bus manager and the audio driver) is the one from
+hrev59901 with the UAC2 work, the version tested over several months. With hrev60256's own
+USB stack, a UAC2 interface crackled after about a minute of playback, with no xruns.
+Finding the upstream change behind that is ongoing work. Other USB devices work as they did
+on hrev59901.
+
 ### 32-bit Windows programs
 
 Wine can now run 32-bit Windows code. Many installers and licence tools need it, even for
@@ -97,16 +103,20 @@ and PACE support:
 ## Install
 
 1. Download `jackdaw-stack-0.5-hrev60256.zip`, unzip it, and open a Terminal in the folder.
-2. Run `sh install.sh`. It checks the system, and stops with a `!!` line on any problem,
-   before changing anything. If your nightly is older than hrev60256, it updates Haiku first
-   and asks you to reboot and run it again.
+2. Run `sh install.sh`. It checks the system, shows what it will do and asks before changing
+   anything. It stops with a `!!` line on any problem. If your nightly is older than
+   hrev60256, it updates Haiku first and asks you to reboot and run it again.
+   `sh install.sh --check` shows the plan without changing anything.
 3. When it says so, reboot and run `sh install.sh` again. The second run tests the new
    kernel (about a minute) and updates the Wine prefix.
 
 `sh install.sh --apps-only` installs only the apps and Wine, on a stock Haiku: no USB
 audio driver, no 32-bit Windows programs, and no iLok plug-ins.
 
-**If Haiku does not start** after the reboot, hold Shift (or Space) at power-on to get the boot
+`sh install.sh --uninstall` removes the stack and returns Haiku to the official packages on
+the current nightly. Your Wine prefix and projects are kept.
+
+**If Haiku does not start** after the reboot, hold Shift at power-on to get the boot
 menu, choose *Select state*, and pick the newest state from before the installation. pkgman
 keeps that state, with the official system package.
 
@@ -149,7 +159,7 @@ JACK buffer settings, and for Windows plug-ins the plug-in name and version.
 
 | Package | Source |
 |---|---|
-| `haiku`, `haiku_devel` (r1~beta6_hrev60256-2) | [rations/haiku](https://github.com/rations/haiku), branch `jackdaw-stack-0.5-hrev60256`; build script in [haiku-kernel-usb](https://github.com/rations/haiku-kernel-usb) |
+| `haiku`, `haiku_devel` (r1~beta6_hrev60256-3) | [rations/haiku](https://github.com/rations/haiku), branch `jackdaw-stack-0.5-hrev60256`; build script in [haiku-kernel-usb](https://github.com/rations/haiku-kernel-usb) |
 | `wine` 11.19-4 | [haiku-wine-port-jackdaw](https://github.com/rations/haiku-wine-port-jackdaw) |
 | `jack` 1.9.23-7 | [jack-port-haiku](https://github.com/rations/jack-port-haiku) |
 | `jack_tools` 4-2 | [jack-example-tools](https://github.com/rations/jack-example-tools) |
@@ -162,5 +172,5 @@ JACK buffer settings, and for Windows plug-ins the plug-in name and version.
 | `vstbridge` 0.2.0-1 | [vstbridge-haiku](https://github.com/rations/vstbridge-haiku) |
 | `jackdaw` 0.6.0-1 | [jackDAW-haiku](https://github.com/rations/jackDAW-haiku) |
 
-<!-- TODO before publishing: confirm the hardware results on hrev60256 (UMC204HD, Gojira,
-Fortin, iLok); remove this comment. -->
+<!-- TODO before publishing: UMC204HD confirmed clean on hrev60256-3; still confirm Gojira,
+Fortin and iLok on -3, then remove this comment. -->

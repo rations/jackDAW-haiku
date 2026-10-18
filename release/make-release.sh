@@ -6,8 +6,7 @@
 # <input dir> holds the built files:
 #   *.hpkg                  the stack packages (one of each, see PACKAGES below)
 #   system/*.hpkg           haiku and haiku_devel, from build-system-package.sh
-#   tools/                  wow64_ldt_test, install-driver.sh,
-#                           wine-mono-<version>-x86.msi
+#   tools/                  wow64_ldt_test, wine-mono-<version>-x86.msi
 # Only the files named here are copied, so nothing else in the input directory
 # (installers, licence files, logs) can end up in the archive.
 set -e
@@ -17,11 +16,12 @@ OUT=${2:?output dir}
 
 VERSION=0.5
 HREV=hrev60256
+SYSREV=3
 NAME="jackdaw-stack-$VERSION"
 
 PACKAGES="jack jack_tools jackgraph lv2_haiku vst3_haiku hktuner namku drumku wine
 	vstbridge jackdaw"
-TOOLS="wow64_ldt_test install-driver.sh"
+TOOLS="wow64_ldt_test"
 
 fail() {
 	echo "!! $*" >&2
@@ -44,8 +44,8 @@ for p in $PACKAGES; do
 	# the version starts with a digit, which keeps jack from matching jack_tools
 	cp "$(one "$IN" "$p-[0-9]*-x86_64.hpkg")" "$D/packages/"
 done
-cp "$(one "$IN/system" "haiku-r1~beta6_$HREV-2-x86_64.hpkg")" "$D/system/"
-cp "$(one "$IN/system" "haiku_devel-r1~beta6_$HREV-2-x86_64.hpkg")" "$D/system/"
+cp "$(one "$IN/system" "haiku-r1~beta6_$HREV-$SYSREV-x86_64.hpkg")" "$D/system/"
+cp "$(one "$IN/system" "haiku_devel-r1~beta6_$HREV-$SYSREV-x86_64.hpkg")" "$D/system/"
 for t in $TOOLS; do
 	cp "$(one "$IN/tools" "$t")" "$D/tools/"
 done
@@ -54,7 +54,7 @@ chmod 755 "$D/tools/wow64_ldt_test"
 
 cp "$HERE/install.sh" "$HERE/README.txt" "$D/"
 cp "$HERE/RELEASE_NOTES-$VERSION.md" "$D/RELEASE_NOTES.md"
-printf 'HREV=%s\nVERSION=%s\n' "$HREV" "$VERSION" > "$D/release.conf"
+printf 'HREV=%s\nSYSREV=%s\nVERSION=%s\n' "$HREV" "$SYSREV" "$VERSION" > "$D/release.conf"
 
 # The only Windows file in a release is the Wine Mono installer.
 EXTRA=$(cd "$D" && find . -type f \( -iname '*.exe' -o -iname '*.msi' -o -iname '*.dll' \) \
