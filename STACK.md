@@ -47,7 +47,7 @@ linked statically, but lilv needs the LV2 **specification bundles** it installs 
 
 | Package | Version (0.5) | Repo | Role | License |
 |---|---|---|---|---|
-| `haiku`, `haiku_devel` | r1~beta6_hrev60256-2 | [rations/haiku](https://github.com/rations/haiku) branch `jackdaw-stack-0.5-hrev60256`, built with [haiku-kernel-usb](https://github.com/rations/haiku-kernel-usb) | Haiku with the USB-audio driver and the kernel support Wine needs | MIT (Haiku) |
+| `haiku`, `haiku_devel` | r1~beta6_hrev60256-3 | [rations/haiku](https://github.com/rations/haiku) branch `jackdaw-stack-0.5-hrev60256`, built with [haiku-kernel-usb](https://github.com/rations/haiku-kernel-usb) | Haiku with the USB-audio driver and the kernel support Wine needs | MIT (Haiku) |
 | `jack` | 1.9.23-7 | [jack-port-haiku](https://github.com/rations/jack-port-haiku) | JACK2 server, libjack, audio/MIDI backends | GPL v2 / LGPL v2.1 |
 | `jack_tools` | 4-2 | [jack-example-tools](https://github.com/rations/jack-example-tools) | standard JACK CLI utilities | GPL v2 |
 | `jackgraph` | 0.2-1 | [jack-graph-haiku](https://github.com/rations/jack-graph-haiku) | native patchbay + server control GUI | MIT |
